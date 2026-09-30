@@ -289,7 +289,7 @@ too (§23.7).
 | Device-side validation | Chain to the **pinned CA set**, with **validity-time checks disabled** (`X509_V_FLAG_NO_CHECK_TIME` or equivalent; verified [DOCKER T4-d]). Hostname/SAN checked |
 | Broker-side validation | Normal, including time: the broker has a correct clock |
 | Revocation | Registry deactivation (durable first) → every live session and half-open handshake of the device closed at once, its ALERTs, status ACKs and new commands refused, the device removed from its zones and every crypto-group key of those zones rotated → ACL removal (SIGHUP). E2E refusal never depends on the ACL step (tested P9, H1 [DOCKER, broker with no ACL change]). Optional CRL file at the broker |
-| CA roll-over | The new CA certificate travels in a signed policy **before** the broker switches. Devices pin {current, next} during the overlap (Rationale OPS-1) |
+| CA roll-over | The new CA certificate travels in a signed policy **before** the broker switches. Devices pin {current, next} during the overlap (Rationale OPS-1): a device's TLS trust anchors **are** its installed policy's `ca_set` (read back from flash with the policy, §15.11), so the new set applies from its next connection. The broker's client-CA file holds both CAs during the overlap; the utility's trust store is operator configuration. Tested over the broker: a device on the new policy follows the broker's switch to a next-CA certificate (also after a reboot), a device still on the old policy is refused by TLS [DOCKER] |
 
 ## 4.6 Firmware Authority
 
@@ -1308,7 +1308,7 @@ exact signed bytes are what gets installed; **nothing is re-serialised** before 
 | 7 | `fota_chunk_size + proof + headers ≤ max_packet` | v2.2 |
 | 8 | `tls_max_record` and `aead` are known values | v2.2 |
 | 9 | `dup_window_s ≥ 120` and `pending_ttl_s ≥ 60` (class may raise, never lower) | v2.2 |
-| 10 | `ca_set` is non-empty | v2.2 |
+| 10 | `ca_set` holds 1–2 DER X.509 CA certificates (basicConstraints CA:TRUE): the devices' TLS trust anchors (§4.5) | v2.2 (CA check: audit M-3) |
 
 ## Policy Distribution
 
@@ -3652,7 +3652,7 @@ The project **must not** claim:
 | K-1 | Offline ECDSA P-256 CA with `basicConstraints` and `keyUsage` (needed by Python 3.13) |
 | K-2 | Device certificates: CN = device ID (regex), EKU clientAuth, `notAfter 99991231235959Z` |
 | K-3 | Broker certificate: SAN, EKU serverAuth, rotation under CA overlap |
-| K-4 | CA roll-over through signed policy (`ca_set`) before any switch |
+| K-4 | CA roll-over through signed policy (`ca_set`) before any switch; the device builds its TLS trust from the installed policy's `ca_set` |
 | K-5 | Revocation: registry → ACL (+ optional CRL) |
 
 ## 27.6 Persistence

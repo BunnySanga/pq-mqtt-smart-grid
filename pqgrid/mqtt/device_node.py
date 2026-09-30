@@ -60,8 +60,13 @@ UNACKED_TRACKED = 256            # bound on the QoS 1 publishes tracked for that
 
 class _Client(mqtt.Client):
     """TCP_NODELAY and TLS 1.3 session reuse. paho 2.1.0 has no hook for either, so its private socket wrap is
-    overridden (requirements pin paho-mqtt==2.1.0)."""
+    overridden (requirements pin paho-mqtt==2.1.0). replace_context() swaps the TLS context for the NEXT connection
+    (CA roll-over, §4.5): paho's tls_set_context() may be called only once."""
     tls_session = None
+
+    def replace_context(self, ctx) -> None:
+        self._ssl_context = ctx
+        self.tls_session = None                           # a session belongs to the context that made it
 
     def _ssl_wrap_socket(self, tcp_sock):
         tcp_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -76,7 +81,13 @@ class DeviceMqtt:
     def __init__(self, device, processor, outbox, tls_ctx, host: str, port: int, reply_timeout: float = 3.0,
                  tries: int = 3, on_event: Optional[Callable[[str, bytes], None]] = None,
                  rng: random.Random = random, fota=None,
-                 self_test: Optional[Callable[[bytes], bool]] = None):
+                 self_test: Optional[Callable[[bytes], bool]] = None, trust=None):
+        """`trust(policy) -> SSLContext` (e.g. tls.device_context_from_policy with the device's certificate) makes the
+        installed policy's ca_set the TLS trust anchors (§4.5 CA roll-over): `tls_ctx` is then ignored, and a newly
+        installed policy with another ca_set applies from the next connection. Without it `tls_ctx` is fixed."""
+        self.trust = trust
+        if trust is not None:
+            tls_ctx = trust(device.policy)
         self.d, self.proc, self.outbox = device, processor, outbox
         self.host, self.port, self.reply_timeout, self.tries = host, port, reply_timeout, tries
         self.on_event, self.rng = on_event, rng
@@ -386,7 +397,10 @@ class DeviceMqtt:
             self.d.flash.require_capacity(p.profile(self.cls))  # refused before the version is committed
 
     def _install_policy(self, p) -> None:
+        old_ca = self.d.policy.ca_set
         self.d.install_policy(p)                              # the old session and ticket are now useless
+        if self.trust is not None and p.ca_set != old_ca:
+            self.c.replace_context(self.trust(p))             # §4.5: the new trust anchors, from the next connection
         prof = self.d.profile
         if self.outbox is not None:
             self.outbox.cap = prof.outbox_cap                 # the budget require_capacity() just checked

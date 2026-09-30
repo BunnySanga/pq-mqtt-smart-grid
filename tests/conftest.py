@@ -24,6 +24,27 @@ from pqgrid.suite.aead import AeadAlg  # noqa: E402
 from pqgrid.suite.hkem import HybridKeyPair  # noqa: E402
 from pqgrid.suite.sig import mldsa_keygen, mldsa_public_bytes  # noqa: E402
 
+def make_ca_der(name: str = "pqgrid-test-ca") -> bytes:
+    """A real self-signed ECDSA P-256 CA certificate (DER): validator rule 10 accepts only CA certificates."""
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)])
+    now = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(subject).issuer_name(subject).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .sign(key, hashes.SHA256()))
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+TEST_CA_DER = make_ca_der()
+
 RULES = (Rule("grid/+/+/telemetry", Tier.TELEMETRY), Rule("grid/+/+/alert", Tier.ALERT),
          Rule("grid/+/+/control", Tier.CONTROL), Rule("grid/dr/+/+/event", Tier.CONTROL))
 
@@ -54,7 +75,7 @@ def make_policy(utility_pk: bytes, cmd_pk: bytes, version: int = 1, classes=None
     p = Policy(policy_id=over.pop("policy_id", "nitk-grid"), version=version, activate_at=over.pop("activate_at", 0),
                default_tier=over.pop("default_tier", Tier.CONTROL), rules=tuple(rules),
                classes=dict(classes or DEFAULT_CLASSES), utility_kem_pk=utility_pk, utility_cmd_pk=cmd_pk,
-               ca_set=over.pop("ca_set", (b"placeholder-ca-der",)))
+               ca_set=over.pop("ca_set", (TEST_CA_DER,)))
     assert not over, over
     return decode_policy(encode_policy(p))          # always go through the signed-bytes path
 

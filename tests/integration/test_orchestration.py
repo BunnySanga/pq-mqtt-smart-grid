@@ -36,7 +36,7 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
     device's tick (random-delay re-handshake under v2)."""
     import conftest
     m = plant.add(M1, "smart_meter")
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) + 4)
     art = plant.sign_policy(new)
     acl_versions = []
@@ -158,7 +158,7 @@ def test_E4_a_device_refused_for_an_old_policy_is_sent_the_current_one(plant):
     activates it and establishes under v2."""
     import conftest
     m = plant.add(M1, "smart_meter")
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) - 1)
     art = plant.sign_policy(new)
     start(plant)
@@ -260,7 +260,8 @@ def test_utility_key_rotation_rollout_over_the_broker(plant):
     from pqgrid.suite.sig import mldsa_keygen, mldsa_public_bytes
     d = plant.add(D1, "der_ctrl")
     kem2, cmd2 = HybridKeyPair.generate(), mldsa_keygen()
-    new = conftest.make_policy(kem2.pk, mldsa_public_bytes(cmd2), version=2, activate_at=int(time.time()) + 6)
+    new = conftest.make_policy(kem2.pk, mldsa_public_bytes(cmd2), version=2, ca_set=plant.policy.ca_set,
+                               activate_at=int(time.time()) + 6)
     art = plant.sign_policy(new, "der_ctrl")
     start(plant)
     with loops(plant, d):

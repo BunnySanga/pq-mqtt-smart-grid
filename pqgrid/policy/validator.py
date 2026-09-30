@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
+from cryptography import x509
+
 from ..errors import PolicyError
 from ..suite.aead import AeadAlg
 from ..suite.hkem import PK_LEN as HKEM_PK_LEN
@@ -29,6 +31,14 @@ MIN_DUP_WINDOW_S, MIN_PENDING_TTL_S = 120, 60
 
 _POLICY_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 _CLASS_NAME = re.compile(r"^[a-z0-9][a-z0-9_]{0,31}$")
+
+
+def _is_ca_certificate(der: bytes) -> bool:
+    try:
+        cert = x509.load_der_x509_certificate(bytes(der))
+        return cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    except (ValueError, x509.ExtensionNotFound):
+        return False
 
 
 def validate(p: Policy, installed_version: Optional[int] = None) -> None:
@@ -59,9 +69,12 @@ def validate(p: Policy, installed_version: Optional[int] = None) -> None:
     # ---- rule 5: monotonic version
     if installed_version is not None and p.version <= installed_version:
         fail("rule 5: rollback: version not newer than installed")
-    # ---- rule 10: CA set
+    # ---- rule 10: CA set (the devices' pinned TLS trust anchors: current and, during a roll-over, next; §4.5)
     if not 1 <= len(p.ca_set) <= 2:
         fail("rule 10: ca_set must hold 1 or 2 certificates")
+    for der in p.ca_set:
+        if not _is_ca_certificate(der):
+            fail("rule 10: every ca_set entry must be a DER X.509 CA certificate (basicConstraints CA:TRUE)")
 
     for name, c in p.classes.items():
         if not _CLASS_NAME.fullmatch(name) or c.name != name:

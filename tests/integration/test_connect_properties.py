@@ -48,7 +48,7 @@ def reaches(plant, dev, publish_size: int) -> bool:
 def with_class(plant, version: int, dclass: str, activate_in: float = 5, **over):
     classes = conftest.replace_class(plant.policy, dclass, **over)
     return conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=version, classes=classes,
-                                activate_at=int(time.time() + activate_in))
+                                ca_set=plant.policy.ca_set, activate_at=int(time.time() + activate_in))
 
 
 def fleet_artifact(plant, policy, dclass: str, part_limit: int, chunk_size: int):
