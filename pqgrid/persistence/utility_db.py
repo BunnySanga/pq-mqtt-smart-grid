@@ -9,7 +9,8 @@ commit returns. Every promise is committed before it is communicated (P8):
   * a DR event before it is published (it is re-sent after a member re-establishes: M4);
   * the rollout state (Master §4.4, U-4): the active and the scheduled POLICY artifact, with the anchors and
     revocations they were verified against, before the policy takes effect or is promised; the publisher's newest
-    artifacts, what is retained since when and the anchors its KEYREVOKEs revoked, before the broker is told.
+    artifacts, what is retained since when and the anchors its KEYREVOKEs revoked, before the broker is told;
+  * the utility's private keys (keyring, DR-051), before a policy naming them can be scheduled (HSM in production).
 Sessions, half-open handshakes and the duplicate cache stay in RAM (recovered through resync + PASR).
 
 u64 values that can exceed 2^63 (cmd_seq = epoch ‖ counter reaches 2^63 in January 2038) are stored as 8-byte
@@ -31,10 +32,13 @@ from ..e2e.handshake import UtilityEndpoint
 from ..fota.artifact import MAX_CHUNKS, MAX_PARTS, decode_manifest, split_signed
 from ..fota.publisher import Published, Publisher
 from ..fota.station import Artifact
+from ..keyring import UtilityKeyring
 from ..pasr.stek import StekKey, StekTable
 from ..pasr.tickets import TicketIssuer, UsedTickets
 from ..registry import DeviceRecord, Registry
 from ..suite.aead import AeadAlg
+from ..suite.hkem import HybridKeyPair
+from ..suite.sig import mldsa_from_private_bytes, mldsa_private_bytes, mldsa_public_bytes
 from ..wire import dec, dec_list, enc, enc_list, r8, r64, u8, u64
 
 SCHEMA = """
@@ -66,6 +70,8 @@ CREATE TABLE IF NOT EXISTS artifacts(dclass TEXT NOT NULL, type INTEGER NOT NULL
                                      payload BLOB NOT NULL, parts BLOB NOT NULL, chunks BLOB NOT NULL,
                                      retained_at REAL, topics BLOB, PRIMARY KEY (dclass, type));
 CREATE TABLE IF NOT EXISTS revoked_anchors(anchor INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS utility_keys(kind TEXT NOT NULL CHECK (kind IN ('kem', 'cmd')), pk BLOB NOT NULL,
+                                        sk BLOB NOT NULL, PRIMARY KEY (kind, pk));
 """
 MAX_ANCHORS = 16
 MAX_TOPICS = MAX_PARTS + MAX_CHUNKS
@@ -244,6 +250,11 @@ class SqlCommandStore(UtilityCommandStore):
                           (status, q.device_id, u64(q.cmd.cmd_seq)))
         q.status = status
 
+    def resign(self, q: QueuedCommand, sig: bytes) -> None:
+        self.db.execute("UPDATE commands SET sig = ? WHERE device_id = ? AND cmd_seq = ?",
+                        (sig, q.device_id, u64(q.cmd.cmd_seq)))
+        super().resign(q, sig)
+
     def snapshot(self):
         raise NotImplementedError("use UtilityDB.backup_to()")
 
@@ -297,6 +308,9 @@ class SqlZoneManager(ZoneManager):
         with self.db.tx() as c:
             c.executemany("DELETE FROM zone_events WHERE name = ? AND bseq = ?", [(zone, u64(b)) for b in bseqs])
 
+    def _save_event_sig(self, ev: LogicalEvent) -> None:
+        self.db.execute("UPDATE zone_events SET sig = ? WHERE name = ? AND bseq = ?", (ev.sig, ev.zone, u64(ev.bseq)))
+
 
 # ============================================================================================ publisher
 class SqlPublisher(Publisher):
@@ -327,6 +341,32 @@ class SqlPublisher(Publisher):
         self.db.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
 
 
+# ================================================================================================ keyring
+class SqlKeyring(UtilityKeyring):
+    """The utility's private keys in the database (prototype, L16; an HSM in production), written before they can be
+    named by a scheduled policy (DR-051)."""
+
+    def __init__(self, db: UtilityDB):
+        super().__init__()
+        self.db = db
+        for kind, pk, sk in db.execute("SELECT kind, pk, sk FROM utility_keys ORDER BY rowid"):
+            if kind == "kem":
+                kp = HybridKeyPair.from_private_bytes(sk)
+                if kp.pk == pk:
+                    self._kem[pk] = kp
+            else:
+                cmd = mldsa_from_private_bytes(sk)
+                if mldsa_public_bytes(cmd) == pk:
+                    self._cmd[pk] = cmd
+
+    def _store_kem(self, kp: HybridKeyPair) -> None:
+        self.db.execute("INSERT OR IGNORE INTO utility_keys VALUES ('kem', ?, ?)", (kp.pk, kp.private_bytes()))
+
+    def _store_cmd(self, sk) -> None:
+        self.db.execute("INSERT OR IGNORE INTO utility_keys VALUES ('cmd', ?, ?)",
+                        (mldsa_public_bytes(sk), mldsa_private_bytes(sk)))
+
+
 # ================================================================================================= assembly
 @dataclass
 class UtilityNode:
@@ -335,21 +375,35 @@ class UtilityNode:
     tickets: TicketIssuer
     commands: CommandService
     zones: ZoneManager
+    keyring: UtilityKeyring
+
+    def keys_match_policy(self) -> bool:
+        """DR-051 invariant: the keys in use are exactly those the active policy names."""
+        p = self.endpoint.policy
+        return (self.endpoint.static.pk == p.utility_kem_pk
+                and mldsa_public_bytes(self.commands.cmd_key) == p.utility_cmd_pk)
 
 
 def open_utility(path: str, policy, static, cmd_key, clock) -> UtilityNode:
     """A utility process whose durable state is the database at `path`. Opening it again is a restart. `policy` is
-    the bootstrap configuration: a newer policy the utility activated earlier (rollout state, U-4) is resumed from
-    the database, re-verified against the anchors it was accepted with. Without it a restart after a rollout put
-    the utility back on its bootstrap policy and every device that had switched was refused."""
+    the bootstrap configuration and (`static`, `cmd_key`) the bootstrap keys, added to the keyring. A newer policy
+    the utility activated earlier (rollout state, U-4) is resumed from the database, re-verified against the anchors
+    it was accepted with (DR-050 as amended: an active policy stays in force until it is superseded). The keys in
+    use are then taken from the keyring by the public keys the active policy names (DR-051): a restart after a key
+    rotation resumes the new keys, and a policy whose private keys the utility does not hold is refused here
+    (KeyringError) instead of starting a utility that no device can reach."""
     db = UtilityDB(path)
+    keyring = SqlKeyring(db)
+    keyring.add(kem=static, cmd=cmd_key)
     stored = db.load_policy("active")
     if stored is not None:
         from ..fota.policy_artifact import verify_policy_artifact
         active = verify_policy_artifact(*stored)
         if active.version > policy.version:
             policy = active
+    static, cmd_key = keyring.keys_for(policy)
     tickets = TicketIssuer(SqlStekTable(db), SqlUsedTickets(db))
     endpoint = UtilityEndpoint(policy, static, SqlRegistry(db), clock=clock, tickets=tickets)
+    endpoint.retired = keyring.retired_kems(static.pk)
     commands = CommandService(endpoint, cmd_key, store=SqlCommandStore(db))
-    return UtilityNode(db, endpoint, tickets, commands, SqlZoneManager(commands, db))
+    return UtilityNode(db, endpoint, tickets, commands, SqlZoneManager(commands, db), keyring)

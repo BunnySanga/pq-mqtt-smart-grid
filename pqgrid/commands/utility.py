@@ -19,7 +19,7 @@ from ..errors import CommandError, EnvelopeError, PolicyError, WireError
 from ..policy.model import CmdType
 from ..suite.kdf import ct_eq
 from ..suite.rand import random_bytes
-from ..suite.sig import mldsa_sign
+from ..suite.sig import mldsa_sign, mldsa_verify
 from .device import MAX_COMMAND
 from .codec import GRANT_ID_LEN, Command, Grant, Setpoint, cmd_signed_input, encode, grant_signed_input, valid_token
 
@@ -79,6 +79,10 @@ class UtilityCommandStore:
 
     def close(self, q: QueuedCommand, status: bytes) -> None:
         q.status = status
+
+    def resign(self, q: QueuedCommand, sig: bytes) -> None:
+        """A new σ under the utility's current command key (DR-051), stored before the command is sent again."""
+        q.cmd = replace(q.cmd, sig=sig)
 
     def snapshot(self) -> "UtilityCommandStore":
         """A backup copy (for restore tests: V-S1)."""
@@ -144,7 +148,9 @@ class CommandService:
 
     def outgoing(self, device_id: bytes) -> list[bytes]:
         """Envelopes to publish for the device's live session: each open, unexpired command once per session,
-        in cmd_seq order (same cmd_seq and σ on redelivery, new keys). Expired ones are closed (E38)."""
+        in cmd_seq order (same cmd_seq and σ on redelivery, new keys). Expired ones are closed (E38). A command
+        queued before a command-key rotation is re-signed under the key the active policy names, with the same
+        cmd_seq, before it is sent (DR-051): the device verifies with that key, and classifies by cmd_seq."""
         s = self.u.current_session(device_id)                      # M1: never under an old-policy session
         if s is None:
             return []
@@ -155,6 +161,10 @@ class CommandService:
                 continue
             if q.last_sid == s.sid:
                 continue
+            c = q.cmd
+            signed = cmd_signed_input(device_id, q.topic, c.cmd_seq, c.expires_at, c.idempotent, c.command)
+            if not mldsa_verify(self.u.policy.utility_cmd_pk, c.sig, signed):
+                self.store.resign(q, mldsa_sign(self.cmd_key, signed))
             self.store.mark_sent(q, s.sid)                          # recorded before the envelope leaves
             out.append(seal_control(self.u.policy, s, q.topic, encode(q.cmd)))
         return out

@@ -282,3 +282,43 @@ def test_E3_cumulative_and_final_setpoint_acks_through_the_device_loop(plant):
         t0 = d.mq.ticks
         assert wait_for(lambda: d.mq.ticks >= t0 + 20, 10)
         assert len(cumulative()) == 3                                            # and only once
+
+
+def test_utility_key_rotation_rollout_over_the_broker(plant):
+    """H-1 / DR-051 through both production loops: the new E2E and command keys are prepared, the policy naming them
+    is published and scheduled, both sides activate it, the device re-handshakes with the new E2E key and applies a
+    command signed with the new command key (a command queued across the rotation is covered in
+    tests/security/test_key_rotation.py). A device power cycle and a utility restart (bootstrap configuration with
+    the OLD keys) both come back on the new keys."""
+    import conftest
+    from pqgrid.suite.hkem import HybridKeyPair
+    from pqgrid.suite.sig import mldsa_keygen, mldsa_public_bytes
+    d = plant.add(D1, "der_ctrl")
+    kem2, cmd2 = HybridKeyPair.generate(), mldsa_keygen()
+    new = conftest.make_policy(kem2.pk, mldsa_public_bytes(cmd2), version=2, activate_at=int(time.time()) + 6)
+    art = plant.sign_policy(new, "der_ctrl")
+    start(plant)
+    with loops(plant, d):
+        assert wait_for(lambda: d.d.confirmed, 15)
+        plant.u.prepare_keys(kem=kem2, cmd=cmd2)
+        plant.u.publish_artifact(art)
+        plant.u.schedule_policy(art.signed, art.payload, plant.station.anchors)
+        assert wait_for(lambda: POLICY in d.mq.fota_staged, 15), d.mq.errors
+        queued = plant.u.command(D1, b"CLOSE BREAKER 3", 600)             # before: signed with the OLD key
+        assert wait_for(lambda: plant.node.commands.outcome(D1, queued) == b"OK", 15)
+        assert wait_for(lambda: plant.node.endpoint.policy.version == 2 and d.d.confirmed
+                        and d.d.policy.version == 2 and d.d.session.policy_info == new.info(), 30), d.mq.errors
+        assert plant.node.keys_match_policy() and plant.node.endpoint.static.pk == kem2.pk
+        after = plant.u.command(D1, b"CURTAIL 50%", 600)                  # signed with the NEW command key
+        assert wait_for(lambda: plant.node.commands.outcome(D1, after) == b"OK", 15), d.mq.errors
+        assert d.applied == [b"CLOSE BREAKER 3", b"CURTAIL 50%"]
+    d.mq.disconnect()
+    plant.boot(d)                                                              # device power cycle on its v2
+    assert d.d.policy.version == 2 and d.d.policy.utility_kem_pk == kem2.pk
+    plant.restart_utility()                                                    # bootstrap v1 + old keys given:
+    assert plant.node.endpoint.policy.version == 2 and plant.node.keys_match_policy()   # v2 and new keys resume
+    with loops(plant, d):
+        assert wait_for(lambda: d.d.confirmed and d.d.session.policy_info == new.info(), 30), d.mq.errors
+        seq = plant.u.command(D1, b"TRIP", 600)
+        assert wait_for(lambda: plant.node.commands.outcome(D1, seq) == b"OK", 15), d.mq.errors
+    assert d.applied == [b"CLOSE BREAKER 3", b"CURTAIL 50%", b"TRIP"]

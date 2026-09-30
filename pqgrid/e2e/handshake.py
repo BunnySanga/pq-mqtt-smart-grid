@@ -401,6 +401,7 @@ class UtilityEndpoint:
                  clock: Callable[[], float] = time.time, tickets: Optional["TicketIssuer"] = None):
         self.policy, self.static, self.registry, self.clock = policy, static, registry, clock
         self.tickets = tickets                                              # None: FIN only, no resumption
+        self.retired: list[HybridKeyPair] = []                              # older E2E keys: recognise only (DR-051)
         self.sessions: dict[bytes, Session] = {}
         self._by_device: dict[bytes, bytes] = {}
         self._pending: "OrderedDict[bytes, _Pending]" = OrderedDict()   # insertion order = creation order
@@ -430,11 +431,16 @@ class UtilityEndpoint:
         rec = self.registry.get(device_id)
         return rec is not None and rec.active
 
-    def install_policy(self, policy: Policy) -> int:
+    def install_policy(self, policy: Policy, static: Optional[HybridKeyPair] = None) -> int:
         """The utility activates a verified new policy (Master §12 Policy Updates, P5, P10; remediation M1).
         Every session of the old POLICY_INFO is closed at once (its keys dropped); the entry stays until the
         device establishes again, so what it still sends gets the explicit old-policy refusal (not a resync hint).
-        A handshake already past SH is refused at DF (on_finished). Returns the number of sessions closed."""
+        A handshake already past SH is refused at DF (on_finished). `static` is the E2E key pair the new policy
+        names (DR-051); it must match `policy.utility_kem_pk`. Returns the number of sessions closed."""
+        if static is not None:
+            if static.pk != policy.utility_kem_pk:
+                raise HandshakeError("the E2E key pair does not match the policy's utility_kem_pk")
+            self.static = static
         self.policy, info, closed = policy, policy.info(), 0
         for s in self.sessions.values():
             if s.k_master and not ct_eq(s.policy_info, info):
@@ -505,11 +511,10 @@ class UtilityEndpoint:
         if tag != b"CH" or len(n_d) != N_LEN or len(nonce) != NONCE_LEN:
             raise HandshakeError("unexpected message")
         try:
-            ss_u = hkem.decaps(self.static, ct_u)
-            k_b = keys.early_key(ss_u, pk_e, ct_u, n_d)
-            did, dclass, pinfo, fw_b, _dtime = dec(aead.open_(prof.aead, k_b, nonce, ct_body, h(b"CH", pk_e, ct_u, n_d)), 5)
+            ss_u, (did, dclass, pinfo, fw_b, _dtime) = self._open_hello(self.static, prof, pk_e, ct_u, n_d, nonce, ct_body)
             fw = r64(fw_b)
         except (CryptoError, WireError) as e:
+            self._recognise_old_key_hello(prof, pk_e, ct_u, n_d, nonce, ct_body)
             raise HandshakeError("client hello failed authentication") from e
         if not ct_eq(did, topic_id):
             raise HandshakeError("identity does not match the device's topic")
@@ -537,6 +542,26 @@ class UtilityEndpoint:
         sh = enc([b"SH", ct_e, n_u, nonce2, ct_inner, mu])
         self._dup.put(key, sh, now, prof.dup_window_s)
         return sh
+
+    @staticmethod
+    def _open_hello(static: HybridKeyPair, prof, pk_e: bytes, ct_u: bytes, n_d: bytes, nonce: bytes, ct_body: bytes):
+        ss_u = hkem.decaps(static, ct_u)
+        k_b = keys.early_key(ss_u, pk_e, ct_u, n_d)
+        return ss_u, dec(aead.open_(prof.aead, k_b, nonce, ct_body, h(b"CH", pk_e, ct_u, n_d)), 5)
+
+    def _recognise_old_key_hello(self, prof, pk_e, ct_u, n_d, nonce, ct_body) -> None:
+        """DR-051: after an E2E key rotation a device still on an older policy encapsulates to a retired key. Such a
+        client hello is only RECOGNISED here (a bounded number of retired keys, newest first), so that it is refused
+        as an old-policy hello and the device is sent the current policy (E-4); it can never establish a session."""
+        for old in self.retired:
+            try:
+                _, (_did, _cls, pinfo, _fw, _t) = self._open_hello(old, prof, pk_e, ct_u, n_d, nonce, ct_body)
+            except (CryptoError, WireError):
+                continue
+            if not ct_eq(pinfo, self.policy.info()):
+                raise PolicyMismatchError("POLICY_INFO mismatch: the client hello uses a retired utility E2E key; "
+                                          "the device must install the current policy")
+            return
 
     def on_resume_hello(self, topic_id: bytes, rh: bytes) -> bytes:
         """RH → RS. The 9 checks run in TicketIssuer.redeem; the ticket is consumed there, before RS exists (I-8)."""

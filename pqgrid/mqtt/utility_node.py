@@ -255,10 +255,19 @@ class UtilityMqtt:
         with self.lock:
             self.publisher.publish(self.c, art)
 
+    def prepare_keys(self, kem=None, cmd=None, expect_kem_pk: bytes | None = None,
+                     expect_cmd_pk: bytes | None = None) -> None:
+        """Hold the private keys a coming policy will name (a rotation, DR-051), durably, before that policy is
+        scheduled. `expect_*` refuses a private key that does not match the public key meant to be prepared."""
+        with self.lock:
+            self.n.keyring.add(kem=kem, cmd=cmd, expect_kem_pk=expect_kem_pk, expect_cmd_pk=expect_cmd_pk)
+
     def activate_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> bool:
         """At activate_at the utility switches to the verified new policy: old-policy sessions and tickets are
         refused from then on (P5, P10), every zone key rotates (key table §4.7; members get the new keys when
-        they re-handshake) and the broker ACL is recompiled from the new policy. False while not yet due."""
+        they re-handshake) and the broker ACL is recompiled from the new policy. False while not yet due.
+        The utility then operates with the private keys the policy names (DR-051); a policy whose keys it does not
+        hold is refused before anything changes (KeyringError)."""
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
         p = verify_policy_artifact(signed, payload, anchors, revoked)
@@ -266,9 +275,12 @@ class UtilityMqtt:
             return False
         with self.lock:
             validate(p, installed_version=self.n.endpoint.policy.version)
+            static, cmd_key = self.n.keyring.keys_for(p)             # H-1: refused before any state changes
             self.n.zones.rotate_all()                                # first: a crash then leaves the old policy
             self.n.db.save_policy("active", signed, payload, anchors, revoked)   # active; durable before effect
-            self.n.endpoint.install_policy(p)                        # old-policy sessions closed (M1)
+            self.n.endpoint.install_policy(p, static=static)         # old-policy sessions closed (M1), new E2E key
+            self.n.endpoint.retired = self.n.keyring.retired_kems(static.pk)
+            self.n.commands.cmd_key = cmd_key                        # new command key (keys follow the policy)
             if self.publisher is not None:
                 self.publisher.policy = p
         if self.acl_hook:
@@ -280,7 +292,8 @@ class UtilityMqtt:
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
         p = verify_policy_artifact(signed, payload, anchors, revoked)  # a bad artifact is refused now …
-        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer
+        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer …
+        self.n.keyring.keys_for(p)                                     # … or whose private keys are not held
         self.n.db.save_policy("scheduled", signed, payload, anchors, revoked)   # survives a restart (U-4)
         self._scheduled = (signed, payload, anchors, frozenset(revoked))
 

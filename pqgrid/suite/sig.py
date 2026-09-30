@@ -34,6 +34,18 @@ def mldsa_public_bytes(sk: mldsa.MLDSA65PrivateKey) -> bytes:
     return sk.public_key().public_bytes_raw()
 
 
+def mldsa_private_bytes(sk: mldsa.MLDSA65PrivateKey) -> bytes:
+    """The 32-byte seed (FIPS 204 ξ) from which the key pair is re-derived: the storage form of the command key."""
+    return sk.private_bytes_raw()
+
+
+def mldsa_from_private_bytes(seed: bytes) -> mldsa.MLDSA65PrivateKey:
+    try:
+        return mldsa.MLDSA65PrivateKey.from_seed_bytes(bytes(seed))
+    except ValueError as e:
+        raise CryptoError("invalid ML-DSA-65 private key") from e
+
+
 def mldsa_sign(sk: mldsa.MLDSA65PrivateKey, msg: bytes) -> bytes:
     return sk.sign(msg)
 

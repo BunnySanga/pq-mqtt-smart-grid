@@ -1360,7 +1360,7 @@ ends the contradiction with v2.1's own D14.
 | Change | What happens |
 |---|---|
 | New policy version | All sessions and tickets are invalid after `activate_at`; devices re-handshake under the new policy |
-| Utility key rotation | A new policy carries the new keys |
+| Utility key rotation | A new policy carries the new public keys. The utility first **prepares** the matching private keys (held durably in its keyring: an HSM in production, the utility database in the prototype), then schedules the policy; a policy whose private keys it does not hold is refused at scheduling and at activation, before anything changes. The utility always operates with the keys its **active** policy names, so the policy and the keys in use can never disagree, also across a crash or restart. Commands and retained DR events queued before a command-key rotation are re-signed under the new key with the same `cmd_seq` / `bseq`. A device still on the old policy is recognised under the retired E2E key only to be refused and sent the current policy (E-4). DR-051 |
 | CA roll-over | A new policy carries {current, next} CA; the broker switches later |
 | Class profile change | Takes effect at the next connection |
 
@@ -1386,7 +1386,8 @@ activation windows. They are rare (a few per day at IEEE 2030.5-style rates) and
 measured 3,442 B without the `idempotent` field.
 
 **σ does not cover `sid`.** A command can therefore be **redelivered in a later session** with the same
-`seq` and the same signature, re-encrypted under the new keys.
+`seq` and the same signature, re-encrypted under the new keys. The one exception is a command-key rotation: a command
+queued across it is re-signed under the new key with the same `cmd_seq` before it is sent (DR-051).
 
 **Device order of checks** (clarification 3, 2026-09-29; DR-046 as amended):
 1. AEAD open;
@@ -2961,6 +2962,19 @@ It had five steps:
 | **Amended 2026-09-29** | Clarification 8, the full lifecycle: while A is active, A signs ordinary releases, B must **not** sign them, B may sign KEYREVOKE(A), A may never revoke B. After A is revoked, B is the active recovery/release anchor and signs subsequent releases; A is permanently unauthorised |
 | **Future trigger** | More than two anchors in new hardware (a quorum rule becomes possible) |
 
+## DR-051: Utility key rotation
+
+| Field | Content |
+|---|---|
+| **Question** | How does the utility move to new E2E and command keys that a new policy names (§12 Policy Updates, §4.7, §23.7)? |
+| **Options** | 1. **Prepared keys, selected by the active policy**: the utility holds a keyring of private keys (current and prepared), and uses the pair whose public keys its active policy names. 2. A separate "active key" record switched at activation. 3. Private keys delivered inside the policy |
+| **Decision** | **1**. A policy whose private keys the utility does not hold is refused when scheduled and when activated (before any state changes); a utility is never started on a policy whose keys it does not hold. Commands and retained DR events signed before a command-key rotation are re-signed under the active key with the same `cmd_seq` / `bseq` before they are sent (the device classifies by sequence, and verifies with the key of its installed policy). The E2E endpoint keeps the two most recent retired E2E keys only to **recognise** a client hello from a device still on an older policy, refuse it as such and republish the current policy (E-4 trigger 2); a hello under a retired key never establishes a session |
+| **Why** | The persisted active policy is the single record of which keys are in use, so a crash or restart can never leave the policy naming one key while the utility uses another. Found by the independent release audit (H-1): activating a policy with new keys used to succeed while the utility kept its old keys, which refused every device's handshake |
+| **Rejected** | 2: a second record that a crash can leave inconsistent with the policy. 3: private keys must never travel in a broadcast artifact |
+| **Trade-offs** | The keyring holds old private keys (prototype: the utility database, L16); a re-signed command carries a new σ over the same fields |
+| **Evidence** | `tests/security/test_key_rotation.py` (KEM, command and both keys; missing and mismatched keys; crash before and after the activation write; restarts; queued commands and DR events; duplicate and older policies; retired-key hellos) [SIM]; rollout through both main loops over the broker, then a device power cycle and a utility restart [DOCKER] |
+| **Future trigger** | HSM integration (§30) |
+
 ---
 
 # 21. Alternatives Considered
@@ -3283,8 +3297,8 @@ See §9.6. The v2.2 additions:
 | Stolen key | Consequence | Containment |
 |---|---|---|
 | Device E2E or TLS key | Impersonate **that** device | Revoke in the registry (P9) |
-| Utility E2E key | Read new sessions; **no command forgery** | New policy (key rotation) |
-| Command key | Forge commands and GRANTs | HSM, separation of duties, rotation through policy |
+| Utility E2E key | Read new sessions; **no command forgery** | New policy naming a new key (key rotation, DR-051) |
+| Command key | Forge commands and GRANTs | HSM, separation of duties, rotation through policy (DR-051) |
 | STEK | Mint tickets (RISK) | HSM; revocation still checked |
 | Anchor | Forge firmware | KEYREVOKE by the other anchor |
 | CA | Hop impersonation | ALERT/CONTROL still E2E-protected; CA roll-over through policy |
