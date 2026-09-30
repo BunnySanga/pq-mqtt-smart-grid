@@ -30,7 +30,7 @@ from ..persistence.flash import RecordStore
 from ..suite.sig import slh_verify
 from ..wire import dec, enc, r8, r32, r64, u8, u32, u64
 from . import merkle
-from .artifact import (ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, MAX_CHUNKS, MAX_PARTS, POLICY, TYPE_NAMES, FotaError, Manifest,
+from .artifact import (ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, MAX_CHUNKS, MAX_PARTS, POLICY, FotaError, Manifest,
                        check_signer, decode_chunk, decode_manifest, decode_part, split_signed)
 
 T_PROTECTED = 1                              # in the protected store
@@ -354,5 +354,4 @@ class Installer:
         return self.prot.committed[t]
 
 
-TYPES = TYPE_NAMES
 __all__ = ["Installer", "FotaFlash", "Protected", "FotaError", "FIRMWARE", "POLICY", "KEYREVOKE", "MAX_PARTS"]

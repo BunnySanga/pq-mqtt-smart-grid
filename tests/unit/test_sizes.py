@@ -65,7 +65,6 @@ def test_resume_sizes_v22_layout(world: World):
 def test_control_sizes_v22_layout(world: World):
     from pqgrid.commands import CommandProcessor, CommandService, ZoneManager
     from pqgrid.e2e.envelopes import control_topic
-    from pqgrid.suite.aead import AeadAlg
     d = world.device(b"der-0001", "der_ctrl")
     world.full(d)
     svc = CommandService(world.utility, world.cmd_sk)

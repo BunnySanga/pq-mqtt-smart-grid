@@ -8,7 +8,6 @@ Run in the test image, against a snapshot of the tree mounted read-only at /src 
     python tools/mutation_check.py sel 1,9,10 0 1        # only the listed mutants (same docker wrapper)
 Last full run (after C1-9): 117 mutants, 112 killed, 5 equivalent (24, 28, 40, 110, 112).
 """
-import os
 import shutil
 import subprocess
 import sys

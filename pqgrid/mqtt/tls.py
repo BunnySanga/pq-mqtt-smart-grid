@@ -13,7 +13,6 @@ import ssl
 
 X509_V_FLAG_NO_CHECK_TIME = 0x200000                    # OpenSSL flag; not named in Python's ssl module
 HYBRID_GROUPS = "X25519MLKEM768:SecP256r1MLKEM768"
-CLASS_SUITE = {"AES256GCM": "TLS_AES_256_GCM_SHA384", "CHACHA20POLY1305": "TLS_CHACHA20_POLY1305_SHA256"}
 
 
 def _base(ca_files: list[str], cert: str, key: str) -> ssl.SSLContext:

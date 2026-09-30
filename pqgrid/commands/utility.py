@@ -10,7 +10,7 @@ operation that completes before anything is sent (P8).
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 from ..e2e.envelopes import control_topic, seal_control, status_sid, verify_status_ack
