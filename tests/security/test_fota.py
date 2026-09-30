@@ -313,6 +313,84 @@ def test_policy_activates_at_its_time_and_E57_binds_versions(dev, station, world
     assert dev.inst.committed(POLICY) == 2
 
 
+def _policy_art(station, world: World, version: int, activate_at: int = T0):
+    p = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=version, activate_at=activate_at)
+    return p, build(station, POLICY, version, encode_policy(p), activate_at=activate_at)
+
+
+def test_the_installed_policy_is_kept_in_flash_across_reboots_and_updates(dev, station, world: World):
+    """Master §4.1: the device holds its installed policy in flash. A factory device has none (its factory policy
+    applies); after an activation the exact signed bytes come back after a reboot, and after a factory reset of the
+    normal flash; a newer policy is staged BESIDE the installed one, which stays intact until the next commit.
+    Before the fix nothing persisted it: after a reboot the device ran its factory policy, the utility refused it
+    and the current policy it re-sent was refused as a rollback, for ever."""
+    assert dev.inst.installed_policy() is None
+    v2, a2 = _policy_art(station, world, 2)
+    dev.feed(a2)
+    assert dev.inst.activate_policy(world.policy).raw == v2.raw
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v2.raw
+    v3, a3 = _policy_art(station, world, 3, activate_at=T0 + 600)
+    dev.feed(a3)                                                           # staged ahead of activate_at …
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v2.raw                       # … without touching the installed one
+    dev.now[0] = T0 + 600
+    assert dev.inst.activate_policy(dev.inst.installed_policy()).raw == v3.raw
+    dev.norm = FlashSim()                                                  # factory reset: normal flash erased
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v3.raw and dev.inst.committed(POLICY) == 3
+
+
+def test_a_modified_policy_area_is_refused_at_activation_and_at_boot(dev, station, world: World):
+    """Like the firmware slot (V-F4), a policy read back from flash is checked against its signed SHA-256. A byte
+    changed inside utility_cmd_pk still decodes and validates, so without the check the device committed (and would
+    boot with) a command key nobody signed."""
+    v2, a2 = _policy_art(station, world, 2)
+    dev.feed(a2)
+    area = dev.ff.policy_areas[1 - dev.inst.prot.policy[0]]                 # the staging area
+    off = bytes(area).find(v2.utility_cmd_pk) + 100
+    area[off] ^= 1
+    with pytest.raises(FotaError, match="staged policy modified"):
+        dev.inst.activate_policy(world.policy)
+    assert dev.inst.committed(POLICY) == 0 and dev.inst.installed_policy() is None
+    dev.feed(a2)                                                           # the genuine artifact re-delivered
+    assert dev.inst.activate_policy(world.policy).utility_cmd_pk == v2.utility_cmd_pk
+    dev.ff.policy_areas[dev.inst.prot.policy[0]][off] ^= 1                  # now the INSTALLED copy is modified
+    dev.boot()
+    with pytest.raises(FotaError, match="installed policy"):
+        dev.inst.installed_policy()
+
+
+def test_a_device_rebooted_after_a_policy_update_establishes_under_it(station, world: World):
+    """The lock-out, end to end in process: v2 activated on both sides, the device reboots and boots with its
+    installed policy (not the factory one), and a full handshake under v2 succeeds."""
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    from pqgrid.persistence.device import DeviceFlash
+    from pqgrid.registry import DeviceRecord
+    from pqgrid.suite.hkem import HybridKeyPair
+    v2, a2 = _policy_art(station, world, 2, activate_at=int(world.t))
+    kp, norm, prot, ff = HybridKeyPair.generate(), FlashSim(), FlashSim(), FotaFlash(64 * 1024)
+    world.registry.add(DeviceRecord(b"c2-0001", C2, kp.pk))
+    clock = lambda: world.t                                                # noqa: E731
+
+    def boot():
+        df = DeviceFlash(norm, clock)
+        inst = Installer(station.anchors, C2, MP, ff, RecordStore(prot, clock), df.store, clock)
+        return DeviceEndpoint(b"c2-0001", C2, inst.installed_policy() or world.policy, 1, kp, clock=clock,
+                              flash=df), inst
+    d, inst = boot()
+    for p in a2.parts:
+        inst.on_part(p)
+    for c in a2.chunks:
+        inst.on_chunk(c)
+    d.install_policy(inst.activate_policy(d.policy))
+    world.utility.install_policy(v2)
+    d, inst = boot()                                                       # reboot
+    assert d.policy.info() == v2.info()
+    world.full(d)
+    assert d.confirmed and world.utility.current_session(b"c2-0001").policy_info == v2.info()
+
+
 def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tmp_path):
     payload = encode_policy(world.policy)
     art = build(station, POLICY, world.policy.version, payload)

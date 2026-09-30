@@ -184,14 +184,17 @@ class Plant:
         return dev
 
     def boot(self, dev: Dev) -> Dev:
-        """Power-on: every object rebuilt from flash; a new MQTT connection."""
+        """Power-on: every object rebuilt from flash; a new MQTT connection. The device runs its installed policy,
+        kept in flash (Master §4.1), or its factory policy if none was ever installed over the air."""
         df = DeviceFlash(dev.flash, clock=time.time)
-        dev.d = DeviceEndpoint(dev.did, dev.dclass, self.policy, 1, dev.kp, flash=df)
+        dev.fota = Installer(self.station.anchors, dev.dclass, self.policy.profile(dev.dclass).max_packet,
+                             dev.fota_flash, RecordStore(dev.protected, clock=time.time), df.store,
+                             clock=lambda: dev.d.now())
+        policy = dev.fota.installed_policy() or self.policy
+        dev.d = DeviceEndpoint(dev.did, dev.dclass, policy, 1, dev.kp, flash=df)
         dev.proc = CommandProcessor(dev.d, dev.applied.append, lambda t, v: dev.setpoints.append((t, v)),
                                     targets={"P_ACTIVE_W"}, state=df.command_state())
-        dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), self.policy.profile(dev.dclass).outbox_cap)
-        dev.fota = Installer(self.station.anchors, dev.dclass, self.policy.profile(dev.dclass).max_packet,
-                             dev.fota_flash, RecordStore(dev.protected, clock=time.time), df.store, clock=dev.d.now)
+        dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), policy.profile(dev.dclass).outbox_cap)
         dev.mq = DeviceMqtt(dev.d, dev.proc, dev.outbox, self.b.device_ctx(dev.cert), "localhost", self.b.port,
                             reply_timeout=2.0, fota=dev.fota)
         return dev

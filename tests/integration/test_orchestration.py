@@ -99,6 +99,12 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
         assert plant.node.endpoint.current_session(M1).policy_info == new.info()
         assert plant.node.zones.zones["f7"].groups[AeadAlg.AES256GCM].key_epoch > cc0   # policy change: rotated
         assert m.fota.committed(POLICY) == 2
+    m.mq.disconnect()
+    plant.boot(m)                                                              # power cycle after the rollout:
+    assert m.d.policy.version == 2                                             # it boots with its installed v2 …
+    with loops(plant, m):
+        assert wait_for(lambda: m.d.confirmed and m.d.session.policy_info == new.info(), 30), m.mq.errors
+        assert plant.node.endpoint.current_session(M1).policy_info == new.info()   # … and is not locked out
 
 
 def test_M9_firmware_is_committed_by_the_loop_and_the_device_re_handshakes_with_its_new_version(plant):

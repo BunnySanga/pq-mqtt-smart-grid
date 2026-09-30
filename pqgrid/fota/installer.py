@@ -10,11 +10,13 @@ Order of trust for every artifact:
   4. the whole payload's length and SHA-256: "staged".
 Then, by type: FIRMWARE boots into the new slot only at activate_at (E60), after the bootloader re-hashes the
 slot (V-F4 model) and re-checks the signer (E59); the self-test decides commit or revert (E-F2). POLICY is
-validated and activated at activate_at (E57). KEYREVOKE applies DR-050: only B revokes A, never the last anchor.
+re-hashed, validated and activated at activate_at (E57); it is staged beside the installed policy, which the device
+keeps in flash and boots with (installed_policy(), Master §4.1). KEYREVOKE applies DR-050: only B revokes A, never
+the last anchor.
 
 Protected storage (§15.11) is a separate record store that a factory reset does not erase. Its one record holds
-committed[FIRMWARE], committed[POLICY], the revocation counter, the revoked anchors and the active slot, so every
-commit is a single atomic write (§15.12).
+committed[FIRMWARE], committed[POLICY], the revocation counter, the revoked anchors, the active firmware slot and the
+installed policy's area, length and SHA-256, so every commit is a single atomic write (§15.12).
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ from ..errors import CapacityError, PolicyError, WireError
 from ..policy import decode_policy, validate
 from ..persistence.flash import RecordStore
 from ..suite.sig import slh_verify
-from ..wire import dec, enc, r8, r64, u8, u64
+from ..wire import dec, enc, r8, r32, r64, u8, u32, u64
 from . import merkle
 from .artifact import (ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, MAX_CHUNKS, MAX_PARTS, POLICY, TYPE_NAMES, FotaError, Manifest,
                        check_signer, decode_chunk, decode_manifest, decode_part, split_signed)
@@ -40,15 +42,19 @@ MAX_ASSEMBLIES = 4                           # manifests assembled at once; the 
 
 @dataclass
 class FotaFlash:
-    """Simulated flash regions that survive a reboot: the two firmware slots and the small-artifact areas."""
+    """Simulated flash regions that survive a reboot: the two firmware slots, the two policy areas and the KEYREVOKE
+    area. Like the firmware slots, the policy areas alternate: a new policy is staged in the area that does not hold
+    the installed one, and its commit (one protected record) makes it the installed one."""
     slot_size: int
     area_size: int = 16 * 1024
     slots: list = field(default_factory=list)
     areas: dict = field(default_factory=dict)
+    policy_areas: list = field(default_factory=list)
 
     def __post_init__(self):
         self.slots = self.slots or [bytearray(self.slot_size), bytearray(self.slot_size)]
-        self.areas = self.areas or {POLICY: bytearray(self.area_size), KEYREVOKE: bytearray(self.area_size)}
+        self.areas = self.areas or {KEYREVOKE: bytearray(self.area_size)}
+        self.policy_areas = self.policy_areas or [bytearray(self.area_size), bytearray(self.area_size)]
 
 
 class Protected:
@@ -56,24 +62,28 @@ class Protected:
         self.s = store
         raw = store.get(T_PROTECTED, b"state")
         if raw:
-            fw, pol, rev, bits, active = dec(raw, 5)
+            fw, pol, rev, bits, active, parea, plen, pdigest = dec(raw, 8)
             self.committed = {FIRMWARE: r64(fw), POLICY: r64(pol), KEYREVOKE: r64(rev)}
             self.revoked = {a for a in (ANCHOR_A, ANCHOR_B) if r8(bits) >> a & 1}
             self.active = r8(active)
+            self.policy = (r8(parea), r32(plen), pdigest)
         else:
             self.committed, self.revoked, self.active = {FIRMWARE: 0, POLICY: 0, KEYREVOKE: 0}, set(), 0
+            self.policy = (0, 0, b"")          # (area, length, SHA-256) of the installed policy; none: factory policy
 
-    def _save(self, committed: dict, revoked: set, active: int) -> None:
-        bits = sum(1 << a for a in revoked)
+    def _save(self, committed: dict, revoked: set, active: int, policy: tuple) -> None:
+        bits, (parea, plen, pdigest) = sum(1 << a for a in revoked), policy
         self.s.put(T_PROTECTED, b"state", enc([u64(committed[FIRMWARE]), u64(committed[POLICY]),
-                                               u64(committed[KEYREVOKE]), u8(bits), u8(active)]))
-        self.committed, self.revoked, self.active = committed, revoked, active     # only after the durable write
+                                               u64(committed[KEYREVOKE]), u8(bits), u8(active), u8(parea),
+                                               u32(plen), pdigest]))
+        self.committed, self.revoked, self.active, self.policy = committed, revoked, active, policy   # after the write
 
-    def commit(self, type_: int, version: int, active: Optional[int] = None) -> None:
-        self._save({**self.committed, type_: version}, set(self.revoked), self.active if active is None else active)
+    def commit(self, type_: int, version: int, active: Optional[int] = None, policy: Optional[tuple] = None) -> None:
+        self._save({**self.committed, type_: version}, set(self.revoked), self.active if active is None else active,
+                   self.policy if policy is None else policy)
 
     def revoke(self, anchor: int, counter: int) -> None:
-        self._save({**self.committed, KEYREVOKE: counter}, self.revoked | {anchor}, self.active)
+        self._save({**self.committed, KEYREVOKE: counter}, self.revoked | {anchor}, self.active, self.policy)
 
 
 @dataclass
@@ -193,7 +203,12 @@ class Installer:
 
     # ----------------------------------------------------------------------------------------- chunks
     def _area(self, t: int) -> bytearray:
-        return self.flash.slots[1 - self.prot.active] if t == FIRMWARE else self.flash.areas[t]
+        """Where artifact type t is staged: never the running firmware's slot nor the installed policy's area."""
+        if t == FIRMWARE:
+            return self.flash.slots[1 - self.prot.active]
+        if t == POLICY:
+            return self.flash.policy_areas[1 - self.prot.policy[0]]
+        return self.flash.areas[t]
 
     def on_chunk(self, raw: bytes) -> Optional[int]:
         """Returns the artifact type when this chunk completed (and staged) it."""
@@ -264,7 +279,10 @@ class Installer:
         except FotaError:
             self._drop(POLICY)
             raise FotaError("staged policy signed by a revoked anchor")
-        payload = bytes(self.flash.areas[POLICY][:m.payload_length])
+        payload = bytes(self._area(POLICY)[:m.payload_length])
+        if hashlib.sha256(payload).digest() != m.payload_sha256:          # as V-F4 for firmware: re-read from flash,
+            self._drop(POLICY)                                             # so re-checked against the signed hash
+            raise FotaError("staged policy modified since its download was verified")
         try:
             p = decode_policy(payload)
             if p.version != m.version or p.activate_at != m.activate_at:
@@ -275,9 +293,23 @@ class Installer:
         except (PolicyError, WireError, CapacityError) as e:
             self._drop(POLICY)
             raise FotaError(f"policy refused: {e}") from e
-        self.prot.commit(POLICY, m.version)
-        self._drop(POLICY)
+        self.prot.commit(POLICY, m.version, policy=(1 - self.prot.policy[0], m.payload_length, m.payload_sha256))
+        self._drop(POLICY)                                                 # version and installed area: one record
         return p
+
+    def installed_policy(self):
+        """The policy of the last committed POLICY activation, read back from its area and checked against the length
+        and SHA-256 committed with it in protected storage (Master §4.1: the device holds its installed policy in
+        flash); None if no policy was ever installed over the air (the factory policy applies). The device boots
+        with it: without it, a reboot after a policy update left the device on its factory policy, which the utility
+        refuses, and the current policy re-sent to it was refused as a rollback, for ever."""
+        area, length, digest = self.prot.policy
+        if not digest:
+            return None
+        raw = bytes(self.flash.policy_areas[area][:length])
+        if hashlib.sha256(raw).digest() != digest:
+            raise FotaError("the installed policy does not match its committed SHA-256")
+        return decode_policy(raw)
 
     def _apply_keyrevoke(self, m: Manifest, payload: bytes) -> None:
         try:
