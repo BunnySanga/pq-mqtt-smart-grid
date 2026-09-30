@@ -338,6 +338,8 @@ class DeviceMqtt:
         self.d.install_policy(p)                              # the old session and ticket are now useless
         prof = self.d.profile
         self._props.SessionExpiryInterval, self._props.MaximumPacketSize = prof.session_expiry_s, prof.max_packet
+        if self.outbox is not None:
+            self.outbox.cap = prof.outbox_cap                 # the budget require_capacity() just checked
         self._rehandshake_at = time.monotonic() + self._spread()
 
     def _spread(self) -> float:

@@ -391,6 +391,68 @@ def test_a_device_rebooted_after_a_policy_update_establishes_under_it(station, w
     assert d.confirmed and world.utility.current_session(b"c2-0001").policy_info == v2.info()
 
 
+
+def test_the_installer_follows_the_packet_limit_of_the_policy_it_commits(dev, station, world: World):
+    """E61 checks chunks against the device's packet limit, a class value of the INSTALLED policy. A policy that raises
+    it (the device then declares 8 KiB to the broker and the publisher builds for 8 KiB) must let those artifacts in,
+    now and after a reboot; before the fix the installer kept its factory limit and refused them for ever."""
+    from conftest import replace_class
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=T0,
+                     classes=replace_class(world.policy, C2, max_packet=8192, fota_chunk_size=6144))
+    dev.feed(build(station, POLICY, 2, encode_policy(v2), activate_at=T0))
+    dev.inst.activate_policy(world.policy)
+    art = build(station, FIRMWARE, 2, firmware(), max_packet=8192, chunk=6144)
+    assert dev.feed(art)[1] == [FIRMWARE]
+    dev.boot()                                                             # Dev.boot passes the factory 4 KiB
+    assert dev.inst.max_packet == 8192
+    assert dev.feed(build(station, FIRMWARE, 3, firmware(), max_packet=8192, chunk=6144))[1] == [FIRMWARE]
+
+
+def test_a_policy_without_the_devices_own_class_is_refused_before_commit(dev, station, world: World):
+    """The manifest names the class (F7), but the policy inside might not define it. Committed, it would leave the
+    device with an installed policy it cannot run (every class value comes from it): a lock-out. Refused first."""
+    others = {n: c for n, c in world.policy.classes.items() if n != C2}
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=T0, classes=others)
+    dev.feed(build(station, POLICY, 2, encode_policy(v2), activate_at=T0))
+    with pytest.raises(FotaError, match="c2_meter"):
+        dev.inst.activate_policy(world.policy)
+    assert dev.inst.committed(POLICY) == 0 and dev.inst.installed_policy() is None
+
+
+def test_the_device_loop_applies_every_class_value_of_a_newly_activated_policy(station, world: World):
+    """§12 through the production step (DeviceMqtt.housekeeping, no broker): after the loop activates a policy, the
+    E2E endpoint, the MQTT CONNECT properties, the FOTA installer's packet limit and the outbox cap all follow the
+    new class profile; before the fix the outbox and the installer kept their factory values."""
+    import ssl
+    from conftest import replace_class
+    from pqgrid.commands import CommandProcessor
+    from pqgrid.mqtt.device_node import DeviceMqtt
+    from pqgrid.persistence.device import DeviceFlash
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    from pqgrid.registry import DeviceRecord
+    from pqgrid.suite.hkem import HybridKeyPair
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=int(world.t),
+                     classes=replace_class(world.policy, C2, max_packet=8192, fota_chunk_size=6144, outbox_cap=2048,
+                                           session_expiry_s=3600))
+    kp, clock = HybridKeyPair.generate(), (lambda: world.t)
+    world.registry.add(DeviceRecord(b"c2-0001", C2, kp.pk))
+    df = DeviceFlash(FlashSim(), clock)
+    d = DeviceEndpoint(b"c2-0001", C2, world.policy, 1, kp, clock=clock, flash=df)
+    inst = Installer(station.anchors, C2, MP, FotaFlash(64 * 1024), RecordStore(FlashSim(), clock), df.store, clock)
+    outbox = df.outbox("grid/c2_meter/c2-0001/alert", world.policy.profile(C2).outbox_cap)
+    mq = DeviceMqtt(d, CommandProcessor(d, lambda c: None), outbox, ssl.create_default_context(), "localhost", 1,
+                    fota=inst)
+    art = build(station, POLICY, 2, encode_policy(v2), activate_at=int(world.t))
+    for part in art.parts:
+        inst.on_part(part)
+    for chunk in art.chunks:
+        inst.on_chunk(chunk)
+    mq.housekeeping()                                                      # the loop activates it
+    new = v2.profile(C2)
+    assert d.policy.info() == v2.info() and d.profile == new
+    assert mq._props.MaximumPacketSize == 8192 and mq._props.SessionExpiryInterval == 3600
+    assert inst.max_packet == new.max_packet and outbox.cap == new.outbox_cap
+
 def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tmp_path):
     payload = encode_policy(world.policy)
     art = build(station, POLICY, world.policy.version, payload)

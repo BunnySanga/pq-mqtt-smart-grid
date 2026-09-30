@@ -99,9 +99,16 @@ class Download:
 class Installer:
     def __init__(self, anchors: dict[int, bytes], device_class: str, max_packet: int, flash: FotaFlash,
                  protected: RecordStore, store: RecordStore, clock: Callable[[], float]):
-        self.anchors, self.cls, self.max_packet = dict(anchors), device_class, max_packet
+        self.anchors, self.cls = dict(anchors), device_class
         self.flash, self.store, self.clock = flash, store, clock
         self.prot = Protected(protected)
+        self.max_packet = max_packet                     # the factory policy's class limit, until one is installed:
+        try:                                             # then the INSTALLED policy's (E61 must match what the
+            installed = self.installed_policy()          # device declares to the broker)
+        except (FotaError, PolicyError, WireError):
+            installed = None                             # damaged: installed_policy() reports it to the caller
+        if installed is not None:
+            self.max_packet = installed.profile(self.cls).max_packet
         self._parts: dict[tuple[int, int], dict] = {}
         self.downloads: dict[int, Download] = {}
         self.staged: dict[int, Manifest] = {}
@@ -288,13 +295,15 @@ class Installer:
             if p.version != m.version or p.activate_at != m.activate_at:
                 raise PolicyError("manifest and policy disagree on version or activate_at (E57)")
             validate(p, installed_version=installed.version)
-            if admit is not None:
-                admit(p)
+            p.profile(self.cls)                                            # it must define this device's class:
+            if admit is not None:                                          # committed without it, nothing could
+                admit(p)                                                   # run it (a lock-out)
         except (PolicyError, WireError, CapacityError) as e:
             self._drop(POLICY)
             raise FotaError(f"policy refused: {e}") from e
         self.prot.commit(POLICY, m.version, policy=(1 - self.prot.policy[0], m.payload_length, m.payload_sha256))
         self._drop(POLICY)                                                 # version and installed area: one record
+        self.max_packet = p.profile(self.cls).max_packet                   # E61 now follows the new class profile
         return p
 
     def installed_policy(self):
