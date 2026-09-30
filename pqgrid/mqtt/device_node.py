@@ -98,7 +98,8 @@ class DeviceMqtt:
         self.session_present = False
         self._replies: "queue.Queue[bytes]" = queue.Queue()
         self._live: dict[int, bytes] = {}                    # msg_seq → alert_id of alerts sent in this session
-        self._zones: set[str] = set()
+        self._zones: set[str] = set()                         # zones this device holds (or held) a key for
+        self._dr_topics: set[str] = set()                     # their event topics, for its CURRENT crypto group
         self.dr_refused: deque = deque(maxlen=256)            # (topic, reason) of every DR event refused (M5)
         self.dr_duplicates = 0                                # re-sent events already accepted (M4): not errors
         self._sync_pending: dict[str, tuple[float, int]] = {} # zone → (retry deadline, ZONEKEYs seen then)
@@ -194,7 +195,8 @@ class DeviceMqtt:
         self.session_present = bool(flags.session_present)
         if not self.session_present:                         # first connect, or the broker lost the session
             subs = [(topics.hs_down(self.did), 1), (topics.control(self.cls, self.did), 1)]
-            subs += [(topics.dr_event(z, self.d.profile.aead), 1) for z in sorted(self._zones)]
+            self._dr_topics = {topics.dr_event(z, self.d.profile.aead) for z in self._zones}
+            subs += [(t, 1) for t in sorted(self._dr_topics)]
             self._subscribe(subs)
         client.publish(topics.status(self.cls, self.did), b"online", qos=1)   # E52: the utility counts these
         if self.fota is not None and not self._fota_subscribed:
@@ -447,12 +449,16 @@ class DeviceMqtt:
                     self.dr_duplicates += 1                   # already accepted: expected after every re-send
                 return
             ack = self.proc.on_control(topic, payload)
-            new_zones = self.proc.zones.zones() - self._zones
+            self._zones |= self.proc.zones.zones()
+            want = {topics.dr_event(z, self.d.profile.aead) for z in self._zones}
+            new, old = sorted(want - self._dr_topics), sorted(self._dr_topics - want)
+            self._dr_topics = want
         if ack:
             self._publish(topics.alert(self.cls, self.did), ack)
-        for z in sorted(new_zones):                           # a ZONEKEY arrived: follow its group's events
-            self._zones.add(z)
-            self._subscribe([(topics.dr_event(z, self.d.profile.aead), 1)])
+        if old:                                               # a policy moved its class to another AEAD, so to
+            self.c.unsubscribe(old)                           # another crypto group (DR-047): leave the old topic
+        if new:                                               # a ZONEKEY arrived: follow its group's events (a new
+            self._subscribe([(t, 1) for t in new])            # zone, or its new group after an AEAD change)
 
     def _request_zone_sync(self, zone: str, epoch: int) -> None:
         """E-2: at most one outstanding request per zone; answered when a ZONEKEY for the zone arrives, retried after

@@ -188,3 +188,38 @@ def test_M4_expired_events_are_not_resent_and_retention_overflow_raises_an_alarm
     assert [a[0].split(":")[0] for a in zm.alarms] == ["retention overflow"]   # never silent
     p.restart()
     assert len(p.node.zones.zones[Z].events) == MAX_RETAINED                # the retained set is durable
+
+
+def test_a_device_whose_class_changes_aead_follows_its_new_groups_event_topic(world):
+    """DR-047: a member listens on its own crypto group's topic. A policy that moves its class to another AEAD moves it
+    to another group, so when its new ZONEKEY arrives it must subscribe to that group's topic. Before the fix it only
+    subscribed for a NEW zone name, so it kept listening on the old group's topic and silently missed every live
+    event (nothing arrived, so not even a zone sync was triggered). Through paho's callback, without a broker."""
+    import ssl
+    from pqgrid.commands import CommandProcessor, CommandService, ZoneManager
+    from pqgrid.mqtt.device_node import DeviceMqtt
+    d = world.device(D1, "der_ctrl")                                       # ChaCha20-Poly1305 under v1
+    world.full(d)
+    svc = CommandService(world.utility, world.cmd_sk)
+    zm, proc = ZoneManager(svc), CommandProcessor(d, lambda c: None)
+    mq = DeviceMqtt(d, proc, None, ssl.create_default_context(), "localhost", 1)
+    subscribed, unsubscribed = [], []
+    mq._publish = lambda topic, payload: None
+    mq._subscribe = lambda subs: subscribed.extend(t for t, _ in subs)
+    mq.c.unsubscribe = lambda topics: unsubscribed.extend(topics)
+    zm.create(Z)
+    zm.add_member(Z, D1)
+    mq._on_control(control_topic("der_ctrl", D1), zm.distribute(Z)[D1])
+    assert subscribed == [event_topic(Z, AeadAlg.CHACHA20POLY1305)]
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2,
+                     classes=replace_class(world.policy, "der_ctrl", aead=AeadAlg.AES256GCM))
+    world.utility.install_policy(v2)
+    mq._install_policy(v2)                                                 # what the device loop does at activate_at
+    world.full(d)                                                          # the re-handshake under v2
+    for env in zm.zonekeys_for(D1):                                        # its new group's ZONEKEY
+        mq._on_control(control_topic("der_ctrl", D1), env)
+    assert subscribed[-1] == event_topic(Z, AeadAlg.AES256GCM)
+    assert unsubscribed == [event_topic(Z, AeadAlg.CHACHA20POLY1305)]     # its old group's topic is left
+    ev = zm.publish(Z, b"SHED", 600)                                       # published on the AES group's topic …
+    assert list(ev) == [event_topic(Z, AeadAlg.AES256GCM)]
+    assert proc.zones.open(event_topic(Z, AeadAlg.AES256GCM), ev[event_topic(Z, AeadAlg.AES256GCM)]) == b"SHED"
