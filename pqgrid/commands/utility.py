@@ -39,7 +39,8 @@ class QueuedCommand:
 
 class UtilityCommandStore:
     """What Master §16 keeps in SQLite: utility_epoch, device_seq and the commands table (= the redelivery
-    queue). In memory here (E36); slice 4 makes allocate_and_enqueue one WAL transaction."""
+    queue). In memory here (E36); persistence.utility_db.SqlCommandStore makes allocate_and_enqueue one WAL
+    transaction."""
 
     def __init__(self):
         self.last_epoch = 0

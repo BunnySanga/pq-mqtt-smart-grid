@@ -54,7 +54,7 @@ ALERT_DEDUP_PER_DEVICE = 4096     # bounded memory for alert_id deduplication (I
 # ================================================================================================== device
 @dataclass(frozen=True)
 class StoredTicket:
-    """What the device keeps from NT (Master §14.7). Flash storage arrives with slice 4."""
+    """What the device keeps from NT (Master §14.7); in flash through persistence.device.DeviceFlash."""
     ticket_id: bytes
     blob: bytes
     psk: bytes = field(repr=False)

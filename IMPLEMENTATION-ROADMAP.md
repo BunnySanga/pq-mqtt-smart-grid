@@ -1292,6 +1292,10 @@ and v2.1 80/80 before any change.
 - **Mutation analysis:** 5 equivalent mutants (listed in C1-9) remain by construction; `tools/mutation_check.py`
   re-runs the analysis.
 - **[HW]:** unchanged from §13.8.
+- **Not implemented in the Python device (Master D-2):** pipelining CONNECT with the first PUBLISH (`DeviceMqtt.connect`
+  waits for CONNACK) and MQTT 5 topic aliases for high-rate TELEMETRY (paho 2.1 cannot send them: see
+  `design-validation/constrained-audit/test_transport.py`). Both are byte and latency optimisations, measured in
+  the design-validation T5/T6 experiments, not security properties; an MCU client provides them.
 
 
 **Cycle 2 (fresh scan of the updated tree).** Regression review of cycle 1's changes: none found. Broker tests
@@ -1301,3 +1305,4 @@ under contention: three concurrent full integration runs, 41/41 each [DOCKER].
 |---|---|---|---|---|---|
 | C2-1 | Fuzz coverage (I-21) | The fuzz tests covered the 12 slice-1 to slice-3 message types but none added later: ZONESYNC (E-2), the re-sent DR event, SETPOINT, ZONEKEY, the ALERT ACK and FIN. Result: no defect; every corruption of them is refused with a controlled error | Test-only | `test_corrupted_later_message_types_are_refused_cleanly` (6 × 300 mutations; the genuine message still works afterwards) | [SIM] |
 | C2-2 | Test strength of cycle 1's own fixes | 23 new mutants (117–139 in `tools/mutation_check.py`), one per check added in cycle 1: 22 killed at once; the survivor showed that the C1-13 test never restarted **after** a retention clean-up, so a clean-up that was not persisted went unseen (a restarted utility would believe an artifact still retained and skip the E-4 "no longer retained" republish) | Test-only: the C1-13 test now restarts after the clean-up and checks nothing is believed retained | 23 of 23 killed; overall 135 of 140, the 5 equivalent ones unchanged | [SIM] |
+| C2-3 | Documentation (Phase 8) | Code docstrings described finished work in the future tense ("Slice 4 moves it to SQLite", "Flash storage arrives with slice 4", …) and the package docstring described slice 1 only; the roadmap did not say that Master D-2's CONNECT pipelining and topic aliases are not in the Python device | Docstrings name the class that now does it; package map; §14.1 records the D-2 gap and why | Docs only (suite re-run) | — |
