@@ -1329,3 +1329,22 @@ holds the STEK) the database's 0600 mode [DOCKER]; no change.
 | C3-1 | ACL compiler (§10.1, K-5) | One registry record whose class the policy does not define (e.g. a class dropped by a new policy while its devices are still registered) made `render_acl` raise for the whole fleet. The broker then kept its **previous** ACL: fail-stale, not fail-closed, including the rights of devices revoked since the last compile; the activation's ACL hook also raised after the policy was already active. The test pinned the raise | Such a device gets no block (a comment line says why); every other device's rights are still written | `test_acl_gives_no_rights_to_a_device_whose_class_is_not_in_the_policy` (replaces the test that expected the raise) | [SIM] |
 | C3-2 | Documentation (Phase 8) | Two costs were not written down anywhere: the M4 re-send of every still-valid DR event at each establishment (absent from the Master's bandwidth figures) and the unretried ACL hook | Master §22.6 note [ANALYTICAL]; §14.1 entries | Docs only | — |
 | C3-3 | DR subscription after an AEAD change (DR-047) | A device subscribed to a zone's crypto-group topic only when a ZONEKEY for a **new zone name** arrived. A policy moving its class to another AEAD moves it to another group, same zone name: it never subscribed to the new group's topic, stayed on the old one (kept by the persistent broker session) and silently missed every live DR event (nothing arrived, so no zone sync either); until the ACL was recompiled, old-group events it could not open would each have triggered a pointless zone sync | The device tracks its subscribed event topics for its current group: when a ZONEKEY arrives it subscribes to the current group's topic if missing and unsubscribes from a group it left | `test_a_device_whose_class_changes_aead_follows_its_new_groups_event_topic` (`tests/security/test_zones_logical.py`, through paho's callback, no broker) | [SIM] |
+| C3-4 | Final regression gate | Full mutation run on the committed tree (144 mutants): 139 killed, the 5 survivors exactly the 5 equivalent ones; mutants 144–146 for cycle 3's fixes (one re-creates the old "new zone name only" subscription rule): 3 of 3 killed | Tooling only | 147 mutants: 142 killed, 5 equivalent | [SIM] |
+
+**Cycle 3 result.** Found and fixed: one registry record of an undefined class stopping the whole fleet's ACL
+recompile (C3-1), a device missing every live DR event after a policy moved its class to another AEAD (C3-3).
+Recorded: the M4 re-send cost and the unretried ACL hook (C3-2). Final fresh audit: the whole change set against
+`main` reviewed again; `pyflakes` clean; nothing new found.
+
+### 14.2 State after the continuous audit (cycles 1–3)
+
+| Measure | Value |
+|---|---|
+| Cycles | 3, each ending with a fresh scan and a regression review of the previous cycle's own changes |
+| Production defects found and fixed | 18, each shown by a failing test or script first: C1-1, C1-2, C1-3, C1-4, C1-7, C1-8 (2: lock-out; unverified staged policy), C1-10 (3: installer limit, outbox cap, own class), C1-12, C1-13, C2-4, C2-5, C2-6, C2-7, C3-1, C3-3 |
+| Test and harness defects fixed | a TLS 1.3 race in T4 (C1-6), harness fidelity (C1-11), 3 any-exception assertions (C1-5), 18 test gaps from mutation analysis (C1-9: 17; C2-2: 1) |
+| Tests | 464 → 546 collected (Docker); 40 new test functions, 1 replaced; ≈ 10 existing tests strengthened |
+| Mutation analysis | 147 mutants over every security/correctness check, including those added here: 142 killed, 5 equivalent by construction (`tools/mutation_check.py`) |
+| Dead code | `mqtt.tls.CLASS_SUITE`, `fota.installer.TYPES`, 7 unused imports |
+| Evidence | v2.1 `validate.py` 80/80 at every stage; broker tests 41/41 in 3 concurrent runs; [SIM] and [DOCKER] only |
+| Not claimed | hardware validation, formal verification, exactly-once actuation, production readiness, completeness: what remains is in §14.1 |

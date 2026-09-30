@@ -8,7 +8,7 @@ Run in the test image, against a snapshot of the tree mounted read-only at /src 
     python tools/mutation_check.py sel 1,9,10 0 1        # only the listed mutants (same docker wrapper)
 Last full run (after C1-9): 117 mutants, 112 killed, 5 equivalent (24, 28, 40, 110, 112).
 Mutants 117-139 disable the checks added by cycle 1 (C2-2): 23 of 23 killed.
-Mutants 140-143: cycle 2's fixes (C2-8).
+Mutants 140-143: cycle 2's fixes (C2-8). Mutants 144-146: cycle 3's (C3-4).
 """
 import shutil
 import subprocess
@@ -244,6 +244,16 @@ M = [
      "            opened.append((aid, payload)); self._dedup(s.device_id, aid)\n", "C2-6 dedup after the reply"),
     ("pqgrid/mqtt/utility_node.py", "                    if rec is None or not rec.active or rec.dclass != cls:   # not wait",
      "                    if rec is None:   # not wait", "C2-7 telemetry from revoked devices"),
+    # ---------------------------------------------------------------- checks added by cycle 3 (C3-x)
+    ("pqgrid/mqtt/broker.py", "        if rec.dclass not in policy.classes:                      # it could not",
+     "        if False:                      # it could not", "C3-1 no rights for an undefined class"),
+    ("pqgrid/mqtt/device_node.py", "        if old:                                               # a policy moved",
+     "        if False:                                               # a policy moved", "C3-3 leave the old group"),
+    ("pqgrid/mqtt/device_node.py",
+     "            want = {topics.dr_event(z, self.d.profile.aead) for z in self._zones}\n            new, old",
+     "            want = self._dr_topics | {topics.dr_event(z, self.d.profile.aead) for z in self._zones\n"
+     "                                      if not any(t.split('/')[2] == z for t in self._dr_topics)}\n            new, old",
+     "C3-3 follow the new group (old rule: new zone names only)"),
 ]
 
 
