@@ -28,7 +28,7 @@ _TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,32}$")        # targets and zone names
 
 
 def valid_token(s: str) -> bool:
-    return bool(_TOKEN.match(s))
+    return bool(_TOKEN.fullmatch(s))                   # not match(): '$' also matches before a final '\n'
 
 
 @dataclass(frozen=True)

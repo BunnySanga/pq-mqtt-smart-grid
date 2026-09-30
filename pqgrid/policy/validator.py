@@ -36,7 +36,7 @@ def validate(p: Policy, installed_version: Optional[int] = None) -> None:
         raise PolicyError(msg)
 
     # ---- structure
-    if not _POLICY_ID.match(p.policy_id):
+    if not _POLICY_ID.fullmatch(p.policy_id):             # fullmatch: '$' alone accepts a final '\n'
         fail("policy_id must match ^[a-z0-9][a-z0-9-]{0,31}$")
     if not 0 < p.version < 1 << 32:
         fail("version must be in 1 … 2^32-1 (POLICY_INFO carries it as u32)")
@@ -64,7 +64,7 @@ def validate(p: Policy, installed_version: Optional[int] = None) -> None:
         fail("rule 10: ca_set must hold 1 or 2 certificates")
 
     for name, c in p.classes.items():
-        if not _CLASS_NAME.match(name) or c.name != name:
+        if not _CLASS_NAME.fullmatch(name) or c.name != name:
             fail(f"class name {name!r} is invalid")
         # rule 3: unicast control forces forward-secret resumption
         if c.unicast_control and c.resume not in (ResumeMode.PSK_KEM, ResumeMode.NONE):
