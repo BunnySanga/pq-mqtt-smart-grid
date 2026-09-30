@@ -1015,7 +1015,7 @@ For device-class cycles see §22.1.
 | Device reboot (RAM lost) | PASR resume from the flash ticket; outbox resent in DF | Resume | Session back; alerts delivered once (dedup by alert ID) |
 | Reboot between RS and NT | No ticket (single-use), so a full handshake next time | — | Graceful |
 | Reboot after RH was processed | Resend the **stored identical RH** if it survived; otherwise full handshake | "ticket already used" for a *rebuilt* RH [DOCKER S5] | Graceful; costs one full handshake |
-| Utility restart | Next envelope gets a resync hint, then a resume | Sessions lost; STEK, used tickets, command sequences and queue **persisted** | Recovers; unacknowledged alerts resent; unacknowledged commands redelivered |
+| Utility restart | Next envelope gets a resync hint, then a resume | Sessions lost; STEK, used tickets, command sequences and queue **persisted**, and the rollout state (active and scheduled policy, published artifacts, U-4) [SIM, DOCKER] | Recovers; unacknowledged alerts resent; unacknowledged commands redelivered; a rollout continues under the policy it activated |
 | Utility crash mid-write | — | SQLite WAL: a transaction commits entirely or not at all | No torn state (v2.1's JSON files failed here [DOCKER S3]) |
 | Crash between command receipt and actuation | Intent log: PENDING without APPLIED → **INTERRUPTED** reported | Re-issues (as a new command) or cancels | No silent loss, no false "OK" (§13.7) |
 | Broker restart | Full TLS; persistent MQTT sessions survive with `persistence true` | — | Retained artifacts survive (verified N5) |
@@ -1780,7 +1780,7 @@ validated**.
 | Network / broker | Roll back to an old, vulnerable, validly signed version | Monotonic committed version in protected storage (F4, F5; the policy too: F6) |
 | Network / broker | Cross-class firmware | Class field in the signed manifest (F7) |
 | Broker | Withhold updates | Not preventable (DoS). The stretch goal, a freshness heartbeat signed with ML-DSA-65, lets devices detect it |
-| Attacker with access to external flash | Modify a staged image after the download checks | **v2.2:** the bootloader re-verifies the payload hash before booting or swapping from an external slot |
+| Attacker with access to external flash | Modify a staged image after the download checks | **v2.2:** the bootloader re-verifies the payload hash before booting or swapping from an external slot; a policy is re-checked against its signed SHA-256 whenever it is read back from flash (activation, boot) [SIM] |
 | Thief of a station key | Sign malicious firmware | **v2.2:** anchor revocation by the other anchor (§15.14) |
 | A future quantum computer or lattice break | Forge signatures | Hash-based SLH-DSA (hash assumptions only) |
 
@@ -1904,7 +1904,8 @@ An overwrite-only bootloader cannot revert, so two slots are needed.
 4. by artifact type:
    - **FIRMWARE:** reboot into the new slot; self-test passes → **commit** (the counter moves forward);
      it fails → **revert** (the counter is unchanged, so the same version can be retried);
-   - **POLICY:** validate → activate at `activate_at` → commit;
+   - **POLICY:** re-hash, validate (including that it defines the device's own class) → activate at `activate_at` →
+     commit; the device keeps the installed policy in flash (§4.1) and boots with it (§15.11);
    - **KEYREVOKE:** §15.14.
 
 ## 15.11 Anti-Rollback
@@ -1913,6 +1914,11 @@ An overwrite-only bootloader cannot revert, so two slots are needed.
   or a protected flash region.
 - It moves forward **only after a successful boot**. Moving it before would strand a device whose new image
   fails (it would refuse the old version, and the new one would not work).
+- The same protected record holds the installed policy's area, length and SHA-256. A new policy is staged in the
+  other of two policy areas (like the firmware slots) and replaces the installed one in the commit's single write;
+  the device boots with it, re-checked against that digest. Without it a reboot after a policy update left the
+  device on its factory policy, which the utility refuses, while anti-rollback refused the current one: a lock-out
+  (found and fixed in the continuous audit, IMPLEMENTATION-ROADMAP §14, C1-8) [SIM, DOCKER].
 - Tested: firmware rollback and replay (F4, F5), policy rollback (F6), failed boot → revert with the counter
   unchanged, rollback still blocked.
 
@@ -3710,6 +3716,7 @@ redirects v2.1's ESP32 stretch goal to the actual target classes.
 | **v2.2 (this document)** | 2026-09-22 | Every audit change adopted (§19): clock/certificate handling; epoch ‖ counter commands + intent log + statuses; GRANT/SETPOINT; ZONEKEY under session; SQLite WAL; **SLH-DSA-SHA2-128s**; parted manifests; ≥ 2 anchors + KEYREVOKE; finished carries data; persistent MQTT sessions + reconnect strategy + back-off; one AEAD per class; binary policy + class profiles; TLS 1.3-only listeners; device classes and constrained profile | Audit evidence (§18) |
 | **v2.2 + remediation** | 2026-09-29 | Eight finalized clarifications (Appendix F): command classification order; logical zones with per-AEAD crypto groups, logical σ (`pqgrid/v2/bcast`) and re-send under the current key, no early-event buffer; `bseq` per logical zone, no floor; software-enforced 7-day residue; A/B anchor lifecycle. Fixes: live device revocation; bounded intent log (3 writes per command); guarded MQTT callbacks; policy race at DF; chain end on live sessions; scrub call paths; main loops; bounded caches and logs; independent X-Wing KAT and byte fixtures | Read-only correctness/security audit of the implementation |
 | **v2.2 + final remediation** | 2026-09-30 | Device storage budget and start-up check (2 × 4 × 4 KiB; true-bytes outbox; one pending body; zone/chunk/alert bounds); DF carries what its reply can ACK (C2: 53); reconnect back-off kept across main-loop ticks; E-2 zone sync (no cross-topic ordering assumption); E-3 cumulative SETPOINT ACK rules; E-4 deterministic republish triggers and validity | The audit's remaining items |
+| **v2.2 + continuous audit, cycle 1** | 2026-09-30 | Implementation brought in line with this document, no design decision changed: the device keeps and re-verifies its installed policy (§4.1, §15.11) and follows every class value of a new one; the utility's rollout state is durable (U-4); a torn flash-record header no longer blocks the store; a commit interrupted by power loss is finished at boot; identifier grammars match the whole string; GRANT memory bounded; the utility loop survives a refused scheduled policy; 17 test gaps closed by mutation analysis (112 of 117 mutants killed, 5 equivalent) | Iterative implementation audit, each item shown by a failing test first (IMPLEMENTATION-ROADMAP §14) |
 
 **Semester 1 (separate):** the SLE-KEMQTT prototype (`pq-mqtt-session-security/`), its design spec and the
 Semester 1 PDFs were removed from this folder on 2026-09-22. They were moved to the macOS Trash folder

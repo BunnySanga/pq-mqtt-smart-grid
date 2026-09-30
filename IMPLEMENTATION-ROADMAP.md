@@ -1269,3 +1269,27 @@ and v2.1 80/80 before any change.
 | C1-12 | Utility rollout state (Master §4.4, U-4) — **fleet refusal after a restart** | The utility's active and scheduled policy lived only in RAM (`open_utility` took the policy as a start argument; `UtilityMqtt._scheduled`). A restart after a rollout put the utility back on its bootstrap policy, and a restart between scheduling and `activate_at` lost the activation, while the devices switch at `activate_at` regardless: every switched device is then refused for its POLICY_INFO | The database keeps the active and the scheduled POLICY artifact with the anchors and revocations they were verified against (`policy_state`), each written before it takes effect or is promised (P8); `open_utility` resumes a newer active policy after re-verifying it; `UtilityMqtt` reloads the scheduled one and forgets it once activated or refused | `tests/unit/test_utility_loop.py`: `…restarted_utility_keeps_the_policy_it_activated` (a v2 device is served), `…policy_scheduled_before_a_restart_is_still_activated_at_its_time`; `test_M9_scheduled_policy_rollout_end_to_end` now also restarts the utility over the broker (fails before the fix: back on v1) | [SIM, DOCKER] |
 | C1-13 | Publisher rollout state (Master §4.4 "Artifact publisher: rollout state", U-4, E-4) | The publisher's state (newest artifact per class and type, what is retained since when, anchors revoked by published KEYREVOKEs) lived only in RAM, and the harness reused one `Publisher` object across utility restarts, which hid it. After a real restart the utility could republish nothing (E-4 triggers found no artifact), never removed what it had retained before (the retention clock was lost) and forgot its revocations | `Publisher` persistence hooks, written before the broker is told; `SqlPublisher` (tables `artifacts`, `revoked_anchors`) reloads it; the publisher also refuses an artifact with more chunks than any device accepts (1,024); the harness builds the publisher from the reopened database at each restart | `test_the_publishers_rollout_state_survives_a_utility_restart` (`tests/security/test_republish.py`): revocation kept (A's firmware not republished), retained topics removed after the window, B's release republished after a second restart | [SIM] |
 | C1-14 | Dead code (Phase 1) | Proven unused by a search of all code, tests and documents: `mqtt.tls.CLASS_SUITE` (the per-class TLS suite map; Python cannot restrict TLS 1.3 suites, E53, and nothing read it, so it suggested an enforcement that does not exist), `fota.installer.TYPES` (an alias nobody imported) and, by pyflakes, unused imports in `installer.py`, `commands/utility.py`, `tools/mutation_check.py` and three test files | Removed | Full suite unchanged; `pyflakes pqgrid tools` clean (tests: only pytest's fixture-import idiom remains) | — |
+
+### 14.1 Remaining after cycle 1 (classified)
+
+- **Accepted, DoS out of scope (Master L13, §23.14):** a compromised broker can grow two device-side structures:
+  the handshake reply queue (`DeviceMqtt._replies`, drained only while establishing) and the zone-sync bookkeeping
+  (`_sync_pending`, keyed by the zone name of a forged re-sent event, which also makes the device send one ZONESYNC
+  per forged zone: 1:1, no amplification). A broker can drop all traffic anyway.
+- **Implementation bound (I-18 under load):** the utility's duplicate cache keeps at most 4,096 replies (§13.4).
+  I-18 (identical replies to identical requests within the DUP window) therefore holds while at most 4,096 distinct
+  CH/RH/DF arrive within one window; in a larger restoration storm a QoS 1 duplicate may get a fresh reply and cost
+  that device one more attempt. Not a safety issue; sizing it to the fleet is a deployment choice.
+- **Latent, untested path:** `DeviceRecord.max_packet` (a per-device limit in the registry) is honoured by the
+  utility's publish check, but `pqgrid` devices declare and size everything (MQTT Maximum Packet Size, DF) from their
+  class. A per-device value below the class value would make the NT/FIN answering a full DF unpublishable. No
+  production caller sets it; it should equal the class value or be removed.
+- **Minor ordering:** `UtilityEndpoint.on_finished` records the bundled alerts as seen before NT/FIN is built; if
+  building it fails (a database error while rotating the STEK) the device resends them and they arrive flagged as
+  duplicates (the payload still reaches the sink, flagged).
+- **Installed policy damaged in flash:** `Installer.installed_policy()` raises; re-installing the same version to
+  repair it is not implemented [HW: flash integrity].
+- **Mutation analysis:** 5 equivalent mutants (listed in C1-9) remain by construction; `tools/mutation_check.py`
+  re-runs the analysis.
+- **[HW]:** unchanged from §13.8.
+
