@@ -5,7 +5,7 @@ calls a wired step directly to stand in for its production caller."""
 import os
 import time
 
-from harness import NoSpread, broker, loops, plant, requires_broker, start, wait_for   # noqa: F401  (fixtures)
+from harness import broker, loops, plant, requires_broker, start, wait_for   # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.publisher import RETENTION_S
 from pqgrid.mqtt.broker import acl_installer

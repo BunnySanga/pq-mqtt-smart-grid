@@ -40,6 +40,27 @@ def test_duplicate_reply_cache_is_bounded_by_count():
     assert c.get((_DupCache.MAX_ENTRIES + 999).to_bytes(4, "big"), 0) == b"reply"
 
 
+def test_a_duplicate_hello_beyond_the_cache_bound_costs_one_more_attempt_and_nothing_else(world, monkeypatch):
+    """Audit L-8 (§14.1, Master §22.2): past the bound, a QoS 1 duplicate CH whose entry was evicted gets a FRESH SH
+    (I-18 no longer holds for it). The device keeps the first SH; the utility's one half-open state now belongs to
+    the second, so the DF is refused, no session exists on either side, and the device's next attempt establishes.
+    The bound is lowered to 1 here instead of flooding 4,096 real hellos."""
+    from pqgrid.errors import HandshakeError
+    monkeypatch.setattr(_DupCache, "MAX_ENTRIES", 1)
+    d, other = world.device(b"meter-0001", "smart_meter"), world.device(b"meter-0002", "smart_meter")
+    ch = d.client_hello()
+    sh1 = world.utility.on_client_hello(d.id, ch)
+    world.utility.on_client_hello(other.id, other.client_hello())   # evicts meter-0001's entry
+    sh2 = world.utility.on_client_hello(d.id, ch)                   # the broker's duplicate of the same CH
+    assert sh2 != sh1
+    d.on_server_hello(sh1)
+    with pytest.raises(HandshakeError):
+        world.utility.on_finished(d.id, d.finished())
+    assert world.utility.session_for(d.id) is None
+    world.full(d)                                                   # the next attempt
+    assert d.confirmed and world.utility.session_for(d.id).sid == d.session.sid
+
+
 def test_node_logs_keep_only_the_newest_entries():
     log = BoundedLog(cap=100)
     for i in range(250):

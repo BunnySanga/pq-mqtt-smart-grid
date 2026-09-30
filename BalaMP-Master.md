@@ -269,7 +269,7 @@ topic names, sizes and timing. **Never sees:** ALERT or CONTROL plaintext, or an
 |---|---|---|---|
 | E2E endpoint | Runs the utility side of the handshake and PASR; opens alerts, sends ACKs | Utility E2E hybrid key (static) | Sessions in RAM (recoverable through resync + PASR) |
 | Ticket issuer | Issues and validates tickets (9 checks); maintains the used-ticket set | STEK (rotated every 24 h; **HSM in production**) | **SQLite WAL**: used tickets, STEK metadata |
-| **Command service** | Allocates epoch ‖ counter sequences; signs discrete commands and GRANTs; keeps the redelivery queue | ML-DSA-65 command key, **held apart from the E2E key** (HSM or a separate service) | **SQLite WAL**: sequences, queue, statuses |
+| **Command service** | Allocates epoch ‖ counter sequences; signs discrete commands and GRANTs; keeps the redelivery queue | ML-DSA-65 command key, **held apart from the E2E key** (HSM or a separate service). **Prototype:** one process holds both keys, in its keyring in the utility database (DR-051); the separation is a production requirement, not implemented (§25 L16) | **SQLite WAL**: sequences, queue, statuses |
 | Artifact publisher | Relays station-signed manifests (split into parts) and chunks as retained messages; cleans up after the retention window | none (the station signs) | Rollout state |
 | Registry | device ID → class, E2E public key, active/revoked, declared max packet size | — | SQLite |
 | ACL compiler | Verifies the signed policy, reads the registry, writes the ACL, sends SIGHUP to Mosquitto | — | — |
@@ -299,8 +299,8 @@ too (§23.7).
 - **Anchors:** at least two key pairs, **A** (primary) and **B** (backup), generated separately and stored
   separately (different custodians or escrow). Their public keys (32 B each) are burned into every
   bootloader.
-- **Signs:** FIRMWARE, POLICY and KEYREVOKE manifests. A KEYREVOKE for anchor X must be signed by a
-  different, non-revoked anchor.
+- **Signs:** FIRMWARE, POLICY and KEYREVOKE manifests. Only the recovery anchor B may sign a KEYREVOKE, and only for
+  the release anchor A; A can never revoke B (DR-050).
 - **Production note:** LMS/HSS (SP 800-208) is the standards-preferred firmware scheme when a
   hardware-backed station can guarantee that signing state never repeats (§21).
 
@@ -308,9 +308,9 @@ too (§23.7).
 
 | Key | Algorithm | Private part held by | Public part known to | Generated | Rotation | Revocation | Impact if stolen |
 |---|---|---|---|---|---|---|---|
-| Station anchors A, B | SLH-DSA-SHA2-128s | Offline station (separate custodians) | Every bootloader (32 B each) | At fleet setup | Never; replaced only by revocation | KEYREVOKE signed by the other anchor | Firmware forgery until revoked |
-| Utility E2E static key | X25519 + ML-KEM-768 | Utility | Devices, through the signed policy | Utility setup | New policy version | New policy | Read **new** sessions of devices that use it (RISK test); **cannot forge commands** |
-| Utility command key | ML-DSA-65 | Command service / HSM | Devices, through the signed policy | Utility setup | New policy version | New policy | Forge commands and GRANTs, so it must live in an HSM |
+| Station anchors A, B | SLH-DSA-SHA2-128s | Offline station (separate custodians) | Every bootloader (32 B each) | At fleet setup | Never; replaced only by revocation | KEYREVOKE(A) signed by B; B is never revoked (DR-050) | A: firmware forgery until revoked. B: fatal (DR-050 trade-off) |
+| Utility E2E static key | X25519 + ML-KEM-768 | Utility | Devices, through the signed policy | Utility setup | A new policy naming a prepared key (DR-051) | New policy | Read **new** sessions of devices that use it (RISK test); **cannot forge commands** |
+| Utility command key | ML-DSA-65 | Command service / HSM | Devices, through the signed policy | Utility setup | A new policy naming a prepared key (DR-051) | New policy | Forge commands and GRANTs, so it must live in an HSM |
 | STEK | 256-bit, ChaCha20-Poly1305 | Utility (HSM in production) | — | Every 24 h | 24 h; retired after the maximum ticket lifetime | Retire kid | Mint tickets and impersonate devices on PASR (RISK test), so HSM |
 | Device E2E static key | X25519 + ML-KEM-768 | Device | Utility registry | Provisioning | Re-provisioning | Registry | Impersonate **that** device |
 | Device TLS key + certificate | ECDSA P-256 | Device | Broker (through the CA) | Provisioning | CA re-issue | Registry/ACL (+ CRL) | Hop impersonation of that device (TELEMETRY only) |
@@ -938,7 +938,8 @@ appending envelopes fails the key confirmation.
   ALERTs right after NT/FIN, each ACKed on its own; one whose ACK is lost stays in the outbox and rides in the next
   DF, where the utility flags it as a duplicate by its alert ID. Tested with a full C2 outbox and lost ACKs
   [DOCKER].
-- **Why it is reliable.** Every envelope stays in the device's outbox until its end-to-end ACK arrives. If
+- **Why it is reliable** (within the outbox cap: when the outbox is full the oldest alerts are dropped and counted,
+  §16). Every envelope stays in the device's outbox until its end-to-end ACK arrives. If
   DF, NT or the ACKs are lost, the device resends the **identical** DF bytes. The utility's duplicate cache
   answers identically. Envelopes are deduplicated by sequence number and alert ID.
 - **Measured effect** [SIM T6]: time to the first protected message on NB-IoT-good falls from 8.25 s to
@@ -1182,6 +1183,10 @@ enc[0x04, zone, group, u64 key_epoch, u64 bseq, nonce(12),
   **current** key with the same σ and `bseq`, on its own control topic (one topic, so the key arrives first).
   The device's persisted `bseq` drops what it already accepted. Retention is bounded (64 per zone); overflow
   raises an alarm.
+- **Delivery across a power loss is at most once** (audit L-3): the device records the event's `bseq` (DR-048) and
+  then hands the event to the application. A power loss before that record is durable leaves the event unaccepted
+  (the re-send below delivers it); one after it and before the application acted loses the event without any report
+  (a broadcast has no ACK). Tested at every byte of the record [SIM].
 - There is **no RAM early-event buffer** (the former E55 behaviour). An event that cannot be opened (e.g. the
   broker's queued copy delivered at CONNACK, before this session's ZONEKEY) is refused and recorded with its
   reason; the re-send above delivers it. Tested over the broker, including rotation while the device is down
@@ -1281,7 +1286,7 @@ TELEMETRY topic (A7).
 | `cmd_types` | {CMD, GRANT, SETPOINT} | Allowed CONTROL sub-types |
 | `max_setpoint_rate` | per minute | Upper bound any GRANT may give |
 | `aead` | AES256GCM / CHACHA20POLY1305 | One AEAD at both layers |
-| `tls_max_record` | 512 / 1,024 / 2,048 / 4,096 / none | Asked for with max_fragment_length |
+| `tls_max_record` | 512 / 1,024 / 2,048 / 4,096 / none | Asked for with max_fragment_length by the device's TLS stack (D-1). **Not applied by the Python prototype** (Python's `ssl` has no max_fragment_length API): validated (rule 8) but consumed only by an MCU TLS stack (§25 L18) |
 | `max_packet` | bytes | The device's MQTT 5 Maximum Packet Size |
 | `fota_chunk_size` | bytes | Must fit `max_packet` with proof and headers |
 | `reconnect` | BATCH(interval_s) / PERSISTENT | §10.5 |
@@ -1488,7 +1493,9 @@ SETPOINT (CONTROL sub-type): pt = enc["SETPOINT", grant_id(8), value, expires_at
 5. the rate is ≤ `max_rate`;
 6. the sequence is newer than the last applied SETPOINT of that grant (newest wins).
 
-Otherwise it replies **REJECTED** (with a reason) or **SUPERSEDED**.
+Otherwise it replies **REJECTED** (with a reason). A **replayed or older** SETPOINT (rule 6) never gets that far: its
+`msg_seq` is not newer than the last one opened in the session, so the envelope's two-phase replay guard drops it
+before it is opened (§9.6) and no status is sent (nothing authentic to acknowledge). It is never applied (V-G5).
 
 **Why this is safe:** only the session's two endpoints can produce a valid SETPOINT, and only inside bounds
 the command key signed for that exact session.
@@ -1761,8 +1768,9 @@ The three v2.2 mechanisms, measured together as scenario D:
 3. **Pipelining** CONNECT and the first publish (telemetry-only wakes).
 
 **Status:** (1) and (3) are standard MQTT behaviour, used in T6. (2) was simulated **size-equivalently** in T6
-(it measures link time, not the protocol code). The reference implementation of (2) is **not yet
-validated**.
+(it measures link time, not the protocol code). (2) is implemented in `pqgrid` and tested functionally in process
+and over the broker [SIM, DOCKER] (§9.4); its **latency** on the protocol code over real or modelled links has not
+been measured. (3) is not implemented in the Python prototype (a prototype choice; paho 2.1 could do it, §25 L17).
 
 ## 14.11 Trade-offs
 
@@ -1957,7 +1965,9 @@ An overwrite-only bootloader cannot revert, so two slots are needed.
   can never revoke B** (DR-050, decided 2026-09-29). Under the earlier rule, "signed by a different, non-revoked
   anchor", a thief of A (the most exposed key) could revoke B first and leave the fleet unrecoverable.
 - **Its version number is a revocation counter** in protected storage, so it cannot be rolled back.
-- **The device refuses to revoke its last active anchor.**
+- **The device refuses to revoke its last active anchor.** With anchors {A, B} DR-050 already guarantees it (B can
+  revoke only A, and nothing revokes B), so the explicit check cannot be reached; it is kept as defence in depth for
+  hardware with more anchors.
 - **After revoking A**, B signs every subsequent release and A is refused for everything, permanently. A new
   anchor can be added only in new hardware (bootloader ROM).
 - **Roles are re-checked** at firmware boot and policy activation (an artifact staged before a revocation).
@@ -2131,7 +2141,7 @@ It had five steps:
 
 | Label | Meaning |
 |---|---|
-| **[DOCKER]** | Measured in the project container (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, Python 3.13.5, `cryptography` 50.0.1, paho-mqtt 2.1.0) on an Apple-silicon laptop. **Not** a device measurement |
+| **[DOCKER]** | Measured in the project container (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, Python 3.13.5, `cryptography` 50.0.1, paho-mqtt 2.1.0) on an Apple-silicon laptop. **Not** a device measurement. **[DOCKER, substitute]**: the 2026-09-30 release audit and its remediation ran in a SUBSTITUTE container because the canonical one could not be built (Docker Hub 429 / Debian mirrors 403): Ubuntu 25.10, OpenSSL 3.5.3, Mosquitto 2.0.22, Python 3.13.7, same Python pins (`docker/substitute-ubuntu.Dockerfile`). Equivalence with the canonical container is **not** demonstrated |
 | **[SIM]** | Docker plus a modelled link (one-way delay, serialisation rate, TCP handshake RTT). Not NB-IoT, not an MCU |
 | **[LIT]** | From a named paper, standard or datasheet; the source's hardware is always stated (§32) |
 | **[ANALYTICAL]** | Calculated from [LIT]/[DOCKER] inputs in `constrained-audit/analysis.py`; lower bounds where stated |
@@ -2610,7 +2620,7 @@ It had five steps:
 | **Question** | When may the device send protected data after SH/RS? |
 | **Options** | 1. After NT/FIN ("confirm before use", v2.1). 2. **Inside DF ("finished carries data")**. 3. 0-RTT inside RH |
 | **Decision** | **2** (v2.1 → v2.2) |
-| **Why** | Saves a round trip; the utility processes data only after verifying MAC_D in the same message; outbox + ACKs keep it reliable |
+| **Why** | Saves a round trip; the utility processes data only after verifying MAC_D in the same message; outbox + ACKs make delivery reliable within the outbox cap (§9.4) |
 | **Rejected** | 1: +1 RTT for protection that ACK + outbox already give. 3: replayable early data |
 | **Trade-offs** | A lost DF means resent alerts |
 | **Evidence** | [SIM T6] scenario D |
@@ -3114,6 +3124,19 @@ are **excluded [HW]**.
 **The TLS record buffers dominate:** 2 × 16 KiB by default. The broker sends 16,401 B records unless asked
 for max_fragment_length (512 → ≤ 529 B records; 1,024 → ≤ 1,041 B) [DOCKER T3].
 
+**Utility-side memory and storage bounds of the prototype** (audit L-8) [ANALYTICAL; Python object sizes measured
+with `sys.getsizeof` in the substitute container]. Nothing here is a device figure.
+
+| Structure | Bound | Worst case |
+|---|---|---|
+| Duplicate-reply cache (I-18) | 4,096 entries, evicted by age and count | ~2.7 KB per SH entry, ~4.4 KB per largest C2 NT: **10.6–17.1 MiB** |
+| Seen alert IDs (dedup) | 4,096 per device (≥ what an outbox can hold: ~100 entries at 4 KiB) | ~57 B per ID: **230 KiB per device** once it has sent 4,096 alerts; 10,000 such devices ≈ 2.2 GiB |
+| Sessions, half-open handshakes | one each per device (DR-036) | a few hundred bytes plus derived keys per device |
+| Logs (refusals, alarms, zone syncs, republishes) | 1,000 entries each (BoundedLog) | — |
+| `commands` table (audit trail, SQLite) | **not bounded** (closed rows are kept) | ~3.6 KB per command: at 3 a day for 10,000 devices ~108 MB a day (§25 L21) |
+| `used_tickets`, `zone_events`, `artifacts`, `stek` (SQLite) | pruned by expiry; 64 events per zone; one artifact per (class, type); ≤ 9 keys | — |
+| Device `_replies` queue, `_sync_pending` (RAM) | not bounded; filled only by messages on the device's own topics | growth only under a malicious broker (DoS, out of scope §2.4) |
+
 ## 22.3 Flash
 
 | Item | Size |
@@ -3337,7 +3360,7 @@ See §9.6. The v2.2 additions:
 | Utility E2E key | Read new sessions; **no command forgery** | New policy naming a new key (key rotation, DR-051) |
 | Command key | Forge commands and GRANTs | HSM, separation of duties, rotation through policy (DR-051) |
 | STEK | Mint tickets (RISK) | HSM; revocation still checked |
-| Anchor | Forge firmware | KEYREVOKE by the other anchor |
+| Anchor | Forge firmware | A: KEYREVOKE(A) signed by B (DR-050). B: not revocable (the DR-050 trade-off) |
 | CA | Hop impersonation | ALERT/CONTROL still E2E-protected; CA roll-over through policy |
 
 ## 23.8 Broker Compromise
@@ -3412,8 +3435,8 @@ Bounded costs:
 | **PASS-v2.1** | Passed in `design-validation` (80/80, network N1–N7); the behaviour is unchanged in v2.2, and it will be re-run on the v2.2 code |
 | **PASS-v2.1 → UPDATE** | Passed in v2.1, but v2.2 changes the expected behaviour; the test must be rewritten |
 | **FAIL-v2.1 → FIX SPECIFIED** | The audit demonstrated a failure in v2.1; the v2.2 fix is specified, **not yet validated** |
-| **NEW** | A v2.2 test, **not yet run** (none remain: see PASS-v2.2) |
-| **PASS-v2.2** | Implemented and passing in the v2.2 reference (`pqgrid`) [SIM, DOCKER] (IMPLEMENTATION-ROADMAP §7–§13); never [HW] |
+| **NEW** | A v2.2 test, **not yet run** (none remain: see PASS-v2.2; V-F4 has only its [SIM] model, the real external slot is [HW]) |
+| **PASS-v2.2** | Implemented and passing in the v2.2 reference (`pqgrid`) [SIM, DOCKER] (IMPLEMENTATION-ROADMAP §7–§15; since 2026-09-30 in the substitute container, [DOCKER, substitute]); never [HW] |
 
 "Actual result" quotes the v2.1 run.
 
@@ -3451,14 +3474,14 @@ Bounded costs:
 | E-X5 | Handshake flood from one device | ≤ 1 half-open state | ok | Resource bound | PASS-v2.1 |
 | E-X6 | Old CH replayed while a session is live | Live session unaffected | ok | Replay | PASS-v2.1 |
 | E-Z1 | Member removed from a zone (holds the old epoch key) | Cannot read the new epoch | "no key for zone/epoch" | Backward secrecy | PASS-v2.1 |
-| **S1** | Utility restart, then a new command | Applied | **Answered DUP, silently dropped** | Command liveness | **FAIL-v2.1 → FIX SPECIFIED** (epoch ‖ counter, persisted) |
-| **S2a** | Crash after the counter write, before actuation (ACK not sent) | INTERRUPTED reported | **Never applied; utility dropped it** | Honest apply | **FAIL-v2.1 → FIX SPECIFIED** (intent log) |
-| **S2b** | Crash after an OK ACK, before actuation | Cannot happen (OK only after APPLIED) | **False OK; nothing to redeliver** | Honest apply | **FAIL-v2.1 → FIX SPECIFIED** |
+| **S1** | Utility restart, then a new command | Applied | **Answered DUP, silently dropped** | Command liveness | FAIL-v2.1 → **PASS-v2.2** (epoch ‖ counter, persisted; `test_S1_*`) |
+| **S2a** | Crash after the counter write, before actuation (ACK not sent) | INTERRUPTED reported | **Never applied; utility dropped it** | Honest apply | FAIL-v2.1 → **PASS-v2.2** (intent log; `test_S2a_VS3_crash_during_actuation`) [SIM] |
+| **S2b** | Crash after an OK ACK, before actuation | Cannot happen (OK only after APPLIED) | **False OK; nothing to redeliver** | Honest apply | FAIL-v2.1 → **PASS-v2.2** (`test_crash_after_applied_before_the_ack_left`, VS3) [SIM] |
 | V-G1 | Forged GRANT (no command key) | Reject: signature | — | Command authority | PASS-v2.2 |
 | V-G2 | GRANT from session X used in session Y | Reject: sid | — | Session binding | PASS-v2.2 |
 | V-G3 | SETPOINT without a live GRANT | REJECTED (no grant) | — | Command authority | PASS-v2.2 |
 | V-G4 | SETPOINT out of bounds / too fast / after expiry | REJECTED (bounds / rate / expired) | — | Safety limits | PASS-v2.2 |
-| V-G5 | Replayed or older SETPOINT | SUPERSEDED, not applied | — | Replay, ordering | PASS-v2.2 |
+| V-G5 | Replayed or older SETPOINT | Dropped by the envelope replay guard, not applied, no status (§13.5) | — | Replay, ordering | PASS-v2.2 (`test_VG5_replayed_setpoint_is_dropped`) |
 | V-G6 | SETPOINT forged by the broker (no session key) | AEAD fails | — | Integrity | PASS-v2.2 |
 | V-S1 | Utility restart and DB restore from an old backup, then a new command | Applied (epoch newer) | — | Liveness | PASS-v2.2 |
 | V-S2 | Fresh command answered DUP/SUPERSEDED | Utility regression alarm | — | Detectability | PASS-v2.2 |
@@ -3466,7 +3489,7 @@ Bounded costs:
 | V-Z1 | ZONEKEY delivered under the session (unsigned) cannot be forged by the broker | AEAD fails | — | Integrity | PASS-v2.2 |
 | V-D1 | DF with bundled alerts; utility processes them after MAC_D | Delivered once | — | 1-RTT correctness | PASS-v2.2 |
 | V-D2 | DF with a bad MAC_D and bundled alerts | Nothing processed | — | Authentication | PASS-v2.2 |
-| V-D3 | Lost DF → identical DF resent → identical NT; alerts not duplicated | One delivery | — | Idempotency | NEW (replaces "confirm before use" EDGE) |
+| V-D3 | Lost DF → identical DF resent → identical NT; alerts not duplicated | One delivery | — | Idempotency | **PASS-v2.2** (`test_lost_nt_identical_df_gets_identical_nt`; over the broker: `test_live_remainder_with_lost_acks_*`) |
 
 ## 24.2 PASR
 
@@ -3487,9 +3510,9 @@ Bounded costs:
 | E-P3 | Counterfactual: restart without a persisted STEK | Every ticket dies | "ticket not authentic" | Why the STEK is persisted | PASS-v2.1 |
 | E-P4 | Consumed ticket replayed after a restart | Reject | "ticket already used" | Single use | PASS-v2.1 |
 | E-P5 | Clone uses the ticket first | Genuine device sees "already used" (alarm); full handshake evicts the clone | ok | Clone detection | PASS-v2.1 |
-| **S3** | Torn write of used.json / stek.json | Restart OK; no ticket forgotten | **Restart fails (JSONDecodeError)** | Availability, replay | **FAIL-v2.1 → FIX SPECIFIED** (SQLite WAL) |
-| **S4** | 100k outstanding tickets | Constant cost per resume | **4.8 MB / 41.9 ms rewrite per resume** | Scalability | **FAIL-v2.1 → FIX SPECIFIED** |
-| **S5** | Rebuilt RH after the first was processed | (by design) full handshake; **v2.2:** the identical RH is resent and gets the same RS | "ticket already used" | Single use vs recovery | Behaviour confirmed; v2.2 retransmission rule **NEW** |
+| **S3** | Torn write of used.json / stek.json | Restart OK; no ticket forgotten | **Restart fails (JSONDecodeError)** | Availability, replay | FAIL-v2.1 → **PASS-v2.2** for a killed process (SQLite WAL; `test_S3_writer_killed_mid_stream_loses_no_promise`); a power cut is not tested (§25 L20) |
+| **S4** | 100k outstanding tickets | Constant cost per resume | **4.8 MB / 41.9 ms rewrite per resume** | Scalability | FAIL-v2.1 → **PASS-v2.2** (`test_S4_resume_cost_is_constant_with_100k_outstanding_tickets`) |
+| **S5** | Rebuilt RH after the first was processed | (by design) full handshake; **v2.2:** the identical RH is resent and gets the same RS (within the attempt lifetime, DR-053) | "ticket already used" | Single use vs recovery | **PASS-v2.2** (`test_S5_*`, in process and over the broker) |
 | RISK-1 | Stolen STEK | Attacker mints tickets (shown **succeeding** on purpose) | ok | Why an HSM | PASS-v2.1 (documented risk) |
 | RISK-2 | Stolen utility E2E key | Reads new sessions, **cannot forge commands** | ok | Separation of keys | PASS-v2.1 (documented risk) |
 
@@ -3508,7 +3531,7 @@ Bounded costs:
 | E-F2 | New firmware fails to boot | Revert; counter unchanged; rollback still blocked | ok | No bricking | PASS-v2.1 |
 | E-F3 | Chunk from another version mixed in | Reject | "chunk from another artifact" | Integrity | PASS-v2.1 |
 | E-F4 | Offline across policy v1 → v4 | Installs v4; v3 refused | ok | Currency | PASS-v2.1 |
-| **T1** | Manifest larger than the device's max packet | Delivered (parted) | **Never delivered at 8,192 / 16,384** | Update availability | **FAIL-v2.1 → FIX SPECIFIED** (parts; 128s) |
+| **T1** | Manifest larger than the device's max packet | Delivered (parted) | **Never delivered at 8,192 / 16,384** | Update availability | FAIL-v2.1 → **PASS-v2.2** (parts; 128s; V-F1, `test_N6_T1_*`; after a policy changes max_packet: DR-052) |
 | V-F1 | Parted 128s manifest at max 4,096 / 8,192 → installs | Installed | — | Availability | PASS-v2.2 |
 | V-F2 | KEYREVOKE(A) signed by B → A-signed artifacts refused; B-signed accepted | as stated | — | Revocation | PASS-v2.2 |
 | V-F3 | KEYREVOKE(A) signed by A, or revoking the last anchor | Refused | — | Revocation safety | PASS-v2.2 |
@@ -3526,10 +3549,10 @@ Bounded costs:
 | N5 | Broker restart with a retained manifest | Survives only with persistence | persistence on: kept; off: lost | Availability | PASS-v2.1 |
 | N6 | 400 KB publish vs `max_packet_size 300000` | Sender disconnected; 256 KB delivered | as expected | Resource bound | PASS-v2.1 |
 | N7 | TLS resumption after an IP change | Resumed | resumed | Mobility | PASS-v2.1 |
-| **T4** | Device clock 1970 / +3 years; expired device certificate | Connects (v2.2) | **Refused ("not yet valid" / "expired")** | Availability | **FAIL-v2.1 → FIX SPECIFIED** (T4-d and T4-g show the fix works) |
+| **T4** | Device clock 1970 / +3 years; expired device certificate | Connects (v2.2) | **Refused ("not yet valid" / "expired")** | Availability | FAIL-v2.1 → **PASS-v2.2** (`test_T4_device_tls_ignores_certificate_time_but_not_the_chain`) |
 | T7 | Per-device PSK on the hop | (evaluated as an alternative) | TLS 1.2 only, classical DHE; the pin bypassed | Downgrade | Alternative **rejected**; validator rule added |
 | V-N1 | Configuration validator refuses any TLS 1.2 listener | Refused | — | Downgrade | PASS-v2.2 |
-| I1 | Integrated: tampered chunk + replayed command + policy downgrade during a rollout | Each rejected by its own mechanism | — | Composition | Planned (Phase 4) |
+| I1 | Integrated: tampered chunk + replayed command + policy downgrade during a rollout | Each rejected by its own mechanism | — | Composition | **PASS-v2.2** (`test_I1_tampered_chunk_replayed_command_and_downgrade_during_a_rollout`, real Mosquitto) |
 
 **Totals.** 80/80 v2.1 scenarios behaved as expected, and N1–N7 passed.
 
@@ -3537,7 +3560,10 @@ The audit **demonstrated** failures in v2.1 in:
 - S1, S2a, S2b, S3, S4 (state and persistence);
 - T1, T4 (transport and TLS time).
 
-Their fixes are specified here. The v2.2 tests (V-*) are **not yet run**.
+Their v2.2 fixes are implemented in `pqgrid` and the corresponding tests pass [SIM, DOCKER] (IMPLEMENTATION-ROADMAP
+§13–§15; since 2026-09-30 in the substitute container, §17.3). The v2.1 "PASS-v2.1" rows are the design-validation
+results; 40 of the 57 rows whose status is PASS-v2.1 are re-run on the v2.2 code by a `pqgrid` test named after
+them (e.g. `test_A1_*`, `test_P1_*`, `test_F1_*`; counted from test discovery on 2026-09-30). None is [HW].
 
 ---
 
@@ -3560,7 +3586,13 @@ Their fixes are specified here. The v2.2 tests (V-*) are **not yet run**.
 | L13 | DoS is out of scope | Detectable only | §2.4 |
 | L14 | Mosquitto specifics: no native groups option; no TLS 1.3 PSK; the private `_ssl_wrap_socket` override in paho (pinned `paho-mqtt==2.1.0`) | Configuration fragility | §27 |
 | L15 | Traffic profiles: P1/P2 are derived from standards and practice, P3 from a simulated 802.15.4 study; no utility trace data | Estimates, labelled | §22 |
-| L16 | The HSM is only stated as a requirement; the prototype stores the STEK and command key in SQLite or files | Prototype key theft = RISK tests | §27.3 |
+| L16 | The HSM and the separation of the command service from the E2E key holder (U-2) are production requirements only: the prototype runs both in one process and keeps the STEK and the keyring (E2E and command private keys, DR-051) in its SQLite database | Prototype key theft = RISK tests | §27.3 |
+| L17 | D-2 pipelining (a PUBLISH right after CONNECT) and MQTT 5 topic aliases are not implemented in the Python device. This is a prototype choice, not a library limit: paho-mqtt 2.1.0 can send both (its `publish()` needs only the socket, and accepts a zero-length topic with a TopicAlias under MQTT 5); alias bookkeeping (per-connection mapping, re-sent QoS 1 messages) would be the application's | The byte/latency savings are the [DOCKER T5]/[SIM T6] figures, not measured on the protocol code | §10.5, §10.7 |
+| L18 | D-1 per-class TLS: the Python device cannot restrict TLS 1.3 groups or cipher suites, nor ask for max_fragment_length (`tls_max_record`); hybrid-only is enforced by the broker's pin | An MCU TLS stack is needed for these [HW] | §8.4, §22.2 |
+| L19 | DR events are delivered at most once across a power loss (the event is lost if power fails after its `bseq` is recorded and before the application acted) | No automatic recovery of that event | §11 |
+| L20 | Utility durability: SQLite WAL + `synchronous = FULL` is exercised against a killed process (SIGKILL), not a power cut; durability across a power cut relies on SQLite's documented guarantee [LIT] | Power-cut behaviour of the utility's disk is not demonstrated | §16 |
+| L21 | The closed rows of the `commands` table (the audit trail) are kept for ever by the prototype; a retention/archiving policy is an operator task. At 3 commands a day, 10,000 devices and ~3.6 KB a row: ~108 MB a day [ANALYTICAL] | Disk growth | §16 |
+| L22 | The device's maximum packet size reported in the registry (§10.2) is honoured by the utility as min(reported, class `max_packet`), but the Python device declares, and sizes its DF by, the class value. A reported value below the class value makes the NT/FIN answering a large DF unpublishable: the refusal is recorded and the DF's alerts still reach the application (audit L-4), but that device cannot establish until the value is corrected. No `pqgrid` code path sets it; provisioning must record the class value or more | Liveness of a misprovisioned device; no security effect | §10.2 |
 
 ---
 
@@ -3612,8 +3644,8 @@ The project **must not** claim:
 
 | # | Requirement |
 |---|---|
-| D-1 | TLS 1.3 client on the application MCU with hybrid groups (wolfSSL-class). Offers only its class suite. Asks for max_fragment_length per the class profile. Verifies the chain to the pinned CA set **without time checks**. Checks hostname/SAN. **TCP_NODELAY on** |
-| D-2 | MQTT 5 client: `clean_start = false`, Session Expiry, declared Maximum Packet Size = class `max_packet`, pipelining, topic aliases for high-rate TELEMETRY, back-off with full jitter |
+| D-1 | TLS 1.3 client on the application MCU with hybrid groups (wolfSSL-class). Offers only its class suite. Asks for max_fragment_length per the class profile. Verifies the chain to the pinned CA set (the installed policy's `ca_set`) **without time checks**. Checks hostname/SAN. **TCP_NODELAY on**. *Python prototype: chain to `ca_set`, no time checks, hostname and TCP_NODELAY implemented; class suite and max_fragment_length not (§25 L18)* |
+| D-2 | MQTT 5 client: `clean_start = false`, Session Expiry, declared Maximum Packet Size = class `max_packet` (reconnect when a new policy changes it, DR-052), pipelining, topic aliases for high-rate TELEMETRY, back-off with full jitter. *Python prototype: all but pipelining and topic aliases (§25 L17)* |
 | D-3 | E2E state machine per §9.4 (finished carries data), with identical retransmission of CH/DF/RH, and per-class DUP/PENDING timers |
 | D-4 | Command handling per §13: statuses, intent log, GRANT/SETPOINT checks, `idempotent` handling |
 | D-5 | Policy engine: binary parser (strict), strongest rule wins, CONTROL default, validator rules 1–10 |
@@ -3628,7 +3660,7 @@ The project **must not** claim:
 | # | Requirement |
 |---|---|
 | U-1 | E2E endpoint and PASR per §9 and §14, persist then respond |
-| U-2 | Command service **separated** from the E2E key holder; ML-DSA-65 key in an HSM (production) |
+| U-2 | Command service **separated** from the E2E key holder; ML-DSA-65 key in an HSM (production). *Not in the prototype (§25 L16)* |
 | U-3 | epoch ‖ counter sequences; the commands table as the redelivery queue; regression alarm |
 | U-4 | SQLite WAL, `synchronous = FULL`: registry, used tickets, STEK (or HSM), sequences, commands, zone keys, rollout state |
 | U-5 | Zone manager: ZONEKEY per member session; rotation on membership change + weekly |
@@ -3687,7 +3719,7 @@ All tests run in Docker unless marked **[HW]**. The existing 80 scenarios and N1
 | Category | Tests |
 |---|---|
 | **Unit** | Codec (strict parsing, caps, trailing bytes); policy validator rules 1–10; tier engine; X-Wing; HKDF labels; Merkle paths (all sizes, including non-powers of two); sequence classification (DUP / SUPERSEDED) and the utility regression alarm; GRANT bounds and rate; the device record store (CRC, latest-wins, compaction) |
-| **Integration** | Full lifecycle over real Mosquitto: provisioning → full handshake → alerts, commands, GRANT/SETPOINT → PASR → policy change → firmware update → ticket invalidation (I1); persistent sessions; parted manifest delivery |
+| **Integration** | Full lifecycle over real Mosquitto: provisioning → full handshake → alerts, commands, GRANT/SETPOINT → PASR → policy change → firmware update → ticket invalidation (the lifecycle tests); I1, the composed attack of §24.4; persistent sessions; parted manifest delivery |
 | **Security** | A1–A13, P1–P10, F1–F7, N1–N7, RISK-1/2; V-G1…G6, V-Z1, V-D2, V-F2, V-F3, V-F5, V-N1 |
 | **Crash** | S1 (utility restart), V-S1 (DB restore), S2 variants and V-S3 (every intent-log step), S3 (kill during every SQLite write → restart consistent), device crash at every record write, crash mid-KEYREVOKE |
 | **Reboot** | Reboot between RH/RS/DF/NT; after PENDING; mid-download; during swap **[HW]**; RTC 1970 and +3 years (T4) through **both** TLS and E2E |
@@ -3774,6 +3806,8 @@ redirects v2.1's ESP32 stretch goal to the actual target classes.
 | **v2.2 + remediation** | 2026-09-29 | Eight finalized clarifications (Appendix F): command classification order; logical zones with per-AEAD crypto groups, logical σ (`pqgrid/v2/bcast`) and re-send under the current key, no early-event buffer; `bseq` per logical zone, no floor; software-enforced 7-day residue; A/B anchor lifecycle. Fixes: live device revocation; bounded intent log (3 writes per command); guarded MQTT callbacks; policy race at DF; chain end on live sessions; scrub call paths; main loops; bounded caches and logs; independent X-Wing KAT and byte fixtures | Read-only correctness/security audit of the implementation |
 | **v2.2 + final remediation** | 2026-09-30 | Device storage budget and start-up check (2 × 4 × 4 KiB; true-bytes outbox; one pending body; zone/chunk/alert bounds); DF carries what its reply can ACK (C2: 53); reconnect back-off kept across main-loop ticks; E-2 zone sync (no cross-topic ordering assumption); E-3 cumulative SETPOINT ACK rules; E-4 deterministic republish triggers and validity | The audit's remaining items |
 | **v2.2 + continuous audit, cycle 1** | 2026-09-30 | Implementation brought in line with this document, no design decision changed: the device keeps and re-verifies its installed policy (§4.1, §15.11) and follows every class value of a new one; the utility's rollout state is durable (U-4); a torn flash-record header no longer blocks the store; a commit interrupted by power loss is finished at boot; identifier grammars match the whole string; GRANT memory bounded; the utility loop survives a refused scheduled policy; 17 test gaps closed by mutation analysis (112 of 117 mutants killed, 5 equivalent) | Iterative implementation audit, each item shown by a failing test first (IMPLEMENTATION-ROADMAP §14) |
+| **v2.2 + continuous audit, cycles 2–3** | 2026-09-30 | A revoked member keeps no zone key after a crash (zone removal finished at start); rotation before the policy is persisted; a DF's alerts recorded as seen only after its reply is built; revoked devices' TELEMETRY refused; an undefined class gets no ACL rights (the rest of the fleet's ACL is still written); a device follows its new crypto group's DR topic after an AEAD change. 147 mutants, 142 killed, 5 equivalent | IMPLEMENTATION-ROADMAP §14 |
+| **v2.2 + independent release audit remediation** | 2026-09-30 | Utility key rotation through the policy (DR-051); reconnect when a policy changes CONNECT properties, POLICY/KEYREVOKE sized to the class floor (DR-052); one authoritative revocation set at the utility (DR-050 amended); fresh utility_time: bounded attempt lifetime (DR-053); CA roll-over through `ca_set` (§4.5); ACL hook failures retried, never reported as refusals; DF alerts reach the application before the reply; clone alarm on a reused ticket; explicit broker user and queue limit; composed attack I1 over the broker; documentation reconciled (§24 statuses, anchor rule, V-G5, D-1/D-2, limitations L16–L22); evidence labelled [DOCKER, substitute] | Independent read-only release audit (IMPLEMENTATION-ROADMAP §15) |
 
 **Semester 1 (separate):** the SLE-KEMQTT prototype (`pq-mqtt-session-security/`), its design spec and the
 Semester 1 PDFs were removed from this folder on 2026-09-22. They were moved to the macOS Trash folder
@@ -4074,6 +4108,20 @@ landed in this document, and what remains open. Code, tests and results per item
 - **E-4 (resolved):** deterministic republish triggers and validity rules, independent of the time floor (§15.8).
 - **Device storage (resolved):** worst case 10,774 B per bank (10,758 B before DR-053 added the RH build time), store 2 × 4 × 4 KiB (§16 Device Storage Capacity);
   DF carries at most what its reply can ACK (C2: 53 alerts, §9.4).
+
+**Independent release audit (2026-09-30), and where each finding landed** (code, tests and evidence:
+IMPLEMENTATION-ROADMAP §15):
+
+| Finding | Resolution | Where |
+|---|---|---|
+| H-1 utility key rotation not implemented | Keyring; keys follow the active policy | §12 Policy Updates, §13.1, §23.7, DR-051 |
+| H-2 CONNECT properties stale after a policy change | Planned reconnect; POLICY/KEYREVOKE sized to the class floor | §12 Policy Updates, §15.9, DR-052 |
+| M-1 revocation snapshot at scheduling | One authoritative set; the policy in force stays until superseded | DR-050 (amended) |
+| M-2 stale authenticated utility_time | Attempt lifetime max(DUP_WINDOW, PENDING_TTL) | §9.4, §16, DR-053 |
+| M-3 CA roll-over not implemented | Device trust = installed `ca_set`; rule 10 requires CA certificates | §4.5, §12 rule 10, §27.5 K-4 |
+| M-4 contradictions in this document | Reconciled | §4.4, §4.6, §4.7, §13.5 (V-G5), §14.10, §15.14, §23.7, §24, §27.2, §31 |
+| M-5 substitute evidence not reproducible | Labelled [DOCKER, substitute]; recipe in Git; canonical still not buildable here | §17.3, L-list |
+| L-1 … L-10, design ambiguities 1–6 | Fixed, or documented as limitations L16–L22 | §11, §13.5, §22.2, §25, §27, §28 |
 
 **Not claimed:** hardware validation; guaranteed erasure while powered off; exactly-once actuation (the claim is
 at most once, with INTERRUPTED reported); latency gains beyond the measured [SIM]/[DOCKER] figures; security

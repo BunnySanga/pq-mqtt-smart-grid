@@ -1006,8 +1006,8 @@ Evidence:
   figure is claimed here.
 - The device side is Python, not an MCU TLS stack. It cannot restrict TLS 1.3 groups or suites (E53): hybrid is
   enforced by the broker pin and shown with `s_client`. A device-side TLS stack (wolfSSL-class) is **[HW]**.
-- The ACL compiler does not yet verify the policy **signature**, and the FOTA topic rights are not yet compiled:
-  both arrive with slice 6 (E13).
+- ~~The ACL compiler does not yet verify the policy **signature**, and the FOTA topic rights are not yet compiled:
+  both arrive with slice 6 (E13).~~ Done in slice 6 (`compile_acl` verifies the signed POLICY artifact).
 - The takeover threshold (5 connects in 10 minutes) is a heuristic that signals "investigate", not proof of a
   clone.
 
@@ -1248,10 +1248,12 @@ Iterative review after the final remediation pass. Every entry was first shown b
 before the fix (the "before" run is recorded in the commit message), then fixed, then checked with the focused
 tests, the full Docker suite and the frozen v2.1 `validate.py` (80/80). Evidence labels as in §13. Nothing is [HW].
 
-**Test environment note.** The canonical images are built from `design-validation/Dockerfile` (Debian trixie).
-Where Debian mirrors are unreachable, an equivalent base (Ubuntu 25.10: OpenSSL 3.5.3, Mosquitto 2.0.22,
-Python 3.13, the same pinned `cryptography`/`paho-mqtt`/`pytest`) was used; it reproduced the 464-test baseline
-and v2.1 80/80 before any change.
+**Test environment note (corrected, §15).** The canonical images are built from `design-validation/Dockerfile`
+(Debian trixie). It could not be built in this environment (Debian mirrors 403, later Docker Hub 429), so **every
+number of this section was produced in a SUBSTITUTE base** (Ubuntu 25.10: OpenSSL 3.5.3, Mosquitto 2.0.22,
+Python 3.13.7, the same pinned `cryptography`/`paho-mqtt`/`pytest`; recipe now in `docker/substitute-ubuntu.Dockerfile`).
+It reproduced the 464-test baseline and v2.1 80/80 before any change; equivalence with the canonical image is not
+demonstrated (an earlier wording called it "equivalent").
 
 | # | Area | Defect (how it was shown) | Fix | Regression test | Label |
 |---|---|---|---|---|---|
@@ -1280,26 +1282,31 @@ and v2.1 80/80 before any change.
   I-18 (identical replies to identical requests within the DUP window) therefore holds while at most 4,096 distinct
   CH/RH/DF arrive within one window; in a larger restoration storm a QoS 1 duplicate may get a fresh reply and cost
   that device one more attempt. Not a safety issue; sizing it to the fleet is a deployment choice.
-- **Latent, untested path:** `DeviceRecord.max_packet` (a per-device limit in the registry) is honoured by the
+- **Latent path:** `DeviceRecord.max_packet` (a per-device limit in the registry) is honoured by the
   utility's publish check, but `pqgrid` devices declare and size everything (MQTT Maximum Packet Size, DF) from their
   class. A per-device value below the class value would make the NT/FIN answering a full DF unpublishable. No
-  production caller sets it; it should equal the class value or be removed.
+  production caller sets it. *Release audit (§15):* kept (Master §10.2 has the device report its maximum), now
+  exercised by the L-4 test and recorded as Master §25 L22.
 - ~~**Minor ordering:** `on_finished` recorded the bundled alerts as seen before NT/FIN was built~~ — fixed in C2-6.
 - **Installed policy damaged in flash:** `Installer.installed_policy()` raises; re-installing the same version to
   repair it is not implemented [HW: flash integrity].
 - **Mutation analysis:** 5 equivalent mutants (listed in C1-9) remain by construction; `tools/mutation_check.py`
   re-runs the analysis.
 - **[HW]:** unchanged from §13.8.
-- **ACL recompilation (optional hardening):** the ACL hook runs once after a revocation or an activation; if it
+- ~~**ACL recompilation (optional hardening):** the ACL hook runs once after a revocation or an activation; if it
   fails (e.g. the broker is restarting when it is signalled) the failure is visible (it raises to the caller or is
-  an internal alarm of the loop) but is not retried. Since C2-4 and C2-7 a stale ACL gives a revoked device nothing
+  an internal alarm of the loop) but is not retried.~~ Retried by every tick since the release audit (§15, L-1). Since C2-4 and C2-7 a stale ACL gives a revoked device nothing
   beyond a broker connection (unreadable events, refused messages, public signed artifacts).
 - **DR re-send cost (by design, M4):** each (re)establishment re-sends every still-valid event of the device's zones;
   the device drops what it already accepted. Recorded in Master §22.6; changing it needs a decision record.
 - **Not implemented in the Python device (Master D-2):** pipelining CONNECT with the first PUBLISH (`DeviceMqtt.connect`
-  waits for CONNACK) and MQTT 5 topic aliases for high-rate TELEMETRY (paho 2.1 cannot send them: see
-  `design-validation/constrained-audit/test_transport.py`). Both are byte and latency optimisations, measured in
-  the design-validation T5/T6 experiments, not security properties; an MCU client provides them.
+  waits for CONNACK) and MQTT 5 topic aliases for high-rate TELEMETRY. *Corrected by the independent release audit
+  (§15):* this is a choice of the prototype, not a paho limit. paho-mqtt 2.1.0 can do both (`publish()` and
+  `subscribe()` need only the socket, which the synchronous `connect()` has once CONNECT is sent; under MQTT 5 it
+  accepts a zero-length topic with a TopicAlias property), and the cited experiment's own recorded result
+  (`design-validation/constrained-audit/results/transport.txt`) shows an aliased publish of 94 B sent through paho.
+  Both are byte and latency optimisations, measured in the design-validation T5/T6 experiments, not security
+  properties (Master §25 L17).
 
 
 **Cycle 2 (fresh scan of the updated tree).** Regression review of cycle 1's changes: none found. Broker tests
@@ -1343,8 +1350,127 @@ Recorded: the M4 re-send cost and the unretried ACL hook (C3-2). Final fresh aud
 | Cycles | 3, each ending with a fresh scan and a regression review of the previous cycle's own changes |
 | Production defects found and fixed | 18, each shown by a failing test or script first: C1-1, C1-2, C1-3, C1-4, C1-7, C1-8 (2: lock-out; unverified staged policy), C1-10 (3: installer limit, outbox cap, own class), C1-12, C1-13, C2-4, C2-5, C2-6, C2-7, C3-1, C3-3 |
 | Test and harness defects fixed | a TLS 1.3 race in T4 (C1-6), harness fidelity (C1-11), 3 any-exception assertions (C1-5), 18 test gaps from mutation analysis (C1-9: 17; C2-2: 1) |
-| Tests | 464 → 546 collected (Docker); 40 new test functions, 1 replaced; ≈ 10 existing tests strengthened |
+| Tests | 464 → 546 collected ([DOCKER, substitute]); 40 new test functions, 1 replaced; ≈ 10 existing tests strengthened |
 | Mutation analysis | 147 mutants over every security/correctness check, including those added here: 142 killed, 5 equivalent by construction (`tools/mutation_check.py`) |
 | Dead code | `mqtt.tls.CLASS_SUITE`, `fota.installer.TYPES`, 7 unused imports |
-| Evidence | v2.1 `validate.py` 80/80 at every stage; broker tests 41/41 in 3 concurrent runs; [SIM] and [DOCKER] only |
+| Evidence | v2.1 `validate.py` 80/80 at every stage (it tests the v2.1 reference prototype, not `pqgrid`); broker tests 41/41 in 3 concurrent runs; [SIM] and [DOCKER, substitute] only |
 | Not claimed | hardware validation, formal verification, exactly-once actuation, production readiness, completeness: what remains is in §14.1 |
+
+## 15. Independent release audit and remediation (2026-09-30)
+
+An independent, read-only release audit of `main` at `197ef40` (the merge of PR #1) reported 2 high and 5 medium
+findings, 10 low ones, 6 design ambiguities, and lists of requirement gaps, validation gaps, stale material and weak
+tests. They were remediated on the branch `claude/release-remediation`, created from `origin/main` at `197ef40` and
+not merged. For each code fix the steps were: reproduce it (a test that fails on the code before the fix, run in a
+scratch copy); fix it; add a regression test; run the focused tests, the broker tests and the full suite; review the
+diff; commit; push.
+
+Evidence labels as in §13. [SIM] means in-process, on the production code paths. [DOCKER, substitute] means the real
+Mosquitto 2.0.22 in the substitute image (§15.10). Nothing here is [HW].
+
+### 15.1 Stage 1: release blockers
+
+| # | Issue (audit) | Root cause | Fix | Files | Regression tests | Broker validation | Commit | Status |
+|---|---|---|---|---|---|---|---|---|
+| H-1 | Utility key rotation through the policy did not work. Activating a policy that names new `utility_kem_pk` / `utility_cmd_pk` succeeded, but the utility kept its old private keys: every device on the new policy was refused and commands stayed signed with the old key | The utility took its private keys once, at start, and never read the keys named by the policy | A keyring (`pqgrid/keyring.py`, `SqlKeyring` in the utility database). The utility always uses the pair its **active** policy names. Scheduling or activating a policy whose keys are not held is refused before any state changes. `open_utility` selects keys by the active policy. Queued commands and retained DR events are re-signed under the active key with the same sequence numbers. The two most recent retired E2E keys are used only to recognise and refuse an old-policy hello (E-4 republish); such a hello never yields a session. Master §12, §13.1, §23.7, DR-051 | `keyring.py`, `errors.py`, `suite/sig.py`, `persistence/utility_db.py`, `commands/utility.py`, `commands/zones.py`, `e2e/handshake.py`, `mqtt/utility_node.py` | `tests/security/test_key_rotation.py` (13): KEM key, command key, both; missing and mismatched keys; a crash before and after the activation write; restarts; commands and events queued across a rotation; old-key hellos; no key material in reprs | `test_utility_key_rotation_rollout_over_the_broker` (both production loops, device power cycle, utility restart) [DOCKER, substitute] | `3ba7195` | FIXED |
+| H-2 | CONNECT properties stayed stale after a policy change. A policy raising `max_packet` left the live connection on the old declared limit; the broker silently dropped the NT answering a DF with an alert backlog, and the device could not re-establish | New class values reached only the client's properties object; nothing reconnected, while the utility, the installer and DF sizing switched at once. The C1-10 test inspected that object | `DeviceMqtt` declares the **installed** policy's values at CONNECT and records what the live connection declared. When they differ it makes one planned reconnect (flush, DISCONNECT, CONNECT) at the §12 re-handshake point. After a raise it re-subscribes to the retained FOTA topics. The publisher sizes POLICY/KEYREVOKE to the class **delivery floor** (the smallest `max_packet` any activated policy gave the class, persisted); FIRMWARE follows the current policy. Master §12, §15.9, DR-052 | `mqtt/device_node.py`, `fota/publisher.py`, `persistence/utility_db.py` | C1-10 unit test now asserts what the next CONNECT declares; publisher floor unit test (`test_fota.py`) | `tests/integration/test_connect_properties.py` (5), observed at the broker (its CONNECT log, what it forwards, whether it kept the session): raise with a 60-alert backlog, lower + 3 s session expiry, broker outage + reboot, no-change policy (no reconnect), FIRMWARE and a DR event above the old limit. The pre-fix device fails all 5 (the backlog test with the audit's symptom) | `f400bdd` | FIXED |
+| M-1 | A policy scheduled while anchor A was valid was still activated after KEYREVOKE(A); every device refuses it, so the utility and the fleet diverged | The scheduled policy was verified against the caller's revocation snapshot, taken at scheduling time | The database's `revoked_anchors` table is the single authoritative set. It is consulted at scheduling, at every activation attempt, at restart (a scheduled policy is re-verified), for a new policy's ACL and for republication. The policy already in force is not re-judged. DR-050 amended | `mqtt/utility_node.py`, `persistence/utility_db.py`, `fota/publisher.py` | `tests/security/test_revocation_authority.py` (6): real utility, SqlPublisher, anchors A/B and a device installer | Covered in-process with the production loop (`UtilityMqtt.tick`); no broker behaviour involved | `52b1394` | FIXED |
+| M-2 | A stale but authentic `utility_time` could roll the device clock back: an SH withheld for 6 h set the clock 6 h back | A hello was resent identically, and any authentic reply to it accepted, for ever | Attempt lifetime = `max(DUP_WINDOW, PENDING_TTL)` on the device's clock. Past it the hello (an RH with its ticket) is abandoned, a reply to it is refused before its time is believed, and a persisted PSK RH carries its build time. Master §9.4, §16 (budget 10,774 B), DR-053 | `e2e/handshake.py`, `persistence/device.py`, `mqtt/device_node.py` | `tests/security/test_time_freshness.py` (12, 11 of which fail on the pre-fix code); `test_flash_capacity.py` budget | [SIM] only: the delay is on the utility→device path and is modelled by holding the reply | `c513584` | FIXED |
+| M-3 | CA roll-over through the policy's `ca_set` was not implemented: `ca_set` was parsed and never used | The device TLS context came from provisioning files | The device's TLS trust is the installed policy's `ca_set` (no time checks, §8.8), rebuilt when a new policy changes it (next connection; the TLS session is dropped). Rule 10 requires DER X.509 CA certificates. Master §4.5, §12 rule 10, K-4 | `mqtt/tls.py`, `mqtt/device_node.py`, `policy/validator.py` | `tests/unit/test_ca_trust.py` (rule 10 cases, >2 refused by the codec, the context trusts exactly `ca_set`) | `tests/integration/test_ca_rollover.py`: v2 with {current, next} rolled out, the broker switches to the next CA, the v2 device re-establishes (also after a power cycle), a v1 device is refused by TLS [DOCKER, substitute] | `136982b` | FIXED |
+
+### 15.2 Stage 2: the other findings
+
+| # | Finding | Decision / fix | Tests / evidence | Commit | Status |
+|---|---|---|---|---|---|
+| M-4 | Contradictions between the Master and the code | Reconciled: §4.4, §4.6, §4.7 (anchor roles, key rotation), §12 (`tls_max_record`, rule 10), §13.5 (V-G5), §14.10, §15.14 (the last-anchor guard is unreachable), §17.3 (substitute label), §22.2 (utility bounds), §23.7, §24 (statuses of S1, S2a, S2b, S3, S4, S5, T1, T4, V-D3, V-G5 and I1 set from the tests that exist, each with its test name), §25 (L16–L22), §27.2 (D-1, D-2, U-2 prototype notes), §28 (I1), §31, Appendix F | Documentation; every status names its test | this commit | FIXED |
+| M-5 | The final evidence came from a substitute environment that was not in Git | `docker/substitute-ubuntu.Dockerfile`: labelled SUBSTITUTE, pinned by digest, versions recorded; `docker/pqgrid-tests.Dockerfile` takes `BASE`. The canonical build was retried and failed again (§15.10). All figures are labelled [DOCKER, substitute]; equivalence is not claimed | §15.10 | `d460e3a` | FIXED (reproducibility); canonical run: VALIDATION GAP |
+| L-1 | An ACL hook failure was reported as "policy refused" and never retried | `recompile_acl()`: the activation result stands on its own; a failure is recorded in `acl_failures` and retried by every tick until it succeeds. A zone join now also owes a recompile. `broker.acl_installer()` is the production hook (compile, atomic write, SIGHUP) | `test_an_acl_hook_failure_is_retried_and_never_reported_as_a_refused_activation`; the broker rollout test uses `acl_installer` and checks the file the broker reloads | `16f0ced` | FIXED |
+| L-2 | The last-anchor guard cannot be reached under DR-050 | Kept as defence in depth (hardware with more anchors). The installer docstring, its comment and the V-F3 test comment now say it is unreachable; no scenario was manufactured to reach it. Master §15.14 | Mutant 110 classified as unreachable (§15.9) | `d460e3a`, this commit | VERIFIED LIMITATION (intentional dead branch) |
+| L-3 | A DR event can be lost between the `bseq` write and application delivery if power fails | Chosen semantics: **at most once** (Master §11, L19), as for commands (L9). No durable pending-delivery record was added: the device cannot tell whether the application acted before the cut, so re-delivery after a reboot would make it at least once (a possible double action), and a broadcast has no ACK to report the loss | `tests/security/test_dr_power_loss.py` (27): a cut at each of the 26 bytes of the `bseq` record (torn: the re-send is accepted after reboot) and after it is durable (the re-send is refused as a replay: lost, never delivered twice) | `7736bf6` | VERIFIED LIMITATION (L19) |
+| L-4 | DF alerts could be marked seen before the application got them, when the NT publish failed | The alerts are handed to the application before the reply is published | `test_df_alerts_reach_the_application_even_when_the_reply_cannot_be_published` (delivered once; a retransmitted DF adds nothing) | `16f0ced` | FIXED |
+| L-5 | `max_fragment_length` (`tls_max_record`) is parsed and validated but never applied | Python's `ssl` has no API for it. It stays in the signed policy format for an MCU TLS stack (D-1). Code comment, Master §12 table and L18 say the prototype does not apply it | — | this commit | NOT IMPLEMENTED AND EXPLICITLY DOCUMENTED |
+| L-6 | No separation of duties or HSM in the prototype | Master §4.4 (command service row), §27.2 U-2 and L16 separate the production requirement from the prototype, which runs one process and keeps the keys in SQLite | — | this commit | NOT IMPLEMENTED AND EXPLICITLY DOCUMENTED |
+| L-7 | Broker user and queue limits were left to defaults | `render_config` writes `user mosquitto` and `max_queued_messages 1000`; `validate_config` requires both and refuses `user root` unless it is explicitly allowed (throwaway test containers only). `max_inflight_messages`, persistence paths and listener addresses stay operator-controlled | `test_transport_units.py` (render and validate cases) | `7736bf6` | FIXED |
+| L-8 | RAM and storage bounds were not sized | Master §22.2 table [ANALYTICAL; Python object sizes measured with `sys.getsizeof`]: duplicate cache 10.6–17.1 MiB; seen alert IDs 230 KiB per device; `commands` table ~108 MB a day at 3 commands a day for 10,000 devices (L21); the device's `_replies` and `_sync_pending` grow only under a malicious broker (DoS, out of scope) | `test_duplicate_reply_cache_is_bounded_by_count`; new `test_a_duplicate_hello_beyond_the_cache_bound_costs_one_more_attempt_and_nothing_else` (the §14.1 claim, now tested) | this commit | VERIFIED LIMITATION (L21 retention is an operator task) |
+| L-9 | Clone monitoring missed used-ticket events | "Ticket already used" raises `ticket_reuse_alarms` (Master §27.8 M-1), not only a refusal-log line | `test_a_reused_ticket_raises_the_clone_alarm` | `16f0ced` | FIXED |
+| L-10 | A stale roadmap sentence ("the ACL compiler does not yet verify the policy signature") | Struck through (§11.6); stale §14.1 entries now point here | — | this commit | FIXED |
+
+### 15.3 Design ambiguities (one definition each now)
+
+| # | Ambiguity | Decision (Master) | Tests |
+|---|---|---|---|
+| 1 | V-G5: SUPERSEDED or a replay drop? | A replayed or older SETPOINT is dropped by the envelope replay guard, with no status. SUPERSEDED is the status of a redelivered discrete command older than the last applied one, or of a replaced GRANT (§13.5) | `test_VG5_replayed_setpoint_is_dropped`; the SUPERSEDED cases in `test_control.py` |
+| 2 | "Takes effect at the next connection" | The next CONNECT declares the installed policy's values, and a policy that changes them causes exactly one planned reconnect (DR-052) | `test_connect_properties.py` |
+| 3 | Who owns anchor revocation state, and when is it checked? | The utility database's set is authoritative and is checked at scheduling, activation, restart, new-policy ACL compilation and republication. The policy in force is not re-judged (DR-050 amended) | `test_revocation_authority.py` |
+| 4 | `utility_time` adopted before key confirmation | Kept, but only from a reply to a hello younger than the attempt lifetime. Adopting after NT/FIN was rejected because the NT can be held back the same way (DR-053) | `test_time_freshness.py` |
+| 5 | DR-event delivery across a power loss | At most once (§11, L19) | `test_dr_power_loss.py` |
+| 6 | Two definitions of I1 | §24.4 defines it: a composed attack during a rollout. The §28 lifecycle test that carried the name is renamed `test_lifecycle_over_the_broker` | `test_composed_attack.py::test_I1_…` over the broker |
+
+### 15.4 Requirement gaps named by the audit
+
+| Item | Status |
+|---|---|
+| Utility key rotation through the policy | FIXED (H-1) |
+| CA roll-over through `ca_set` | FIXED (M-3) |
+| D-1 `max_fragment_length` | NOT IMPLEMENTED AND EXPLICITLY DOCUMENTED (L18; Python `ssl` has no API) |
+| D-2 pipelining and topic aliases | NOT IMPLEMENTED AND EXPLICITLY DOCUMENTED (L17). The earlier "paho cannot" reason was wrong and is corrected in §14.1 and the Master |
+| U-2 separation of duties / HSM | NOT IMPLEMENTED AND EXPLICITLY DOCUMENTED (L16) |
+| B-6 broker queue limit, B-1 user | FIXED (L-7) |
+
+### 15.5 Validation gaps named by the audit
+
+| Item | Status |
+|---|---|
+| Utility SQLite durability is tested against SIGKILL only | VALIDATION GAP (L20; SQLite's guarantee is [LIT]) |
+| Composed I1 attack | FIXED: `test_composed_attack.py` over the broker (`7736bf6`) |
+| Timing and side channels | VALIDATION GAP (L12) |
+| Latency and byte figures modelled, not measured on hardware or networks | VALIDATION GAP, labelled [SIM]/[ANALYTICAL]/[DOCKER] (L17, §22) |
+| ACL wiring through operator hooks | `broker.acl_installer` is the production hook and runs in the broker rollout test. Running it in a deployment (broker PID, file path, permissions) is operator configuration: VALIDATION GAP for a real deployment |
+| Latent `max_packet` paths | FIXED for the class value (H-2 broker tests); the per-device registry value is documented (Master §25 L22) and exercised by the L-4 test |
+| Duplicate cache beyond 4,096 | VERIFIED LIMITATION: bound tested; the effect past it (one more attempt, nothing else) is now tested |
+| Canonical environment not run | VALIDATION GAP (§15.10) |
+| MCU resource claims analytical or from literature | VALIDATION GAP [HW] (§15.12) |
+| Mutation analysis excludes integration tests | Partly addressed: 3 mutants also run the broker test that exercises them. The in-process score is reported separately (§15.9) |
+| Tests use private attributes | Reviewed (§15.8) |
+| Tests stub paho or call callbacks directly | The C3-3 AEAD move (`16f0ced`) and revoked-device TELEMETRY (C2-7) also have broker tests now. The callback-level unit tests stay as fast checks of the same production callback |
+| The SH-forgery helper re-implements SH generation | Cross-checked against the production SH layout (`d460e3a`) |
+| Survivor classifications rely on untested invariants | Survivors 24 and 28 now have direct tests (`d460e3a`); 40, 110 and 112 are classified in §15.9 |
+
+### 15.6 Stale, dead or conflicting material
+
+| Item | Decision |
+|---|---|
+| The last-anchor guard and a comment claiming it is tested | Guard kept (defence in depth); the comments are corrected (L-2) |
+| `Policy.ca_set` parsed but unused | Now the device's TLS trust (M-3) |
+| `ClassProfile.tls_max_record` parsed but unused | Kept. It is a field of the signed v2.2 policy encoding, and removing it would change the format every device verifies. Marked as not applied by the prototype (L-5) |
+| `DeviceRecord.max_packet` latent path | Kept (Master §10.2); commented; Master §25 L22; exercised by the L-4 test |
+| Redundant ticket checks 5 (chain) and 8 (mode) | Kept as defence in depth; each now has a direct test with a ticket sealed by the real STEK in a state `issue()` never produces |
+| Stale validation numbers and statuses | Master §24 and §31 updated from the tests that exist; counts in §15.11 come from test discovery |
+| Stale anchor-revocation wording | Master §4.6, §4.7 and §23.7 now state DR-050 as amended |
+
+### 15.7 Weak or misleading tests (audit list)
+
+| Test | Change |
+|---|---|
+| C1-10 `max_packet` | Asserts what the next CONNECT declares. The property itself is asserted at the real broker (`test_connect_properties.py`) |
+| V-F3 comment | No longer claims the guard is exercised |
+| I1 | A real composed attack over the broker (§15.3 item 6) |
+| S3 | The Master row says "killed process"; a power cut is L20 |
+| ACL wiring | The rollout test runs the production `acl_installer` and reads the ACL file the broker reloads |
+| C3-3, telemetry | Broker tests added or already present (§15.5) |
+| SH-forgery helper | Cross-checked against the production SH |
+| Mutation tool | A mutant counts as KILLED only when a test **fails** (pytest exit 1). A crash or collection error is ERROR, not a kill |
+
+### 15.8 Private attributes in tests
+
+`grep` finds 85 references to underscore attributes in 23 test files.
+
+| Kind | References | Examples | Decision |
+|---|---|---|---|
+| Fault-injection and setup seams: wrap or replace a private method to inject a failure or count calls, or set up a state | 33 | `_publish`, `_zone_sync`, `_handshake`, `_connection_step`, `_on_control`, `_lib` (OpenSSL NULL), `pasr._keys` (65,535 rotations) | Kept: there is no public way to inject these faults, and each test asserts public behaviour |
+| Checks that secret, half-open or bounded state is gone or bounded, where no public view exists | 40 | `_pending`, `_ch`, `_rh` after revocation; `_grants` (C1-4 memory bound); `_parts` (assembly bound); `_d` (duplicate cache); zone `_keys` epochs; the `_online` / `_conn_attempt` heuristics | Kept: these are the properties themselves |
+| Flash-model internals in the flash unit tests | 10 | `_pos`, `_wseq`, `_live` | Kept: they are white-box tests of the storage model |
+| CONNECT properties the next connection will declare | 1 | `_connect_props` | Kept as a fast check; the behaviour is asserted at the broker |
+| Harness | 1 | `_listening` | — |
+
+Replaced where a public equivalent existed: `test_utility_loop.py` read `UtilityMqtt._scheduled` (now the persisted state, `db.load_policy("scheduled")`). The C1-10 test read `_props` (now what the next CONNECT declares, plus the broker tests).

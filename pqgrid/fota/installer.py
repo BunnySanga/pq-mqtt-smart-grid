@@ -11,8 +11,9 @@ Order of trust for every artifact:
 Then, by type: FIRMWARE boots into the new slot only at activate_at (E60), after the bootloader re-hashes the
 slot (V-F4 model) and re-checks the signer (E59); the self-test decides commit or revert (E-F2). POLICY is
 re-hashed, validated and activated at activate_at (E57); it is staged beside the installed policy, which the device
-keeps in flash and boots with (installed_policy(), Master §4.1). KEYREVOKE applies DR-050: only B revokes A, never
-the last anchor.
+keeps in flash and boots with (installed_policy(), Master §4.1). KEYREVOKE applies DR-050: only B revokes A. The
+"never the last anchor" check (V-F3) cannot be reached with anchors {A, B} under that rule (nothing revokes B); it is
+kept as defence in depth for hardware with more anchors (Master §15.14).
 
 Protected storage (§15.11) is a separate record store that a factory reset does not erase. Its one record holds
 committed[FIRMWARE], committed[POLICY], the revocation counter, the revoked anchors, the active firmware slot and the
@@ -332,7 +333,7 @@ class Installer:
             raise FotaError("only the recovery anchor B may revoke the release anchor A (DR-050)")
         if not (set(self.anchors) - self.prot.revoked - {rid}):
             self._drop(KEYREVOKE)
-            raise FotaError("refusing to revoke the last active anchor")   # V-F3
+            raise FotaError("refusing to revoke the last active anchor")   # V-F3: unreachable under DR-050, §15.14
         self.prot.revoke(rid, m.version)                                   # counter + revoked set: one record
         self._drop(KEYREVOKE)
         for t in [t for t, x in {**self.staged, **{k: d.manifest for k, d in self.downloads.items()}}.items()

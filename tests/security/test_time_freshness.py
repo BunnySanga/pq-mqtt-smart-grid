@@ -10,7 +10,7 @@ production endpoints; the property asserted is always the device's time or a dec
 import pytest
 
 from conftest import World, make_policy
-from test_fota import C2, CHUNK, MP, build, station  # noqa: F401  (fixture)
+from test_fota import C2, MP, build, station  # noqa: F401  (fixture)
 from pqgrid.commands import CommandProcessor, CommandService, ZoneManager
 from pqgrid.e2e.envelopes import control_topic
 from pqgrid.e2e.handshake import DeviceEndpoint
