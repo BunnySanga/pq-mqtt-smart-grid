@@ -327,6 +327,32 @@ def test_VG4_bounds_rate_and_time(c: Ctl):
     assert len(c.sps) == 13
 
 
+def test_utility_grant_memory_is_bounded_by_live_grants(c: Ctl):
+    """Resource bound: each GRANT holds a 3,309-B signature. The utility forgets GRANTs of a device's earlier
+    sessions (they died with their session, §13.4) and GRANTs expired beyond the device-clock slack, when it issues
+    the next one. Before the fix every GRANT ever issued stayed in RAM (hourly GRANTs: ~570 KB per device per week)."""
+    from pqgrid.commands.utility import GRANT_CLOCK_SLACK_S
+    for _ in range(5):                                               # five sessions, one GRANT each
+        gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 3600)
+        assert c.deliver(genv) == b"OK"
+        c.reconnect()
+    live = c.w.utility.session_for(D1)
+    gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 60)
+    assert c.deliver(genv) == b"OK"
+    assert list(c.svc._grants) == [live.sid]                         # only the live session's GRANTs remain
+    for _ in range(20):                                              # one session, a short GRANT every hour
+        c.w.t += 3600
+        gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 60)
+        assert c.deliver(genv) == b"OK"
+    assert list(c.svc._grants[live.sid]) == [gid]                    # the expired ones were dropped
+    c.w.t += 60                                                      # just expired, inside the clock slack: kept,
+    assert c.deliver(c.svc.setpoint(D1, gid, 5, 30)) == b"REJECTED:time"   # so the device still decides (E56)
+    g2, genv = c.svc.grant(D1, TARGET, 0, 50, 12, 3600)             # a replaced but unexpired GRANT stays usable
+    assert c.deliver(genv) == b"OK" and gid in c.svc._grants[live.sid]
+    c.w.t += GRANT_CLOCK_SLACK_S
+    c.svc.grant(D1, TARGET, 0, 50, 12, 3600)
+    assert gid not in c.svc._grants[live.sid] and g2 in c.svc._grants[live.sid]
+
 def test_grant_not_yet_valid(c: Ctl):
     gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 3600, not_before=int(c.w.t) + 300)
     assert c.deliver(genv) == b"OK"

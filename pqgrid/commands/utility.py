@@ -93,6 +93,7 @@ class CommandService:
         self.alarms: list[tuple] = []                              # V-S2: sequence regression
         self.interrupted: list[tuple[bytes, int]] = []             # INTERRUPTED: an operator decides (§13.7)
         self._grants: dict[bytes, dict[bytes, Grant]] = {}        # sid → grant_id → GRANT (session-bound)
+        self._grant_sid: dict[bytes, bytes] = {}                  # device → the sid its GRANTs are held under
 
     # ------------------------------------------------------------------------------------------- helpers
     def now(self) -> int:
@@ -174,8 +175,20 @@ class CommandService:
         g = Grant(self.store.allocate(device_id, self.epoch), random_bytes(GRANT_ID_LEN), s.sid, target, lo, hi,
                   max_rate, nb, now + ttl_s, b"")
         g = replace(g, sig=mldsa_sign(self.cmd_key, grant_signed_input(device_id, topic, g)))
+        self._forget_grants(device_id, s.sid, now)
         self._grants.setdefault(s.sid, {})[g.grant_id] = g
         return g.grant_id, seal_control(self.u.policy, s, topic, encode(g))
+
+    def _forget_grants(self, device_id: bytes, sid: bytes, now: int) -> None:
+        """Bounded memory (each GRANT carries a 3,309-B σ): a device's GRANTs of an earlier session died with it
+        (§13.4), and one expired beyond the device-clock slack can no longer be used on either side."""
+        old = self._grant_sid.get(device_id)
+        if old is not None and old != sid:
+            self._grants.pop(old, None)
+        self._grant_sid[device_id] = sid
+        live = self._grants.get(sid, {})
+        for gid in [gid for gid, g in live.items() if now >= g.expires_at + GRANT_CLOCK_SLACK_S]:
+            del live[gid]
 
     def setpoint(self, device_id: bytes, grant_id: bytes, value: int, ttl_s: int) -> bytes:
         topic = self._topic(device_id, CmdType.SETPOINT)
