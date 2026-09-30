@@ -1178,6 +1178,12 @@ enc[0x04, zone, group, u64 key_epoch, u64 bseq, nonce(12),
 
 - One logical event has one σ and one `bseq`; it is sealed once per crypto group that has members.
 - A join rotates the joiner's group key; a removal (including revocation) rotates every group of the zone.
+- **A live join grants the read right before the key** (release remediation): the ACL naming the new member is
+  compiled and the broker told before its new ZONEKEY is sent. Mosquitto grants a SUBACK without the right and
+  filters at delivery, so the reverse order let a member that subscribed on its key lose the next events silently
+  until the broker reloaded [DOCKER, substitute: first event after a live join lost in 18 of 36 loaded runs before,
+  0 of 36 after]. Events published between the join and the new member's subscription reach it at its next
+  (re)establishment (below), if still valid (§25 L23).
 - The utility keeps every still-valid event (durably, before publishing). After a member (re)establishes it
   gets its ZONEKEY and then the still-valid events issued while it was a member, re-encrypted under its group's
   **current** key with the same σ and `bseq`, on its own control topic (one topic, so the key arrives first).
@@ -3593,6 +3599,7 @@ them (e.g. `test_A1_*`, `test_P1_*`, `test_F1_*`; counted from test discovery on
 | L20 | Utility durability: SQLite WAL + `synchronous = FULL` is exercised against a killed process (SIGKILL), not a power cut; durability across a power cut relies on SQLite's documented guarantee [LIT] | Power-cut behaviour of the utility's disk is not demonstrated | §16 |
 | L21 | The closed rows of the `commands` table (the audit trail) are kept for ever by the prototype; a retention/archiving policy is an operator task. At 3 commands a day, 10,000 devices and ~3.6 KB a row: ~108 MB a day [ANALYTICAL] | Disk growth | §16 |
 | L22 | The device's maximum packet size reported in the registry (§10.2) is honoured by the utility as min(reported, class `max_packet`), but the Python device declares, and sizes its DF by, the class value. A reported value below the class value makes the NT/FIN answering a large DF unpublishable: the refusal is recorded and the DF's alerts still reach the application (audit L-4), but that device cannot establish until the value is corrected. No `pqgrid` code path sets it; provisioning must record the class value or more | Liveness of a misprovisioned device; no security effect | §10.2 |
+| L23 | A member that joins a zone while connected subscribes to its group topic when its new ZONEKEY arrives; events published between the join and that subscription are not delivered live and reach it at its next (re)establishment (the §11 re-send), if still valid. That the broker applies the ACL (signalled before the key is sent) before it forwards the key relies on Mosquitto's reload-per-loop-pass behaviour, observed [DOCKER, substitute], not specified | A newly joined member can miss events issued in the first round trip after its join, until it reconnects | §11 |
 
 ---
 
@@ -3762,6 +3769,9 @@ source of numbers.
 | **Energy** | C3 on a live network | mJ per wake by strategy | Power profiler | Replaces the ratio argument in §22 with measurements |
 | **Watchdog** | C2/C3 | The worst crypto operation vs the watchdog period | Instrumented timing | D-9 settings |
 | **TLS footprint** | C2/C3 | wolfSSL with X25519MLKEM768 + ECDSA + one AEAD + max_fragment_length | Build + runtime measurement | Whether C2 is truly feasible |
+| **NOR flash** | C2/C3 | Page and sector geometry, program/erase granularity, wear against the 10,000-cycle analytical budget (§16), the state a power cut leaves mid-program (the prototype's FlashSim model assumes byte-granular torn writes) | Power-cut rig at random offsets; erase counters | The §16 record store and its budget on the real part |
+| **Bootloader swap** | C2/C3 | Power-fail safety of the A/B swap; external slot B modified after staging (V-F4, only [SIM] today) | Power cuts during the swap; slot rewritten between staging and boot | §15.10–§15.12 on hardware |
+| **TRNG / DRBG** | C2/C3 | Entropy source health and DRBG seeding before the first handshake (D-8); the prototype uses the host's OS/OpenSSL generator | SP 800-90B health tests; boot trace | D-8 on the real part |
 
 **Minimum useful set:** one nRF9160 DK (C3) plus one ~64 KB-RAM Cortex-M board with a modem (C2). This
 redirects v2.1's ESP32 stretch goal to the actual target classes.
@@ -3807,7 +3817,7 @@ redirects v2.1's ESP32 stretch goal to the actual target classes.
 | **v2.2 + final remediation** | 2026-09-30 | Device storage budget and start-up check (2 × 4 × 4 KiB; true-bytes outbox; one pending body; zone/chunk/alert bounds); DF carries what its reply can ACK (C2: 53); reconnect back-off kept across main-loop ticks; E-2 zone sync (no cross-topic ordering assumption); E-3 cumulative SETPOINT ACK rules; E-4 deterministic republish triggers and validity | The audit's remaining items |
 | **v2.2 + continuous audit, cycle 1** | 2026-09-30 | Implementation brought in line with this document, no design decision changed: the device keeps and re-verifies its installed policy (§4.1, §15.11) and follows every class value of a new one; the utility's rollout state is durable (U-4); a torn flash-record header no longer blocks the store; a commit interrupted by power loss is finished at boot; identifier grammars match the whole string; GRANT memory bounded; the utility loop survives a refused scheduled policy; 17 test gaps closed by mutation analysis (112 of 117 mutants killed, 5 equivalent) | Iterative implementation audit, each item shown by a failing test first (IMPLEMENTATION-ROADMAP §14) |
 | **v2.2 + continuous audit, cycles 2–3** | 2026-09-30 | A revoked member keeps no zone key after a crash (zone removal finished at start); rotation before the policy is persisted; a DF's alerts recorded as seen only after its reply is built; revoked devices' TELEMETRY refused; an undefined class gets no ACL rights (the rest of the fleet's ACL is still written); a device follows its new crypto group's DR topic after an AEAD change. 147 mutants, 142 killed, 5 equivalent | IMPLEMENTATION-ROADMAP §14 |
-| **v2.2 + independent release audit remediation** | 2026-09-30 | Utility key rotation through the policy (DR-051); reconnect when a policy changes CONNECT properties, POLICY/KEYREVOKE sized to the class floor (DR-052); one authoritative revocation set at the utility (DR-050 amended); fresh utility_time: bounded attempt lifetime (DR-053); CA roll-over through `ca_set` (§4.5); ACL hook failures retried, never reported as refusals; DF alerts reach the application before the reply; clone alarm on a reused ticket; explicit broker user and queue limit; composed attack I1 over the broker; documentation reconciled (§24 statuses, anchor rule, V-G5, D-1/D-2, limitations L16–L22); evidence labelled [DOCKER, substitute] | Independent read-only release audit (IMPLEMENTATION-ROADMAP §15) |
+| **v2.2 + independent release audit remediation** | 2026-09-30 | Utility key rotation through the policy (DR-051); reconnect when a policy changes CONNECT properties, POLICY/KEYREVOKE sized to the class floor (DR-052); one authoritative revocation set at the utility (DR-050 amended); fresh utility_time: bounded attempt lifetime (DR-053); CA roll-over through `ca_set` (§4.5); ACL hook failures retried, never reported as refusals; DF alerts reach the application before the reply; clone alarm on a reused ticket; explicit broker user and queue limit; composed attack I1 over the broker; a live zone join grants the ACL read right before the new zone key; documentation reconciled (§24 statuses, anchor rule, V-G5, D-1/D-2, limitations L16–L23); evidence labelled [DOCKER, substitute] | Independent read-only release audit (IMPLEMENTATION-ROADMAP §15) |
 
 **Semester 1 (separate):** the SLE-KEMQTT prototype (`pq-mqtt-session-security/`), its design spec and the
 Semester 1 PDFs were removed from this folder on 2026-09-22. They were moved to the macOS Trash folder
@@ -4122,6 +4132,7 @@ IMPLEMENTATION-ROADMAP §15):
 | M-4 contradictions in this document | Reconciled | §4.4, §4.6, §4.7, §13.5 (V-G5), §14.10, §15.14, §23.7, §24, §27.2, §31 |
 | M-5 substitute evidence not reproducible | Labelled [DOCKER, substitute]; recipe in Git; canonical still not buildable here | §17.3, L-list |
 | L-1 … L-10, design ambiguities 1–6 | Fixed, or documented as limitations L16–L22 | §11, §13.5, §22.2, §25, §27, §28 |
+| Found by the remediation's final broker runs: a live join sent the key before the read right | Read right first; the residual window documented | §11, §25 L23 |
 
 **Not claimed:** hardware validation; guaranteed erasure while powered off; exactly-once actuation (the claim is
 at most once, with INTERRUPTED reported); latency gains beyond the measured [SIM]/[DOCKER] figures; security

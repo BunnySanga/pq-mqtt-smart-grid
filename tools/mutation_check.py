@@ -7,7 +7,7 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
     docker run --rm pqgrid-tests python tools/mutation_check.py --root /app sel 1,9,10 0 1   # only these mutants
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
-147-171 the remediation after the independent release audit (R-x). A mutant may name broker tests (5th element)
+147-172 the remediation after the independent release audit (R-x). A mutant may name broker tests (5th element)
 for a check only a real broker exercises; they run in addition to the in-process suite (the test image has
 Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15.
 """
@@ -309,6 +309,10 @@ M = [
     ("pqgrid/mqtt/broker.py", "    if not (mq.isdigit() and 0 < int(mq)):", "    if False:", "R L-7 queue limit required"),
     ("pqgrid/mqtt/broker.py", "    elif glob[\"user\"] == \"root\" and not allow_root:", "    elif False:",
      "R L-7 root refused"),
+    ("pqgrid/mqtt/utility_node.py",                  # 172: the key before the read right (the old order)
+     "            self.recompile_acl()\n            self._send_zone_keys(zone)",
+     "            self._send_zone_keys(zone)\n            self.recompile_acl()",
+     "R join: read right before the new key"),
 ]
 
 

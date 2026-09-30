@@ -543,8 +543,9 @@ def test_E2_event_before_its_zonekey_is_recovered_by_a_zone_sync_over_the_broker
     held, real = _hold_first_control_to(plant, D1)
     plant.u.join_zone("f7", D2)                                                # A: rotation, d1's key held (B)
     assert wait_for(lambda: len(held) == 1)
-    plant.u.dr_event("f7", b"SHED 30%", 600)                                  # C: valid for 10 minutes
-    plant.u.dr_event("f7", b"SHED 40%", 600)                                  # a second one, same race
+    with plant.u.lock:                                  # answering d1's zone sync needs this lock, so both events
+        plant.u.dr_event("f7", b"SHED 30%", 600)        # precede its new key under any load. C: valid for 10 min
+        plant.u.dr_event("f7", b"SHED 40%", 600)        # a second one, same race
     assert wait_for(lambda: ("f7", b"SHED 40%") in d1.mq.events, 15), (d1.mq.dr_refused, d1.mq.errors)
     assert len([1 for _, why in d1.mq.dr_refused if "no key" in why]) == 2   # D: both refused, recorded, …
     assert d1.mq.zone_sync_requests == 1 and list(plant.u.zone_syncs) == [(D1, "f7")]   # … ONE sync (E)

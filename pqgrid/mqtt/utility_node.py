@@ -242,11 +242,16 @@ class UtilityMqtt:
             self._publish(did, topics.control(self.n.endpoint.registry.get(did).dclass, did), env)
 
     def join_zone(self, zone: str, did: bytes) -> None:
+        """The new member's read right (§10.1 ACL) is compiled and the broker told BEFORE its key goes out: Mosquitto
+        grants a SUBACK without the right and filters at delivery, so a member subscribing on its key ahead of the
+        reload would silently lose the next events. Mosquitto handles the reload signal at the end of a pass of its
+        loop, before it forwards a key published after the signal (observed, not specified: Master §25 L23). A
+        failed hook is retried by tick() (L-1); the key is sent regardless."""
         with self.lock:
             self.n.zones.add_member(zone, did)
+            self._acl_due = True
+            self.recompile_acl()
             self._send_zone_keys(zone)                                 # new epoch to every live member
-        self._acl_due = True                                           # the zone's read right (§10.1 ACL)
-        self.recompile_acl()
 
     def revoke_device(self, did: bytes) -> None:
         """Live revocation (H1): durable registry change, sessions and half-open state invalidated, the device

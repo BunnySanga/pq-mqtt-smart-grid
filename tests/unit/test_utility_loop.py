@@ -236,3 +236,29 @@ def test_a_reused_ticket_raises_the_clone_alarm(util):
     u.c.on_message(None, None, Msg("pqgrid/hs/meter-0009/up", clone.resume_hello()))
     assert [did for did, _ in u.ticket_reuse_alarms] == [b"meter-0009"]
     assert any("ticket already used" in r for r in u.refused)
+
+
+@requires_station
+def test_a_joining_member_gets_its_read_right_before_its_new_zone_key(util):
+    """Found by the final concurrent broker runs: join_zone published the new ZONEKEY and only then ran the ACL
+    hook. Mosquitto grants the SUBACK without a read right and filters at delivery, so a member that subscribed on
+    that key could have the next events silently dropped until the broker reloaded, and nothing re-sends them while
+    it stays connected. Now the ACL naming the new member is written and the broker told before its key goes out."""
+    from pqgrid.mqtt import topics
+    u, node, now, signed, restart = util
+    order = []
+
+    class Client:                                                      # the utility's MQTT client, recording
+        def publish(self, topic, payload, qos=0, retain=False):
+            order.append(("publish", topic))
+            return type("Info", (), {"is_published": lambda self: True})()
+    u.c = Client()
+    u.acl_hook = lambda: order.append(("acl", set(node.zones.zones["f7"].members)))
+    d = _device(node, now, b"der-0003", "der_ctrl")
+    ep = node.endpoint
+    d.on_server_hello(ep.on_client_hello(b"der-0003", d.client_hello()))
+    d.on_final(ep.on_finished(b"der-0003", d.finished()).final)       # a live session: its key is sent at once
+    node.zones.create("f7")
+    u.join_zone("f7", b"der-0003")
+    assert order == [("acl", {b"der-0003"}), ("publish", topics.control("der_ctrl", b"der-0003"))]
+    assert not u.acl_failures
