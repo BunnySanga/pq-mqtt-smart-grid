@@ -1293,3 +1293,10 @@ and v2.1 80/80 before any change.
   re-runs the analysis.
 - **[HW]:** unchanged from §13.8.
 
+
+**Cycle 2 (fresh scan of the updated tree).** Regression review of cycle 1's changes: none found. Broker tests
+under contention: three concurrent full integration runs, 41/41 each [DOCKER].
+
+| # | Area | Finding | Change | Test | Label |
+|---|---|---|---|---|---|
+| C2-1 | Fuzz coverage (I-21) | The fuzz tests covered the 12 slice-1 to slice-3 message types but none added later: ZONESYNC (E-2), the re-sent DR event, SETPOINT, ZONEKEY, the ALERT ACK and FIN. Result: no defect; every corruption of them is refused with a controlled error | Test-only | `test_corrupted_later_message_types_are_refused_cleanly` (6 × 300 mutations; the genuine message still works afterwards) | [SIM] |
