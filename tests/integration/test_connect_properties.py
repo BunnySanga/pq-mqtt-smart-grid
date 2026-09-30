@@ -171,3 +171,32 @@ def test_fota_and_dr_messages_between_the_old_and_the_new_limit(plant):
     plant.restart_utility()                                            # the floor survives a restart
     with pytest.raises(FotaError, match="largest packet every device of the class can receive"):
         plant.u.publish_artifact(big)
+
+
+# ------------------------------------------------ retained artifacts dropped under the old limit (mutation #155)
+def test_a_retained_artifact_dropped_under_the_old_limit_arrives_after_the_reconnect(plant):
+    """DR-052 / Master §15.9: the utility activates v2 and publishes FIRMWARE sized for v2's 16 KiB while the device's
+    live connection still declares 4 KiB. The broker drops it for that connection, and retained messages come only
+    with a SUBSCRIBE: after its one planned reconnect the device must subscribe to the retained artifacts again, or
+    it would not see this firmware until the retention window ended. Found by mutation analysis (#155 survived every
+    other test)."""
+    c = plant.add(C2, "c2_meter")                                      # 4096 B
+    v2 = with_class(plant, 2, "c2_meter", activate_in=6, max_packet=16384, fota_chunk_size=12288)
+    art = fleet_artifact(plant, v2, "c2_meter", 4096, 3072)
+    start(plant)
+    with loops(plant, c):
+        assert wait_for(lambda: c.d.confirmed, 15)
+        plant.u.publish_artifact(art)
+        plant.u.schedule_policy(art.signed, art.payload, plant.station.anchors)
+        assert wait_for(lambda: POLICY in c.mq.fota_staged, 15), c.mq.errors
+    assert wait_for(lambda: time.time() >= v2.activate_at, 15)         # both loops stopped; the device's 4 KiB
+    plant.u.tick()                                                     # connection stays up. The utility activates
+    assert plant.node.endpoint.policy.version == 2                     # v2 and publishes FIRMWARE for 16 KiB
+    fw = plant.station.build(FIRMWARE, "c2_meter", 2, os.urandom(30_000), 12288,
+                             part_payload_budget(16384, "c2_meter", FIRMWARE, 2))
+    plant.u.publish_artifact(fw)
+    time.sleep(2)                                                      # precondition: nothing reached the device
+    assert FIRMWARE not in c.fota.downloads and FIRMWARE not in c.mq.fota_staged
+    with loops(plant, c):                                              # it activates v2, reconnects once, and
+        assert wait_for(lambda: FIRMWARE in c.mq.fota_staged, 30), c.mq.errors   # the retained firmware arrives
+        assert c.mq.policy_reconnects == 1 and connects(plant, C2)[-1] == c.d.profile.keepalive_s
