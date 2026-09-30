@@ -403,8 +403,14 @@ def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tm
     with pytest.raises(FotaError, match="signature invalid"):
         verify_policy_artifact(build(rogue, POLICY, world.policy.version, payload).signed, payload, station.anchors)
     from pqgrid.mqtt.broker import compile_acl
-    with pytest.raises(FotaError):
+    with pytest.raises(FotaError, match="do not match"):
         compile_acl(art.signed, payload + b"x", station.anchors, [], {})
+    as_firmware = build(station, FIRMWARE, world.policy.version, payload)       # validly signed, wrong type
+    with pytest.raises(FotaError, match="not a POLICY artifact"):
+        verify_policy_artifact(as_firmware.signed, payload, station.anchors)
+    liar = build(station, POLICY, world.policy.version + 6, payload)            # manifest 7, policy 1 (E57)
+    with pytest.raises(FotaError, match="E57"):
+        verify_policy_artifact(liar.signed, payload, station.anchors)
 
 
 # ============================================================================================ publisher

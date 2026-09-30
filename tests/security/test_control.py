@@ -577,3 +577,85 @@ def test_clarification3_supersession_is_checked_before_expiry(c: Ctl):
     [env] = c.svc.outgoing(D1)                                       # A redelivered while still valid …
     c.w.t += 120                                                     # … arrives after it expired
     assert c.deliver(env) == b"SUPERSEDED" and c.applied == [b"B"]
+
+
+# ============================================================================ mutation-found gaps (C1-9)
+def test_control_is_sealed_and_opened_only_for_its_own_device_on_a_control_tier_topic(c: Ctl, world: World):
+    """§11: the sealer and the receiver check, from their OWN policy, that the topic is CONTROL tier and that the
+    topic's device owns the session. (The AEAD's topic binding would also refuse a moved envelope, which masked the
+    explicit checks in every earlier test.)"""
+    from pqgrid.e2e.envelopes import open_control
+    from pqgrid.policy import Rule, Tier
+    s = world.utility.session_for(D1)
+    with pytest.raises(EnvelopeError, match="another device"):
+        seal_control(world.policy, s, control_topic("der_ctrl", D2), b"x")
+    env = seal_control(world.policy, s, c.topic, b"x")
+    with pytest.raises(EnvelopeError, match="another device"):
+        open_control(world.policy, c.d.session, control_topic("der_ctrl", D2), env)
+    weak = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), rules=(Rule("grid/#", Tier.TELEMETRY),))
+    with pytest.raises(EnvelopeError, match="not CONTROL tier"):
+        seal_control(weak, s, c.topic, b"x")
+    with pytest.raises(EnvelopeError, match="not CONTROL tier"):
+        open_control(weak, c.d.session, c.topic, env)
+
+
+def test_a_status_with_an_unknown_token_is_refused_even_under_a_valid_mac(c: Ctl):
+    """DR-045: only the defined statuses settle a command; a device (or its key holder) cannot write another."""
+    from pqgrid.e2e.envelopes import T_STATUS
+    from pqgrid.suite.kdf import mac
+    from pqgrid.wire import u64
+    seq = c.issue()
+    s = c.d.session
+    body = [s.sid, u64(1), u64(seq), b"PROBABLY"]
+    with pytest.raises(EnvelopeError, match="unknown status"):
+        c.svc.on_status(enc([T_STATUS, *body, mac(s.key("ACK", "up"), b"".join(body))]))
+    assert c.svc.outcome(D1, seq) is None and c.pump() == [b"OK"]
+
+
+def test_setpoints_refused_for_a_class_that_allows_grants_but_not_setpoints(world: World):
+    world.policy = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk),
+                               classes=replace_class(world.policy, "der_ctrl",
+                                                     cmd_types=frozenset({CmdType.CMD, CmdType.GRANT})))
+    world.utility.policy = world.policy
+    c = Ctl(world)
+    gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 3600)
+    assert c.deliver(genv) == b"OK"
+    with pytest.raises(CommandError, match="does not accept SETPOINT"):
+        c.svc.setpoint(D1, gid, 5, 30)                                    # the utility will not send it …
+    assert c.deliver(_raw_setpoint(c, gid, 5)) == b"REJECTED:not-allowed"  # … and the device refuses it anyway
+    assert c.sps == []
+
+
+def test_an_oversized_signed_command_is_refused_before_anything_is_written(c: Ctl):
+    """E44: a PENDING intent must fit one flash record. The utility never issues a body above MAX_COMMAND; a signed
+    one that is larger anyway is refused as malformed: nothing actuated, no intent written."""
+    from pqgrid.commands.device import MAX_COMMAND
+    seq, exp, body = (c.svc.epoch << 32) | 99, int(c.w.t) + 60, b"x" * (MAX_COMMAND + 1)
+    cmd = Command(seq, body, exp, False, mldsa_sign(c.w.cmd_sk, cmd_signed_input(D1, c.topic, seq, exp, False, body)))
+    s = c.w.utility.session_for(D1)
+    assert c.deliver(seal_control(c.w.policy, s, c.topic, encode(cmd))) == b"REJECTED:malformed"
+    assert c.applied == [] and c.state.pending == {} and c.state.last_applied == 0
+    with pytest.raises(CommandError, match="larger than"):
+        c.svc.issue(D1, body, 60)
+
+
+def test_an_interrupted_idempotent_command_is_not_reapplied_after_it_expired(c: Ctl):
+    """§13.7: re-applied only if idempotent, UNEXPIRED and still the newest; otherwise reported INTERRUPTED."""
+    seq = c.issue(b"SET_MODE", ttl=300, idem=True)
+    env = c.svc.outgoing(D1)[0]
+    c.proc.actuate = lambda cmd: (_ for _ in ()).throw(PowerLoss())
+    with pytest.raises(PowerLoss):
+        c.proc.on_control(c.topic, env)
+    c.w.t += 300                                                     # power back only after it expired
+    c.reboot()
+    assert [c.svc.on_status(r)[2] for r in c.proc.recover()] == [b"INTERRUPTED"]
+    assert c.applied == [] and c.svc.outcome(D1, seq) == b"INTERRUPTED"
+
+
+def test_the_utility_refuses_a_setpoint_outside_its_grant(c: Ctl):
+    gid, genv = c.svc.grant(D1, TARGET, 0, 100, 12, 3600)
+    assert c.deliver(genv) == b"OK"
+    for bad in (101, -1):
+        with pytest.raises(CommandError, match="outside the GRANT bounds"):
+            c.svc.setpoint(D1, gid, bad, 30)
+    assert c.proc.on_control(c.topic, c.svc.setpoint(D1, gid, 100, 30)) is None and c.sps == [(TARGET, 100)]

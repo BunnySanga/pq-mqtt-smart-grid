@@ -8,6 +8,7 @@ from conftest import World, make_policy
 from pqgrid.e2e.envelopes import alert_topic
 from pqgrid.e2e.handshake import UnknownSessionError
 from pqgrid.errors import HandshakeError
+from pqgrid.registry import DeviceRecord
 from pqgrid.suite.sig import mldsa_public_bytes
 from pqgrid.wire import dec, enc, enc_list
 
@@ -64,6 +65,16 @@ def test_A3_client_hello_replayed_on_another_topic(world: World):
     d = world.device(M1, "smart_meter")
     with pytest.raises(HandshakeError, match="identity does not match"):
         world.utility.on_client_hello(b"meter-0002", d.client_hello())
+
+
+def test_client_hello_claiming_another_class_than_the_registry_is_refused(world: World):
+    """The registry fixes a device's class (§4.4). A CH that claims another class with the same AEAD (so its body
+    opens) is refused: no half-open state and no reply under either class's profile (mutation-found gap)."""
+    d = world.device(b"c2-0001", "der_ctrl", register=False)               # der_ctrl and c2_meter: both ChaCha
+    world.registry.add(DeviceRecord(b"c2-0001", "c2_meter", d.static.pk))
+    with pytest.raises(HandshakeError, match="device class mismatch"):
+        world.utility.on_client_hello(d.id, d.client_hello())
+    assert b"c2-0001" not in world.utility._pending
 
 
 def test_A4_device_on_old_policy(world: World):
@@ -221,3 +232,73 @@ def test_one_live_session_per_device_and_resync_hint(world: World):
     with pytest.raises(UnknownSessionError) as e:
         world.utility.open_alert(alert_topic("smart_meter", M1), stale)
     assert dec(e.value.hint, 2) == [b"\x07", old_sid]
+
+
+# --------------------------------------------------------------- device-side checks (mutation-found gaps)
+def _sh_from_the_utility_key(w: World, d, ch: bytes, pinfo: bytes, mode: bytes) -> bytes:
+    """A well-formed, fully authenticated SH as a holder of the utility's E2E private key could build it (RISK-2):
+    everything verifies, so only the device's own checks against its installed policy can refuse it."""
+    from pqgrid.e2e import keys
+    from pqgrid.suite import aead, hkem
+    from pqgrid.suite.kdf import h
+    from pqgrid.wire import u64
+    _, pk_e, ct_u, _n_d, _nonce, _ = dec(ch, 6)
+    ss_u, (ss_e, ct_e), (ss_d, ct_d) = hkem.decaps(w.u_static, ct_u), hkem.encaps(pk_e), hkem.encaps(d.static.pk)
+    n_u, nonce, now = os.urandom(32), os.urandom(12), int(w.t)
+    inner = aead.seal(d.profile.aead, keys.k1_key(ss_e, ss_u, ch), nonce,
+                      enc([ct_d, pinfo, mode, u64(now + 3600), u64(now)]), h(b"SH", ct_e, n_u))
+    th2 = h(ch, b"SH", ct_e, n_u, nonce, inner)
+    return enc([b"SH", ct_e, n_u, nonce, inner, keys.mac_u(keys.derive_master(th2, ss_e + ss_u + ss_d).kc_u, th2)])
+
+
+def test_device_refuses_an_authenticated_server_hello_with_another_policy_or_resume_mode(world: World):
+    """§9.4 "check POLICY_INFO_U = installed" and I-20 (the profile is never negotiated): even an SH that fully
+    authenticates cannot move the device to another policy, nor downgrade a PSK_KEM class to PSK resumption."""
+    d = world.device(D1, "der_ctrl")                                        # PSK_KEM: forward-secret resumption
+    ch = d.client_hello()
+    bad_policy = _sh_from_the_utility_key(world, d, ch, b"nitk-grid|\x00\x00\x00\x09", b"PSK_KEM")
+    with pytest.raises(HandshakeError, match="POLICY_INFO mismatch"):
+        d.on_server_hello(bad_policy)
+    downgrade = _sh_from_the_utility_key(world, d, ch, world.policy.info(), b"PSK")
+    with pytest.raises(HandshakeError, match="resume mode does not match"):
+        d.on_server_hello(downgrade)
+    assert d.session is None
+    d.on_server_hello(_sh_from_the_utility_key(world, d, ch, world.policy.info(), b"PSK_KEM"))   # the control:
+    assert d.session is not None                                            # the same SH, honest, is accepted
+
+
+def test_forged_fin_is_refused_and_the_genuine_one_confirms(world: World):
+    """Without a ticket issuer the utility ends the handshake with FIN = HMAC(fin key, sid): a broker cannot
+    confirm the session in its place, nor inject ACKs."""
+    world.utility.tickets = None
+    d = world.device(M1, "smart_meter")
+    d.on_server_hello(world.utility.on_client_hello(M1, d.client_hello()))
+    fin = world.utility.on_finished(M1, d.finished()).final
+    assert dec(fin, 3)[0] == b"FIN"
+    with pytest.raises(HandshakeError, match="final message failed authentication"):
+        d.on_final(flip(fin, 1, 3))
+    assert not d.confirmed
+    assert d.on_final(fin) == [] and d.confirmed and d.ticket is None
+
+
+def test_a_class_that_never_resumes_refuses_a_ticket(world: World):
+    """Resume mode NONE (§14): the device never stores a ticket, even one that authenticates under the session."""
+    from conftest import replace_class
+    from pqgrid.e2e import keys
+    from pqgrid.policy import ResumeMode
+    from pqgrid.suite import aead
+    from pqgrid.suite.kdf import h
+    from pqgrid.wire import u64
+    world.policy = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk),
+                               classes=replace_class(world.policy, "smart_meter", resume=ResumeMode.NONE))
+    world.utility.policy = world.policy
+    d = world.device(M1, "smart_meter")
+    d.on_server_hello(world.utility.on_client_hello(M1, d.client_hello()))
+    res = world.utility.on_finished(M1, d.finished())
+    s, nonce = res.session, os.urandom(12)
+    nt = enc([b"NT", nonce, aead.seal(s.aead, keys.new_ticket_key(s.k_master), nonce,
+                                      enc([os.urandom(16), b"blob", u64(int(world.t) + 60)]), h(b"NT", s.sid)), b""])
+    with pytest.raises(HandshakeError, match="unexpected ticket"):
+        d.on_final(nt)
+    assert d.ticket is None and not d.confirmed
+    assert d.on_final(res.final) == [] and d.confirmed and d.ticket is None    # the genuine FIN

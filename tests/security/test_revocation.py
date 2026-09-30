@@ -99,3 +99,33 @@ def test_revocation_is_durable_across_a_utility_restart(tmp_path):
     d = DeviceEndpoint(D1, "der_ctrl", policy, 1, kp, clock=lambda: t[0])
     with pytest.raises(HandshakeError, match="revoked"):
         again.endpoint.on_client_hello(D1, d.client_hello())
+
+
+def test_a_revocation_that_reached_only_the_registry_is_still_enforced(world: World):
+    """H1 in depth: every E2E use consults the registry's current state, so a revocation recorded in the registry
+    alone (without UtilityEndpoint.revoke_device, e.g. by another operator process) still refuses the device's live
+    session for commands, GRANTs and status ACKs (mutation-found gap: the checks were masked because revoke_device
+    also removes the sessions)."""
+    from pqgrid.e2e.envelopes import status_ack
+    svc, d1, d2, p1, p2, zm = setup(world)
+    seq = svc.issue(D1, b"TRIP", 300)
+    [env] = svc.outgoing(D1)
+    world.registry.revoke(D1)                                              # the registry only
+    assert world.utility.session_for(D1) is not None                       # the session is still in RAM …
+    assert world.utility.current_session(D1) is None                       # … but no longer usable
+    with pytest.raises(EnvelopeError, match="revoked"):
+        svc.on_status(p1.on_control(control_topic("der_ctrl", D1), env))
+    with pytest.raises(EnvelopeError, match="revoked"):
+        svc.on_status(status_ack(d1.session, 0, seq, b"INTERRUPTED"))
+    assert svc.outcome(D1, seq) is None                                    # nothing settled by a revoked device
+    with pytest.raises(CommandError, match="revoked"):
+        svc.grant(D1, "P_ACTIVE_W", 0, 10, 1, 60)
+    assert zm.zonekeys_for(D1) == [] and svc.outgoing(D1) == []
+
+
+def test_revocation_drops_the_half_open_handshake(world: World):
+    d = world.device(D1, "der_ctrl")
+    world.utility.on_client_hello(D1, d.client_hello())
+    assert D1 in world.utility._pending
+    world.utility.revoke_device(D1)
+    assert D1 not in world.utility._pending                                # nothing of it stays in RAM
