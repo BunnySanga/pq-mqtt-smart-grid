@@ -49,9 +49,14 @@ def test_rendered_config_passes_and_every_rule_is_enforced():
         (good.replace("use_identity_as_username true", ""), "use_identity_as_username"),
         (good.replace("max_packet_size 300000", "max_packet_size 400000"), "max_packet_size"),
         (good + "\nlistener 1883\n", "no plaintext listeners"),
+        (good.replace("max_queued_messages 1000\n", ""), "max_queued_messages"),        # B-6
+        (good.replace("user mosquitto\n", ""), "user must be set"),                    # B-1
+        (good.replace("user mosquitto", "user root"), "user root"),
     ]:
         with pytest.raises(ConfigError, match=why):
             validate_config(broken)
+    assert "user mosquitto" in good and "max_queued_messages 1000" in good
+    validate_config(good.replace("user mosquitto", "user root"), allow_root=True)   # throwaway test containers
 
 
 def test_openssl_pin_is_hybrid_only_and_tls13():

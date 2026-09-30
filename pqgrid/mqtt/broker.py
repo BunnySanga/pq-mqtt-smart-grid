@@ -2,7 +2,8 @@
 
 Validator rules (v2.2): every listener is TLS 1.3 only, requires a client certificate and uses its identity as the
 user name; anonymous access is off; persistence is on (retained artifacts and persistent sessions, §10.3); a broker
-max_packet_size of at most 300,000 B (§10.2). The TLS 1.2 case matters: the hybrid group pin does not cover TLS 1.2
+max_packet_size of at most 300,000 B (§10.2); an explicit per-client queue limit (B-6) and an explicit, non-root
+account to run as (B-1; root only for throwaway test containers). The TLS 1.2 case matters: the hybrid group pin does not cover TLS 1.2
 [DOCKER T7], so a TLS 1.2 listener would silently fall back to classical key exchange.
 
 The ACL is generated, never hand-edited: one block per active device (its own topics only), zone read rights from
@@ -22,6 +23,8 @@ from . import topics
 from .tls import HYBRID_GROUPS
 
 MAX_BROKER_PACKET = 300_000
+MAX_QUEUED_MESSAGES = 1000     # B-6: per client; sizing in Master §27.1 (a sleeping device's CONTROL + DR queue, and
+                               # the utility's own queue while it restarts) [ANALYTICAL]
 
 
 class ConfigError(ValueError):
@@ -35,11 +38,14 @@ def hybrid_openssl_cnf() -> str:
             f"Groups = {HYBRID_GROUPS}\nMinProtocol = TLSv1.3\n")
 
 
-def render_config(listeners: list[dict], acl_file: str, persistence_dir: str, log_file: str | None = None) -> str:
-    """listeners: [{"port", "cafile", "certfile", "keyfile"}]."""
-    lines = ["per_listener_settings false", "allow_anonymous false", f"acl_file {acl_file}",
+def render_config(listeners: list[dict], acl_file: str, persistence_dir: str, log_file: str | None = None,
+                  user: str = "mosquitto", allow_root: bool = False) -> str:
+    """listeners: [{"port", "cafile", "certfile", "keyfile"}]. `user` is the account Mosquitto drops to (B-1);
+    `allow_root` exists only for throwaway test containers."""
+    lines = [f"user {user}", "per_listener_settings false", "allow_anonymous false", f"acl_file {acl_file}",
              "persistence true", f"persistence_location {persistence_dir.rstrip('/')}/",
-             f"max_packet_size {MAX_BROKER_PACKET}", "set_tcp_nodelay true",
+             f"max_packet_size {MAX_BROKER_PACKET}", f"max_queued_messages {MAX_QUEUED_MESSAGES}",
+             "set_tcp_nodelay true",
              f"log_dest {'file ' + log_file if log_file else 'stdout'}", "log_type error", "log_type warning",
              "log_type notice"]
     for li in listeners:
@@ -47,11 +53,11 @@ def render_config(listeners: list[dict], acl_file: str, persistence_dir: str, lo
                   f"keyfile {li['keyfile']}", "tls_version tlsv1.3", "require_certificate true",
                   "use_identity_as_username true"]
     text = "\n".join(lines) + "\n"
-    validate_config(text)
+    validate_config(text, allow_root=allow_root)
     return text
 
 
-def validate_config(text: str) -> None:
+def validate_config(text: str, allow_root: bool = False) -> None:
     glob: dict[str, str] = {}
     blocks: list[dict[str, str]] = []
     for raw in text.splitlines():
@@ -77,6 +83,13 @@ def validate_config(text: str) -> None:
     mp = glob.get("max_packet_size", "")
     if not (mp.isdigit() and 0 < int(mp) <= MAX_BROKER_PACKET):
         bad.append(f"max_packet_size must be set and at most {MAX_BROKER_PACKET}")
+    mq = glob.get("max_queued_messages", "")
+    if not (mq.isdigit() and 0 < int(mq)):
+        bad.append("max_queued_messages must be set explicitly (B-6: bounded queues for persistent sessions)")
+    if not glob.get("user"):
+        bad.append("user must be set explicitly (B-1: Mosquitto drops to that account)")
+    elif glob["user"] == "root" and not allow_root:
+        bad.append("user root is for throwaway test containers only (B-1)")
     if not blocks:
         bad.append("no listener")
     for b in blocks:

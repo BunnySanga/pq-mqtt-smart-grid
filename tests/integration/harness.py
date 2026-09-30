@@ -91,10 +91,10 @@ class Broker:
         conf = render_config([
             {"port": self.port, "cafile": self.ca.crt, "certfile": self.cert.crt, "keyfile": self.cert.key},
             {"port": self.port_future, "cafile": self.ca.crt, "certfile": self.future.crt, "keyfile": self.future.key},
-        ], self.acl, f"{self.dir}/db", log_file=self.log)
+        ], self.acl, f"{self.dir}/db", log_file=self.log, user="root", allow_root=True)   # throwaway container
         self.conf, self.cnf = f"{self.dir}/mosquitto.conf", f"{self.dir}/hybrid.cnf"
         with open(self.conf, "w") as f:
-            f.write(conf + "user root\n")                       # test container only: no privilege drop
+            f.write(conf)
         with open(self.cnf, "w") as f:
             f.write(hybrid_openssl_cnf())
         self.proc = None

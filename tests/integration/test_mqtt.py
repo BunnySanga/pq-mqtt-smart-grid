@@ -30,7 +30,7 @@ def online(plant, *devs):
 
 
 # ====================================================================================== I1: the lifecycle
-def test_I1_lifecycle_over_the_broker(plant):
+def test_lifecycle_over_the_broker(plant):
     der, meter = plant.add(D1, "der_ctrl"), plant.add(M1, "smart_meter")
     online(plant)
     der.mq.connect()
