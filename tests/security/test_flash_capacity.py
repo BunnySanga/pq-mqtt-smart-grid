@@ -134,7 +134,7 @@ def test_an_impossible_flash_is_refused_at_start_up(world: World):
     kp = HybridKeyPair.generate()
     world.registry.add(DeviceRecord(LONGEST, "c2_meter", kp.pk))
     small = DeviceFlash(FlashSim(pages=4), clock=lambda: world.t)   # two 8 KiB banks: the old default
-    with pytest.raises(CapacityError, match="worst case needs 10758 B.*holds 6034 B"):
+    with pytest.raises(CapacityError, match="worst case needs 10774 B.*holds 6034 B"):
         DeviceEndpoint(LONGEST, "c2_meter", world.policy, 1, kp, clock=lambda: world.t, flash=small)
 
 

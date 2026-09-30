@@ -26,7 +26,9 @@ class DeviceRecord:
     dclass: str
     e2e_pk: bytes
     active: bool = True
-    max_packet: Optional[int] = None
+    max_packet: Optional[int] = None  # the device's reported maximum (Master §10.2); the utility never sends more
+    #                                    than min(this, class max_packet). pqgrid devices declare the class value, so
+    #                                    a smaller value here can make an NT/FIN unpublishable (Master §25 L22)
 
 
 class Registry:

@@ -3,52 +3,17 @@
 zone-key rotation and ACL recompilation. Every test runs the real loops in threads over the real broker; no test
 calls a wired step directly to stand in for its production caller."""
 import os
-import threading
 import time
-from contextlib import contextmanager
 
-from harness import broker, plant, requires_broker, wait_for          # noqa: F401  (fixtures)
+from harness import broker, loops, plant, requires_broker, start, wait_for   # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.publisher import RETENTION_S
-from pqgrid.mqtt.broker import compile_acl
+from pqgrid.mqtt.broker import acl_installer
 from pqgrid.suite.aead import AeadAlg
 
 pytestmark = requires_broker
 M1, D1 = b"meter-0001", b"der-0001"
 DAY = 86400
-
-
-class NoSpread:
-    """rng for the tests: the §12 random re-handshake delay and the back-off jitter become 0."""
-
-    def uniform(self, a, b):
-        return a
-
-
-@contextmanager
-def loops(plant, *devs, interval=0.05, rng=None):
-    """The utility's and the devices' main loops in threads, stopped (and joined) at the end."""
-    stop = threading.Event()
-    threads = [threading.Thread(target=plant.u.run, args=(stop, interval), daemon=True)]
-    for dev in devs:
-        dev.mq.rng = rng or NoSpread()
-        threads.append(threading.Thread(target=dev.mq.run, args=(stop, interval), daemon=True))
-    for t in threads:
-        t.start()
-    try:
-        yield
-    finally:
-        stop.set()
-        for t in threads:
-            t.join(10)
-    for dev in devs:
-        assert dev.mq.internal_errors == [], dev.mq.internal_errors
-    assert plant.u.internal_errors == [], plant.u.internal_errors
-
-
-def start(plant):
-    plant.publish_acl()
-    plant.u.start()
 
 
 def test_M9_device_loop_connects_establishes_and_recovers_from_a_drop_and_a_utility_restart(plant):
@@ -71,17 +36,15 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
     device's tick (random-delay re-handshake under v2)."""
     import conftest
     m = plant.add(M1, "smart_meter")
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) + 4)
     art = plant.sign_policy(new)
-    acl_versions = []
+    plant.u.acl_hook = acl_installer(plant.u, plant.b.acl, lambda: plant.b.proc.pid,   # the production hook
+                                     bootstrap=(plant.policy_art.signed, plant.policy_art.payload,
+                                                plant.station.anchors))
 
-    def recompile():                                                           # the operator's ACL hook
-        members = {n: set(z.members) for n, z in plant.node.zones.zones.items()}
-        plant.b.load_acl(compile_acl(art.signed, art.payload, plant.station.anchors,
-                                     plant.node.endpoint.registry.records(), members))
-        acl_versions.append(new.version)
-    plant.u.acl_hook = recompile
+    def acl_for() -> str:
+        return open(plant.b.acl).readline()                                    # "# generated for <POLICY_INFO>"
     start(plant)
     with loops(plant, m):
         assert wait_for(lambda: m.d.confirmed, 15)
@@ -95,7 +58,8 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
         assert wait_for(lambda: m.d.confirmed and m.d.policy.version == 2 and
                         m.d.session.policy_info == new.info(), 30), m.mq.errors
         assert plant.node.endpoint.policy.version == 2
-        assert wait_for(lambda: acl_versions == [2], 5)                        # recompiled after the switch
+        assert wait_for(lambda: repr(new.info()) in acl_for(), 5)             # recompiled after the switch
+        assert f"user {M1.decode()}" in open(plant.b.acl).read() and not plant.u.acl_failures
         assert plant.node.endpoint.current_session(M1).policy_info == new.info()
         assert plant.node.zones.zones["f7"].groups[AeadAlg.AES256GCM].key_epoch > cc0   # policy change: rotated
         assert m.fota.committed(POLICY) == 2
@@ -193,7 +157,7 @@ def test_E4_a_device_refused_for_an_old_policy_is_sent_the_current_one(plant):
     activates it and establishes under v2."""
     import conftest
     m = plant.add(M1, "smart_meter")
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) - 1)
     art = plant.sign_policy(new)
     start(plant)
@@ -282,3 +246,81 @@ def test_E3_cumulative_and_final_setpoint_acks_through_the_device_loop(plant):
         t0 = d.mq.ticks
         assert wait_for(lambda: d.mq.ticks >= t0 + 20, 10)
         assert len(cumulative()) == 3                                            # and only once
+
+
+def test_utility_key_rotation_rollout_over_the_broker(plant):
+    """H-1 / DR-051 through both production loops: the new E2E and command keys are prepared, the policy naming them
+    is published and scheduled, both sides activate it, the device re-handshakes with the new E2E key and applies a
+    command signed with the new command key (a command queued across the rotation is covered in
+    tests/security/test_key_rotation.py). A device power cycle and a utility restart (bootstrap configuration with
+    the OLD keys) both come back on the new keys."""
+    import conftest
+    from pqgrid.suite.hkem import HybridKeyPair
+    from pqgrid.suite.sig import mldsa_keygen, mldsa_public_bytes
+    d = plant.add(D1, "der_ctrl")
+    kem2, cmd2 = HybridKeyPair.generate(), mldsa_keygen()
+    new = conftest.make_policy(kem2.pk, mldsa_public_bytes(cmd2), version=2, ca_set=plant.policy.ca_set,
+                               activate_at=int(time.time()) + 6)
+    art = plant.sign_policy(new, "der_ctrl")
+    start(plant)
+    with loops(plant, d):
+        assert wait_for(lambda: d.d.confirmed, 15)
+        plant.u.prepare_keys(kem=kem2, cmd=cmd2)
+        plant.u.publish_artifact(art)
+        plant.u.schedule_policy(art.signed, art.payload, plant.station.anchors)
+        assert wait_for(lambda: POLICY in d.mq.fota_staged, 15), d.mq.errors
+        queued = plant.u.command(D1, b"CLOSE BREAKER 3", 600)             # before: signed with the OLD key
+        assert wait_for(lambda: plant.node.commands.outcome(D1, queued) == b"OK", 15)
+        assert wait_for(lambda: plant.node.endpoint.policy.version == 2 and d.d.confirmed
+                        and d.d.policy.version == 2 and d.d.session.policy_info == new.info(), 30), d.mq.errors
+        assert plant.node.keys_match_policy() and plant.node.endpoint.static.pk == kem2.pk
+        after = plant.u.command(D1, b"CURTAIL 50%", 600)                  # signed with the NEW command key
+        assert wait_for(lambda: plant.node.commands.outcome(D1, after) == b"OK", 15), d.mq.errors
+        assert d.applied == [b"CLOSE BREAKER 3", b"CURTAIL 50%"]
+    d.mq.disconnect()
+    plant.boot(d)                                                              # device power cycle on its v2
+    assert d.d.policy.version == 2 and d.d.policy.utility_kem_pk == kem2.pk
+    plant.restart_utility()                                                    # bootstrap v1 + old keys given:
+    assert plant.node.endpoint.policy.version == 2 and plant.node.keys_match_policy()   # v2 and new keys resume
+    with loops(plant, d):
+        assert wait_for(lambda: d.d.confirmed and d.d.session.policy_info == new.info(), 30), d.mq.errors
+        seq = plant.u.command(D1, b"TRIP", 600)
+        assert wait_for(lambda: plant.node.commands.outcome(D1, seq) == b"OK", 15), d.mq.errors
+    assert d.applied == [b"CLOSE BREAKER 3", b"CURTAIL 50%", b"TRIP"]
+
+
+def test_a_policy_moving_a_class_to_another_aead_moves_its_dr_topic_over_the_broker(plant):
+    """C3-3 and L-1 through the broker (the earlier C3-3 test stubbed paho): a policy moves c2_meter from ChaCha20 to
+    AES-256-GCM, so its zone membership moves to the zone's AES crypto group (DR-047). The production ACL hook
+    recompiles the ACL from the new policy (read right on the AES group topic), the device re-handshakes, gets the
+    AES group key, follows the AES group topic and receives the next event there."""
+    import conftest
+    from pqgrid.fota.publisher import part_payload_budget
+    from pqgrid.mqtt import topics
+    from pqgrid.policy import encode_policy
+    c = plant.add(b"c2-0001", "c2_meter")
+    classes = conftest.replace_class(plant.policy, "c2_meter", aead=AeadAlg.AES256GCM)
+    v2 = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, classes=classes,
+                              ca_set=plant.policy.ca_set, activate_at=int(time.time()) + 4)
+    art = plant.station.build(POLICY, "c2_meter", 2, encode_policy(v2), 3072,
+                              part_payload_budget(4096, "c2_meter", POLICY, 2), activate_at=v2.activate_at)
+    plant.u.acl_hook = acl_installer(plant.u, plant.b.acl, lambda: plant.b.proc.pid,
+                                     bootstrap=(plant.policy_art.signed, plant.policy_art.payload,
+                                                plant.station.anchors))
+    start(plant)
+    with loops(plant, c):
+        assert wait_for(lambda: c.d.confirmed, 15)
+        plant.node.zones.create("f7")
+        plant.u.join_zone("f7", b"c2-0001")                                   # ACL recompiled by the hook
+        chacha = topics.dr_event("f7", AeadAlg.CHACHA20POLY1305)
+        assert wait_for(lambda: chacha in c.mq.subscribed, 10)
+        plant.u.dr_event("f7", b"SHED 10%", 600)
+        assert wait_for(lambda: ("f7", b"SHED 10%") in c.mq.events, 10), c.mq.dr_refused
+        plant.u.publish_artifact(art)
+        plant.u.schedule_policy(art.signed, art.payload, plant.station.anchors)
+        assert wait_for(lambda: c.d.confirmed and c.d.session.policy_info == v2.info(), 30), c.mq.errors
+        aes = topics.dr_event("f7", AeadAlg.AES256GCM)
+        assert wait_for(lambda: aes in c.mq.subscribed, 10), c.mq.errors
+        plant.u.dr_event("f7", b"SHED 20%", 600)
+        assert wait_for(lambda: ("f7", b"SHED 20%") in c.mq.events, 10), c.mq.dr_refused
+        assert f"topic read {aes}" in open(plant.b.acl).read() and not plant.u.acl_failures

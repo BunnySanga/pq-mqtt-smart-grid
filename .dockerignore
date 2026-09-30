@@ -2,6 +2,7 @@
 *
 !pqgrid/
 !tests/
+!tools/
 !pytest.ini
 !requirements.txt
 **/__pycache__

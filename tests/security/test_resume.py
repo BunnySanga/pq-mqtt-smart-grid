@@ -389,3 +389,33 @@ def test_nt_wire_format(world: World):
     assert tid == d.ticket.ticket_id and blob == d.ticket.blob
     with pytest.raises(CryptoError):
         aead.open_(s.aead, keys.new_ticket_key(s.k_master), nonce, ct, h(b"NT"))
+
+
+# ------------------------------------------------ defence in depth: states issue() never produces (mutants 24, 28)
+def _mint(world: World, d, **over) -> bytes:
+    """A ticket sealed with the utility's REAL STEK but with fields TicketIssuer.issue() never produces. Only the
+    STEK holder could mint it (RISK-1); these checks are defence in depth against exactly that."""
+    import dataclasses
+    from pqgrid.pasr.tickets import open_ticket, seal_ticket
+    t = open_ticket(world.tickets.stek, d.ticket.blob, int(world.t))
+    return seal_ticket(world.tickets.stek, dataclasses.replace(t, **over), int(world.t))
+
+
+def test_check_5_refuses_a_ticket_that_outlives_its_chain(world: World):
+    """issue() caps expires_at at the chain expiry, so the chain half of check 5 is redundant for issued tickets;
+    it must still refuse one that is not capped (mutation analysis: survivor 24)."""
+    d = ready(world)
+    chain = d.session.chain_expires
+    blob = _mint(world, d, expires_at=chain + DAY)                     # outlives its chain
+    world.t = chain + 60                                               # chain ended, ticket "valid"
+    with pytest.raises(TicketError, match="ticket expired"):
+        world.utility.on_resume_hello(M1, forge_rh(world, d, blob=blob))
+
+
+def test_check_8_refuses_a_ticket_whose_mode_is_not_the_class_mode(world: World):
+    """A class's tickets carry its resume mode, so "mode = the current policy's mode" is implied by checks 4 and 6
+    for issued tickets; check 8 itself must still refuse a PSK ticket for a PSK_KEM class (survivor 28)."""
+    d = ready(world, D1, "der_ctrl")                                   # PSK_KEM class
+    blob = _mint(world, d, resume_mode=ResumeMode.PSK)
+    with pytest.raises(TicketError, match="resume mode does not match policy"):
+        world.utility.on_resume_hello(D1, forge_rh(world, d, blob=blob, mode=b"PSK", pk_e=b""))

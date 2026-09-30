@@ -22,6 +22,11 @@ requires_station = pytest.mark.skipif(find_openssl() is None,
 T0 = 1_790_000_000
 
 
+class Msg:                                                             # what paho hands the utility's callback
+    def __init__(self, topic, payload):
+        self.topic, self.payload = topic, payload
+
+
 @pytest.fixture
 def util(tmp_path):
     now = [float(T0)]
@@ -59,7 +64,7 @@ def test_scheduling_a_policy_that_is_not_newer_is_refused_at_once(util):
     u, node, now, signed, restart = util
     with pytest.raises(PolicyError, match="rule 5"):
         u.schedule_policy(*signed(1, T0))                             # the installed version: never activatable
-    assert u._scheduled is None
+    assert node.db.load_policy("scheduled") is None
 
 
 @requires_station
@@ -79,7 +84,7 @@ def test_a_scheduled_policy_refused_at_activation_is_dropped_and_the_loop_keeps_
     now[0] += ZONE_ROTATE_EVERY_S                                      # v2 is due; the zone key is a week old
     u.tick()
     assert node.endpoint.policy.version == 3                           # v2 was not activated …
-    assert u._scheduled is None                                        # … it was dropped …
+    assert node.db.load_policy("scheduled") is None                    # … it was dropped …
     assert [r for r in u.refused if "rule 5" in r] != []              # … and the refusal recorded (G-1: locally)
     assert g.key_epoch == e0 + 1 and u.ticks == 1                      # housekeeping ran in the same tick
     now[0] += ZONE_ROTATE_EVERY_S
@@ -119,7 +124,7 @@ def test_a_policy_scheduled_before_a_restart_is_still_activated_at_its_time(util
     assert node.endpoint.policy.version == 2
     u, node = restart()
     u.tick()
-    assert node.endpoint.policy.version == 2 and u._scheduled is None   # activated once, not scheduled again
+    assert node.endpoint.policy.version == 2 and node.db.load_policy("scheduled") is None   # activated once
 
 
 @requires_station
@@ -152,10 +157,6 @@ def test_a_crash_while_activating_never_leaves_the_new_policy_on_the_old_zone_ke
 def test_telemetry_is_accepted_only_from_an_active_device_on_its_own_class_topic(util):
     """H1 / K-5 through paho's callback (no broker): TELEMETRY is hop-only, so the utility's registry decides."""
     u, node, now, signed, restart = util
-
-    class Msg:                                                         # what paho hands the callback
-        def __init__(self, topic, payload):
-            self.topic, self.payload = topic, payload
     u.c.on_message(None, None, Msg("grid/der_ctrl/der-0001/telemetry", b"r1"))
     u.c.on_message(None, None, Msg("grid/smart_meter/der-0001/telemetry", b"r2"))   # another class's topic
     u.c.on_message(None, None, Msg("grid/der_ctrl/der-0404/telemetry", b"r3"))      # unknown device
@@ -163,3 +164,101 @@ def test_telemetry_is_accepted_only_from_an_active_device_on_its_own_class_topic
     u.c.on_message(None, None, Msg("grid/der_ctrl/der-0001/telemetry", b"r4"))      # revoked
     assert u.telemetry == [(b"der-0001", b"r1")] and u.internal_errors == []
     assert sum("telemetry from an unknown or revoked device" in r for r in u.refused) == 3
+
+
+@requires_station
+def test_an_acl_hook_failure_is_retried_and_never_reported_as_a_refused_activation(util):
+    """Audit L-1: the hook ran after the activation, and when it raised tick() reported "scheduled policy refused at
+    activation" for a policy that WAS active, and never recompiled the ACL. Now the activation stands, the failure is
+    recorded as an ACL failure, and every tick retries the owed recompile until it succeeds."""
+    u, node, now, signed, restart = util
+    calls = []
+
+    def hook():
+        calls.append(node.endpoint.policy.version)
+        if len(calls) == 1:
+            raise OSError("broker restarting: SIGHUP failed")
+    u.acl_hook = hook
+    u.schedule_policy(*signed(2, T0 + 60))
+    now[0] = T0 + 61
+    u.tick()
+    assert node.endpoint.policy.version == 2 and node.db.load_policy("scheduled") is None
+    assert not any("refused" in r for r in u.refused) and not u.internal_errors
+    assert calls == [2] and len(u.acl_failures) == 1 and u.acl_failures[0][1] == "OSError"
+    u.tick()                                                           # retried …
+    assert calls == [2, 2] and len(u.acl_failures) == 1
+    u.tick()                                                           # … until it succeeded, then no more
+    assert calls == [2, 2]
+
+
+
+def _device(node, now, did: bytes, dclass: str, max_packet=None):
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    kp = HybridKeyPair.generate()
+    node.endpoint.registry.add(DeviceRecord(did, dclass, kp.pk, max_packet=max_packet))
+    return DeviceEndpoint(did, dclass, node.endpoint.policy, 1, kp, clock=lambda: now[0])
+
+
+@requires_station
+def test_df_alerts_reach_the_application_even_when_the_reply_cannot_be_published(util):
+    """Audit L-4: the DF's alerts were recorded as seen (their IDs) and handed to the application only AFTER NT was
+    published; a refused publish lost them for the application, and their resend was flagged as duplicate. Here the
+    registry's per-device limit (the latent DeviceRecord.max_packet path) admits the SH but not an NT carrying 40
+    ACKs: the alerts are delivered once, the refusal is recorded, and a retransmitted DF delivers nothing twice."""
+    import os
+    u, node, now, signed, restart = util
+    d = _device(node, now, b"der-0003", "der_ctrl", max_packet=2700)
+    sh = node.endpoint.on_client_hello(b"der-0003", d.client_hello())
+    d.on_server_hello(sh)
+    alerts = [("grid/der_ctrl/der-0003/alert", os.urandom(16), b"A%d" % i) for i in range(40)]
+    df = d.finished(alerts)
+    u.c.on_message(None, None, Msg("pqgrid/hs/der-0003/up", df))
+    assert [p for did, p, dup in u.alerts if did == b"der-0003" and not dup] == [a[2] for a in alerts]
+    assert any("exceeds der-0003's maximum packet size" in r for r in u.refused) and not u.internal_errors
+    u.c.on_message(None, None, Msg("pqgrid/hs/der-0003/up", df))       # the identical DF again (QoS 1 / retry)
+    assert len([1 for did, _, _ in u.alerts if did == b"der-0003"]) == 40
+
+
+@requires_station
+def test_a_reused_ticket_raises_the_clone_alarm(util):
+    """Master §27.8 M-1 (audit L-9): "ticket already used" is a clone indicator; it was only in the refusal log."""
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    u, node, now, signed, restart = util
+    d = _device(node, now, b"meter-0009", "smart_meter")
+    ep = node.endpoint
+    d.on_server_hello(ep.on_client_hello(b"meter-0009", d.client_hello()))
+    d.on_final(ep.on_finished(b"meter-0009", d.finished()).final)
+    ticket = d.ticket
+    u.c.on_message(None, None, Msg("pqgrid/hs/meter-0009/up", d.resume_hello()))   # the genuine resume
+    clone = DeviceEndpoint(b"meter-0009", "smart_meter", ep.policy, 1, d.static, clock=lambda: now[0])
+    clone.ticket = ticket                                              # a copy of the flash, a fresh RH
+    now[0] += 200                                                      # beyond the duplicate window
+    u.c.on_message(None, None, Msg("pqgrid/hs/meter-0009/up", clone.resume_hello()))
+    assert [did for did, _ in u.ticket_reuse_alarms] == [b"meter-0009"]
+    assert any("ticket already used" in r for r in u.refused)
+
+
+@requires_station
+def test_a_joining_member_gets_its_read_right_before_its_new_zone_key(util):
+    """Found by the final concurrent broker runs: join_zone published the new ZONEKEY and only then ran the ACL
+    hook. Mosquitto grants the SUBACK without a read right and filters at delivery, so a member that subscribed on
+    that key could have the next events silently dropped until the broker reloaded, and nothing re-sends them while
+    it stays connected. Now the ACL naming the new member is written and the broker told before its key goes out."""
+    from pqgrid.mqtt import topics
+    u, node, now, signed, restart = util
+    order = []
+
+    class Client:                                                      # the utility's MQTT client, recording
+        def publish(self, topic, payload, qos=0, retain=False):
+            order.append(("publish", topic))
+            return type("Info", (), {"is_published": lambda self: True})()
+    u.c = Client()
+    u.acl_hook = lambda: order.append(("acl", set(node.zones.zones["f7"].members)))
+    d = _device(node, now, b"der-0003", "der_ctrl")
+    ep = node.endpoint
+    d.on_server_hello(ep.on_client_hello(b"der-0003", d.client_hello()))
+    d.on_final(ep.on_finished(b"der-0003", d.finished()).final)       # a live session: its key is sent at once
+    node.zones.create("f7")
+    u.join_zone("f7", b"der-0003")
+    assert order == [("acl", {b"der-0003"}), ("publish", topics.control("der_ctrl", b"der-0003"))]
+    assert not u.acl_failures

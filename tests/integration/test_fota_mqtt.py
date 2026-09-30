@@ -82,7 +82,7 @@ def test_signed_policy_rollout_and_activation(plant):
     m = plant.add(M1, "smart_meter")
     online(plant, m)
     import conftest
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) + 3)
     art = plant.sign_policy(new)
     plant.u.publish_artifact(art)
@@ -113,7 +113,7 @@ def test_M1_policy_activated_between_SH_and_DF_over_the_broker(plant):
     plant.publish_acl()
     plant.u.start()
     m.mq.connect()
-    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2,
+    new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) - 1)
     art = plant.sign_policy(new)
     ep, activated = plant.u.n.endpoint, []

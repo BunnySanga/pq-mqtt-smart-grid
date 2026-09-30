@@ -55,7 +55,7 @@ class ClassProfile:
     cmd_types: frozenset
     max_setpoint_rate: int            # per minute
     aead: AeadAlg
-    tls_max_record: Optional[int]     # None = TLS default record size
+    tls_max_record: Optional[int]     # None = TLS default; for an MCU TLS stack (D-1), not applied here (§25 L18)
     max_packet: int
     fota_chunk_size: int
     reconnect: Reconnect

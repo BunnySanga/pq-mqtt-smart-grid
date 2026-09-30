@@ -44,7 +44,7 @@ def test_only_B_may_revoke_and_only_A(station):
     with pytest.raises(FotaError, match="recovery anchor B"):
         d.feed(revoke(station, 1, ANCHOR_A, ANCHOR_A), chunks=[])          # A revoking itself
     with pytest.raises(FotaError, match="only the recovery anchor B may revoke the release anchor A"):
-        d.feed(revoke(station, 1, ANCHOR_B, ANCHOR_B))                     # B revoking B (the last anchor)
+        d.feed(revoke(station, 1, ANCHOR_B, ANCHOR_B))                     # B revoking B: the role rule
     with pytest.raises(FotaError, match="only the recovery anchor B may revoke the release anchor A"):
         d.feed(revoke(station, 1, 7, ANCHOR_B))                            # an anchor that does not exist
     assert d.inst.prot.revoked == set() and d.inst.committed(KEYREVOKE) == 0

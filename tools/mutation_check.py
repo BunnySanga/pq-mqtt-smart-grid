@@ -2,14 +2,16 @@
 the in-process suite (tests/unit, tests/security) must kill it. A survivor is either a missing test or an equivalent
 mutant (a check made redundant by construction: record why).
 
-Run in the test image, against a snapshot of the tree mounted read-only at /src (4 slices in parallel):
-    for k in 0 1 2 3; do docker run --rm -v "$PWD":/src:ro -v "$PWD/tools":/t:ro -w /tmp pqgrid-tests \
-        python /t/mutation_check.py $k 4 & done; wait
-    python tools/mutation_check.py sel 1,9,10 0 1        # only the listed mutants (same docker wrapper)
-Last full run (after C1-9): 117 mutants, 112 killed, 5 equivalent (24, 28, 40, 110, 112).
-Mutants 117-139 disable the checks added by cycle 1 (C2-2): 23 of 23 killed.
-Mutants 140-143: cycle 2's fixes (C2-8). Mutants 144-146: cycle 3's (C3-4).
+Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 slices in parallel:
+    for k in 0 1 2 3; do docker run --rm pqgrid-tests python tools/mutation_check.py --root /app $k 4 & done; wait
+    docker run --rm pqgrid-tests python tools/mutation_check.py --root /app sel 1,9,10 0 1   # only these mutants
+A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
+Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
+147-172 the remediation after the independent release audit (R-x). A mutant may name broker tests (5th element)
+for a check only a real broker exercises; they run in addition to the in-process suite (the test image has
+Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15.
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -254,36 +256,106 @@ M = [
      "            want = self._dr_topics | {topics.dr_event(z, self.d.profile.aead) for z in self._zones\n"
      "                                      if not any(t.split('/')[2] == z for t in self._dr_topics)}\n            new, old",
      "C3-3 follow the new group (old rule: new zone names only)"),
+    # ------------------------------------------------ remediation after the independent release audit (R-x)
+    ("pqgrid/mqtt/utility_node.py", "        self.n.keyring.keys_for(p)                                     # … or whose",
+     "        pass                                     # … or whose", "R H-1 schedule refuses keys not held"),
+    ("pqgrid/mqtt/utility_node.py", "            self.n.endpoint.install_policy(p, static=static)",
+     "            self.n.endpoint.install_policy(p)", "R H-1 activation switches the E2E key"),
+    ("pqgrid/mqtt/utility_node.py", "            self.n.commands.cmd_key = cmd_key ",
+     "            self.n.commands.cmd_key = self.n.commands.cmd_key ", "R H-1 activation switches the command key"),
+    ("pqgrid/persistence/utility_db.py", "    static, cmd_key = keyring.keys_for(policy)\n", "",
+     "R H-1 a restart takes the keys the active policy names"),
+    ("pqgrid/commands/utility.py", "            if not mldsa_verify(self.u.policy.utility_cmd_pk, c.sig, signed):",
+     "            if False:", "R H-1 queued commands re-signed after a rotation"),
+    ("pqgrid/commands/zones.py", "        if not mldsa_verify(self.svc.u.policy.utility_cmd_pk, ev.sig, signed):",
+     "        if False:", "R H-1 retained DR events re-signed after a rotation"),
+    ("pqgrid/e2e/handshake.py", "            if not ct_eq(pinfo, self.policy.info()):\n                raise PolicyMismatchError(\"POLICY_INFO mismatch: the client",
+     "            if False:\n                raise PolicyMismatchError(\"POLICY_INFO mismatch: the client",
+     "R H-1 old-policy hello under a retired key recognised"),
+    ("pqgrid/mqtt/device_node.py", "        return self._declared is not None and self._declared != self._connect_props(self.d.profile)",
+     "        return False", "R H-2 reconnect when CONNECT properties change",
+     ("tests/integration/test_connect_properties.py",)),
+    ("pqgrid/mqtt/device_node.py", "            self._fota_subscribed = False                     # retained artifacts dropped",
+     "            pass                     # retained artifacts dropped", "R H-2 re-subscribe after a raised limit",
+     ("tests/integration/test_connect_properties.py",)),
+    ("pqgrid/fota/publisher.py", "            return min(cur, self.floor.get(m.device_class, cur))",
+     "            return cur", "R H-2 POLICY/KEYREVOKE sized to the class floor"),
+    ("pqgrid/mqtt/utility_node.py", "        revoked = self.revoked_anchors() | set(revoked)             # M-1",
+     "        revoked = set(revoked)             # M-1", "R M-1 activation uses the revocations of now"),
+    ("pqgrid/mqtt/utility_node.py", "        revoked = frozenset(self.revoked_anchors() | set(revoked))    # M-1",
+     "        revoked = frozenset(revoked)    # M-1", "R M-1 scheduling uses the revocations of now"),
+    ("pqgrid/mqtt/utility_node.py", "        self._recheck_scheduled()                                      # M-1",
+     "        pass                                      # M-1", "R M-1 a restart re-checks the scheduled policy"),
+    ("pqgrid/e2e/handshake.py", "        self._refuse_if_stale(\"server hello\")               # DR-053",
+     "        pass               # DR-053", "R M-2 stale server hello refused"),
+    ("pqgrid/e2e/handshake.py", "        self._refuse_if_stale(\"resume reply\")               # DR-053",
+     "        pass               # DR-053", "R M-2 stale resume reply refused"),
+    ("pqgrid/e2e/handshake.py", "        self._refuse_if_stale(\"final message\")              # DR-053",
+     "        pass              # DR-053", "R M-2 stale final message refused"),
+    ("pqgrid/e2e/handshake.py", "        if (self._ch is None and self._rh is None) or self._attempt_fresh():",
+     "        if True:", "R M-2 an old hello is not resent"),
+    ("pqgrid/e2e/handshake.py", "                        and 0 <= age <= self.attempt_lifetime()):",
+     "                        ):", "R M-2 a stored RH of unknown or great age is not resent after a reboot"),
+    ("pqgrid/policy/validator.py", "        if not _is_ca_certificate(der):", "        if False:",
+     "R M-3 ca_set holds CA certificates"),
+    ("pqgrid/mqtt/device_node.py", "            self.c.replace_context(self.trust(p))",
+     "            pass", "R M-3 trust follows the installed ca_set", ("tests/integration/test_ca_rollover.py",)),
+    ("pqgrid/mqtt/utility_node.py", "        self.recompile_acl()                                         # L-1",
+     "        pass                                         # L-1", "R L-1 an owed ACL recompile is retried"),
+    ("pqgrid/mqtt/utility_node.py", "            self.alerts += [(did, p, dup) for _, p, dup in res.alerts]   # to the",
+     "            pass   # to the", "R L-4 DF alerts delivered to the application"),
+    ("pqgrid/mqtt/utility_node.py", "                self.ticket_reuse_alarms.append((did, self.clock()))",
+     "                pass", "R L-9 clone alarm on a reused ticket"),
+    ("pqgrid/mqtt/broker.py", "    if not (mq.isdigit() and 0 < int(mq)):", "    if False:", "R L-7 queue limit required"),
+    ("pqgrid/mqtt/broker.py", "    elif glob[\"user\"] == \"root\" and not allow_root:", "    elif False:",
+     "R L-7 root refused"),
+    ("pqgrid/mqtt/utility_node.py",                  # 172: the key before the read right (the old order)
+     "            self.recompile_acl()\n            self._send_zone_keys(zone)",
+     "            self._send_zone_keys(zone)\n            self.recompile_acl()",
+     "R join: read right before the new key"),
 ]
 
 
+ROOT = "/src"
+TESTS = ["tests/unit", "tests/security"]          # the in-process suite: every mutant runs it
+
+
 def run(i, mut):
-    path, old, new, name = mut
+    """KILLED only when the suite ran and a test FAILED (pytest exit code 1). Any other non-zero exit (a crash at
+    import or collection, a usage error, an interrupted run) is ERROR: the mutant was not killed by a test."""
+    path, old, new, name = mut[:4]
+    extra = list(mut[4]) if len(mut) > 4 else []   # broker tests for checks only a real broker can exercise
     work = tempfile.mkdtemp()
     for d in ("pqgrid", "tests"):
-        shutil.copytree(f"/src/{d}", f"{work}/{d}")
-    shutil.copy("/src/pytest.ini", work)
+        shutil.copytree(f"{ROOT}/{d}", f"{work}/{d}", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copy(f"{ROOT}/pytest.ini", work)
     src = open(f"{work}/{path}").read()
     n = src.count(old)
     if n != 1:
+        shutil.rmtree(work)
         return f"{i:3d} BADPATTERN({n}) {name}"
     open(f"{work}/{path}", "w").write(src.replace(old, new))
     r = subprocess.run([sys.executable, "-m", "pytest", "-o", "addopts=", "-q", "-x", "-p", "no:cacheprovider",
-                        "tests/unit", "tests/security"], cwd=work, capture_output=True, text=True, timeout=1200)
+                        *TESTS, *extra], cwd=work, capture_output=True, text=True, timeout=1800,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
     shutil.rmtree(work)
     last = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-200:]
-    return f"{i:3d} {'KILLED  ' if r.returncode else 'SURVIVED'} {name}   [{last}]"
+    verdict = {0: "SURVIVED", 1: "KILLED  "}.get(r.returncode, "ERROR   ")
+    return f"{i:3d} {verdict} {name}{' [+broker]' if extra else ''}   [{last}]"
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "sel":                      # python mutate.py sel 1,9,10 <slice> <nslices>
-        chosen = [int(x) for x in sys.argv[2].split(",")]
-        k, n = int(sys.argv[3]), int(sys.argv[4])
+    args = sys.argv[1:]
+    if args[:1] == ["--root"]:                    # the source tree (default /src; /app inside the test image)
+        ROOT, args = args[1], args[2:]
+    if args[0] == "sel":                          # mutation_check.py [--root R] sel 1,9,10 <slice> <nslices>
+        chosen = [int(x) for x in args[1].split(",")]
+        k, n = int(args[2]), int(args[3])
         for j, i in enumerate(chosen):
             if j % n == k:
                 print(run(i, M[i]), flush=True)
-    else:
-        k, n = int(sys.argv[1]), int(sys.argv[2])
+    else:                                         # mutation_check.py [--root R] <slice> <nslices>
+        k, n = int(args[0]), int(args[1])
         for i, mut in enumerate(M):
             if i % n == k:
                 print(run(i, mut), flush=True)

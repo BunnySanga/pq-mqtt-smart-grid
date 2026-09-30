@@ -51,3 +51,8 @@ class CapacityError(PqgridError):
 
 class CommandError(PqgridError):
     """The utility refuses to issue a CONTROL message (class not allowed, no live session, bounds, …)."""
+
+
+class KeyringError(PqgridError, ValueError):
+    """The utility does not hold the private keys a policy names, or a key offered for a rotation does not match
+    its public key (Master §12 Policy Updates, DR-051). Messages name keys by a public fingerprint only."""

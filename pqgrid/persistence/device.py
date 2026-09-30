@@ -2,7 +2,8 @@
 
     ticket  written when NT verifies; deleted at RS (C9). It holds the psk, so superseded copies are erased
             within 7 days (DR-049).
-    rh      PSK: the identical RH bytes, written before the RH is first sent (S5, resend after a reboot).
+    rh      PSK: the identical RH bytes and the time it was built, written before the RH is first sent (S5, resend
+            after a reboot while the utility can still answer it: DR-053).
             PSK_KEM: only an "in flight" marker; the ephemeral private key never reaches flash (C8), so after
             a reboot the device drops the possibly consumed ticket and does a full handshake (no false clone
             alarm).
@@ -21,7 +22,7 @@ from typing import Optional
 
 from ..commands.device import MAX_COMMAND, MAX_INTENTS, DeviceCommandState, IntentRecord
 from ..commands.zones import MAX_ZONES
-from ..errors import CapacityError
+from ..errors import CapacityError, WireError
 from ..fota.artifact import MAX_CHUNKS
 from ..policy.model import ResumeMode
 from ..suite.rand import random_bytes
@@ -49,7 +50,7 @@ def budget(profile) -> tuple[dict[str, int], int]:
     pinfo = MAX_ID + 1 + 4
     blob = 1 + 2 + 12 + _enc_len(16, MAX_ID, MAX_ID, pinfo, 8, 7, 8, 8, 8, 32) + 16          # sealed ticket
     ticket = record_size(0, _enc_len(16, blob, 32, 8, 7, pinfo, 8))
-    rh = record_size(0, _enc_len(2, blob, 32, 7, 0, MAX_ID, pinfo, 8, 8, 32))                  # PSK; PSK_KEM: 1 B
+    rh = record_size(0, _enc_len(_enc_len(2, blob, 32, 7, 0, MAX_ID, pinfo, 8, 8, 32), 8))   # PSK + build time
     intent_body = record_size(8, _enc_len(1, 1, 8, MAX_COMMAND))
     download = record_size(1, _enc_len(MANIFEST_MAX, MAX_CHUNKS // 8))
     alert = record_size(ALERT_ID_LEN, _enc_len(MAX_ALERT_PAYLOAD, MAX_ALERT_KIND))
@@ -129,11 +130,22 @@ class DeviceFlash:
     def clear_ticket(self) -> None:
         self.store.delete(T_TICKET)
 
-    def save_rh(self, rh: bytes, mode: ResumeMode) -> None:
-        self.store.put(T_RH, b"", rh if mode is ResumeMode.PSK else RH_INFLIGHT)
+    def save_rh(self, rh: bytes, mode: ResumeMode, built_at: int) -> None:
+        """PSK: the RH and the authenticated device time it was built at (DR-053: after a reboot it is resent only
+        while the utility can still answer it). PSK_KEM: the in-flight marker only (C8)."""
+        self.store.put(T_RH, b"", enc([rh, u64(built_at)]) if mode is ResumeMode.PSK else RH_INFLIGHT)
 
-    def load_rh(self) -> Optional[bytes]:
-        return self.store.get(T_RH)
+    def load_rh(self) -> Optional[tuple[Optional[bytes], Optional[int]]]:
+        """None if no RH is outstanding; (rh, built_at) for a resendable PSK RH; (None, None) otherwise (the PSK_KEM
+        marker, or a record without a build time: its age is unknown)."""
+        raw = self.store.get(T_RH)
+        if raw is None:
+            return None
+        try:
+            rh, built_at = dec(raw, 2)
+            return rh, r64(built_at)
+        except WireError:
+            return None, None
 
     def clear_rh(self) -> None:
         self.store.delete(T_RH)

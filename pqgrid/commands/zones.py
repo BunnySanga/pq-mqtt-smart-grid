@@ -182,6 +182,9 @@ class ZoneManager:
     def _drop_events(self, zone: str, bseqs: list[int]) -> None:
         pass
 
+    def _save_event_sig(self, ev: LogicalEvent) -> None:
+        pass
+
     # ------------------------------------------------------------------------------------------ membership
     def create(self, name: str) -> Zone:
         if not valid_token(name) or name in self.zones:
@@ -299,6 +302,10 @@ class ZoneManager:
 
     def _seal(self, z: Zone, alg: AeadAlg, ev: LogicalEvent) -> bytes:
         g = self._group_key(z, alg)
+        signed = bcast_signed_input(ev.zone, ev.bseq, ev.expires_at, ev.event)
+        if not mldsa_verify(self.svc.u.policy.utility_cmd_pk, ev.sig, signed):   # retained across a command-key
+            ev.sig = mldsa_sign(self.svc.cmd_key, signed)                         # rotation: re-signed under the
+            self._save_event_sig(ev)                                              # active key (DR-051), same bseq
         return seal_event(z.name, alg, g.key_epoch, g.key, ev.bseq, ev.expires_at, ev.event, ev.sig)
 
     def resend_for(self, device_id: bytes) -> list[bytes]:

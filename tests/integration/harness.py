@@ -7,8 +7,11 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import pytest
@@ -73,6 +76,10 @@ class Broker:
         os.makedirs(f"{self.dir}/db", exist_ok=True)
         P = f"{self.dir}/pki"
         self.ca = pki.make_ca(P)
+        self.ca_next = pki.make_ca(P, "pqgrid-ca-next")      # the next CA of a roll-over (§4.5), unused until then
+        self.trust_bundle = f"{P}/ca-bundle.crt"             # what the broker and the utility trust during it
+        with open(self.trust_bundle, "w") as f:
+            f.write(open(self.ca.crt).read() + open(self.ca_next.crt).read())
         self.cert = pki.issue(self.ca, P, "broker", "broker", "serverAuth", san="DNS:localhost,IP:127.0.0.1")
         self.future = pki.issue(self.ca, P, "broker-future", "broker", "serverAuth", san="DNS:localhost",
                                 not_before="20400101000000Z", not_after="20410101000000Z")
@@ -84,10 +91,10 @@ class Broker:
         conf = render_config([
             {"port": self.port, "cafile": self.ca.crt, "certfile": self.cert.crt, "keyfile": self.cert.key},
             {"port": self.port_future, "cafile": self.ca.crt, "certfile": self.future.crt, "keyfile": self.future.key},
-        ], self.acl, f"{self.dir}/db", log_file=self.log)
+        ], self.acl, f"{self.dir}/db", log_file=self.log, user="root", allow_root=True)   # throwaway container
         self.conf, self.cnf = f"{self.dir}/mosquitto.conf", f"{self.dir}/hybrid.cnf"
         with open(self.conf, "w") as f:
-            f.write(conf + "user root\n")                       # test container only: no privilege drop
+            f.write(conf)
         with open(self.cnf, "w") as f:
             f.write(hybrid_openssl_cnf())
         self.proc = None
@@ -122,7 +129,24 @@ class Broker:
         return tls.device_context([self.ca.crt], cert.crt, cert.key)
 
     def utility_ctx(self):
-        return tls.utility_context([self.ca.crt], self.utility.crt, self.utility.key)
+        """The utility's trust store is operator configuration: both CAs, so a roll-over does not cut it off."""
+        return tls.utility_context([self.trust_bundle], self.utility.crt, self.utility.key)
+
+    def ca_der(self, ca: pki.Cert) -> bytes:
+        return ssl.PEM_cert_to_DER_cert(open(ca.crt).read())
+
+    def switch_to_next_ca(self) -> None:
+        """The CA roll-over's last step (§4.5): the broker's server certificate is re-issued by the NEXT CA and the
+        broker restarted; client certificates of either CA are still accepted during the overlap."""
+        P = f"{self.dir}/pki"
+        nxt = pki.issue(self.ca_next, P, "broker-next", "broker", "serverAuth", san="DNS:localhost,IP:127.0.0.1")
+        conf = open(self.conf).read()
+        conf = conf.replace(f"certfile {self.cert.crt}", f"certfile {nxt.crt}")
+        conf = conf.replace(f"keyfile {self.cert.key}", f"keyfile {nxt.key}")
+        conf = conf.replace(f"cafile {self.ca.crt}", f"cafile {self.trust_bundle}")
+        with open(self.conf, "w") as f:
+            f.write(conf)
+        self.restart()
 
     def s_client(self, *args: str, port: int | None = None, cert: pki.Cert | None = None) -> str:
         cert = cert or self.utility
@@ -156,7 +180,8 @@ class Plant:
     def __init__(self, broker: Broker, tmp):
         self.b, self.db_path = broker, f"{tmp}/utility.db"
         self.u_static, self.cmd_sk = HybridKeyPair.generate(), mldsa_keygen()
-        self.policy = conftest.make_policy(self.u_static.pk, mldsa_public_bytes(self.cmd_sk))
+        self.policy = conftest.make_policy(self.u_static.pk, mldsa_public_bytes(self.cmd_sk),
+                                           ca_set=(broker.ca_der(broker.ca),))   # the devices' TLS trust (§4.5)
         validate(self.policy)
         self.node = open_utility(self.db_path, self.policy, self.u_static, self.cmd_sk, time.time)
         self.station = Station(f"{tmp}")
@@ -196,8 +221,8 @@ class Plant:
         dev.proc = CommandProcessor(dev.d, dev.applied.append, lambda t, v: dev.setpoints.append((t, v)),
                                     targets={"P_ACTIVE_W"}, state=df.command_state())
         dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), policy.profile(dev.dclass).outbox_cap)
-        dev.mq = DeviceMqtt(dev.d, dev.proc, dev.outbox, self.b.device_ctx(dev.cert), "localhost", self.b.port,
-                            reply_timeout=2.0, fota=dev.fota)
+        dev.mq = DeviceMqtt(dev.d, dev.proc, dev.outbox, None, "localhost", self.b.port, reply_timeout=2.0,
+                            fota=dev.fota, trust=lambda p: tls.device_context_from_policy(p, dev.cert.crt, dev.cert.key))
         return dev
 
     def publish_acl(self) -> None:
@@ -238,3 +263,37 @@ def plant(broker, tmp_path):
     p = Plant(broker, tmp_path)
     yield p
     p.close()
+
+
+# ---------------------------------------------------------------------------------------- the production loops
+class NoSpread:
+    """rng for the tests: the §12 random re-handshake delay and the back-off jitter become 0."""
+
+    def uniform(self, a, b):
+        return a
+
+
+@contextmanager
+def loops(plant, *devs, interval=0.05, rng=None):
+    """The utility's and the devices' main loops in threads, stopped (and joined) at the end."""
+    stop = threading.Event()
+    threads = [threading.Thread(target=plant.u.run, args=(stop, interval), daemon=True)]
+    for dev in devs:
+        dev.mq.rng = rng or NoSpread()
+        threads.append(threading.Thread(target=dev.mq.run, args=(stop, interval), daemon=True))
+    for t in threads:
+        t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(10)
+    for dev in devs:
+        assert dev.mq.internal_errors == [], dev.mq.internal_errors
+    assert plant.u.internal_errors == [], plant.u.internal_errors
+
+
+def start(plant):
+    plant.publish_acl()
+    plant.u.start()

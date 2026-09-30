@@ -11,8 +11,9 @@
     (clone) alarm (§10.4, E52). Mosquitto 2.0.21 does not publish the Last Will of a session that is taken over
     [DOCKER, observed in this slice], so the Will alone cannot reveal a clone.
   * Connects with a persistent session, so device messages published while the utility restarts are kept.
-  * run() is the utility's main loop (M9); each tick(): a scheduled policy is activated at activate_at (old-
-    policy sessions closed, every zone key rotated, the ACL recompiled); zone keys at least a week old are
+  * run() is the utility's main loop (M9); each tick(): an owed ACL recompile is retried (L-1); a scheduled policy is
+    activated at activate_at (old-policy sessions closed, every zone key rotated, the ACL recompiled); zone keys at
+    least a week old are
     rotated and sent to live members; retained artifacts past the retention window are removed; sessions whose
     chain ended and expired half-open handshakes are dropped.
 """
@@ -27,7 +28,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from ..e2e.handshake import UnknownSessionError
-from ..errors import EnvelopeError, PolicyMismatchError, PqgridError
+from ..errors import EnvelopeError, PolicyError, PolicyMismatchError, PqgridError, TicketReusedError
 from ..suite.kdf import ct_eq
 from ..wire import peek_tag
 from . import topics
@@ -61,11 +62,15 @@ class UtilityMqtt:
         self.telemetry: list[tuple[bytes, bytes]] = []
         self.statuses: list[tuple[bytes, int, bytes]] = []
         self.takeover_alarms: list[bytes] = []
+        self.ticket_reuse_alarms: list[tuple[bytes, float]] = BoundedLog()   # "ticket already used" (M-1, §27.8)
         self._online: dict[bytes, deque] = {}
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
+        self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
         self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
         self.ticks = 0                                                 # completed main-loop steps
         self.zone_syncs: list[tuple[bytes, str]] = BoundedLog()        # answered zone sync requests (E-2)
+        self.acl_failures: list[tuple] = BoundedLog()                  # failed ACL hook runs (type + locations)
+        self._acl_due = False                                          # an ACL recompile is owed (retried by tick)
         self.republished: list[tuple[bytes, list]] = BoundedLog()      # proactive republishes (E-4)
 
     # ------------------------------------------------------------------------------------------ connection
@@ -150,11 +155,16 @@ class UtilityMqtt:
                 raise
             self._publish(did, topics.hs_down(did), sh)
         elif tag == b"RH":
-            self._publish(did, topics.hs_down(did), u.on_resume_hello(did, msg))
+            try:
+                rs = u.on_resume_hello(did, msg)
+            except TicketReusedError:
+                self.ticket_reuse_alarms.append((did, self.clock()))     # M-1 (§27.8): a clone indicator
+                raise
+            self._publish(did, topics.hs_down(did), rs)
         elif tag == b"DF":
             res = u.on_finished(did, msg)
-            self._publish(did, topics.hs_down(did), res.final)
-            self.alerts += [(did, p, dup) for _, p, dup in res.alerts]
+            self.alerts += [(did, p, dup) for _, p, dup in res.alerts]   # to the application BEFORE the reply is
+            self._publish(did, topics.hs_down(did), res.final)           # published: a failed publish cannot lose them
             if not res.replayed:
                 self._flush(did)
                 self._offer(did, types={FIRMWARE_T}, newer_than={FIRMWARE_T: res.session.fw_version},
@@ -232,8 +242,15 @@ class UtilityMqtt:
             self._publish(did, topics.control(self.n.endpoint.registry.get(did).dclass, did), env)
 
     def join_zone(self, zone: str, did: bytes) -> None:
+        """The new member's read right (§10.1 ACL) is compiled and the broker told BEFORE its key goes out: Mosquitto
+        grants a SUBACK without the right and filters at delivery, so a member subscribing on its key ahead of the
+        reload would silently lose the next events. Mosquitto handles the reload signal at the end of a pass of its
+        loop, before it forwards a key published after the signal (observed, not specified: Master §25 L23). A
+        failed hook is retried by tick() (L-1); the key is sent regardless."""
         with self.lock:
             self.n.zones.add_member(zone, did)
+            self._acl_due = True
+            self.recompile_acl()
             self._send_zone_keys(zone)                                 # new epoch to every live member
 
     def revoke_device(self, did: bytes) -> None:
@@ -244,8 +261,8 @@ class UtilityMqtt:
             self.n.endpoint.revoke_device(did)
             for zone in self.n.zones.remove_device(did):
                 self._send_zone_keys(zone)
-        if self.acl_hook:
-            self.acl_hook()
+        self._acl_due = True
+        self.recompile_acl()
 
     def _send_zone_keys(self, zone: str) -> None:
         for member, env in self.n.zones.distribute(zone).items():
@@ -255,34 +272,77 @@ class UtilityMqtt:
         with self.lock:
             self.publisher.publish(self.c, art)
 
+    def prepare_keys(self, kem=None, cmd=None, expect_kem_pk: bytes | None = None,
+                     expect_cmd_pk: bytes | None = None) -> None:
+        """Hold the private keys a coming policy will name (a rotation, DR-051), durably, before that policy is
+        scheduled. `expect_*` refuses a private key that does not match the public key meant to be prepared."""
+        with self.lock:
+            self.n.keyring.add(kem=kem, cmd=cmd, expect_kem_pk=expect_kem_pk, expect_cmd_pk=expect_cmd_pk)
+
     def activate_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> bool:
         """At activate_at the utility switches to the verified new policy: old-policy sessions and tickets are
         refused from then on (P5, P10), every zone key rotates (key table §4.7; members get the new keys when
-        they re-handshake) and the broker ACL is recompiled from the new policy. False while not yet due."""
+        they re-handshake) and the broker ACL is recompiled from the new policy. False while not yet due.
+        The utility then operates with the private keys the policy names (DR-051); a policy whose keys it does not
+        hold is refused before anything changes (KeyringError)."""
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
+        revoked = self.revoked_anchors() | set(revoked)             # M-1: the revocations of NOW, not a snapshot
         p = verify_policy_artifact(signed, payload, anchors, revoked)
         if self.clock() < p.activate_at:
             return False
         with self.lock:
             validate(p, installed_version=self.n.endpoint.policy.version)
+            static, cmd_key = self.n.keyring.keys_for(p)             # H-1: refused before any state changes
             self.n.zones.rotate_all()                                # first: a crash then leaves the old policy
             self.n.db.save_policy("active", signed, payload, anchors, revoked)   # active; durable before effect
-            self.n.endpoint.install_policy(p)                        # old-policy sessions closed (M1)
+            self.n.endpoint.install_policy(p, static=static)         # old-policy sessions closed (M1), new E2E key
+            self.n.endpoint.retired = self.n.keyring.retired_kems(static.pk)
+            self.n.commands.cmd_key = cmd_key                        # new command key (keys follow the policy)
             if self.publisher is not None:
                 self.publisher.policy = p
-        if self.acl_hook:
-            self.acl_hook()
+        self._acl_due = True
+        self.recompile_acl()                                         # its failure never un-does the activation
         return True
 
     def schedule_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> None:
         """Keep a verified policy until its activate_at; tick() activates it (§12 Policy Distribution)."""
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
+        revoked = frozenset(self.revoked_anchors() | set(revoked))    # M-1: the utility's authoritative set
         p = verify_policy_artifact(signed, payload, anchors, revoked)  # a bad artifact is refused now …
-        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer
+        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer …
+        self.n.keyring.keys_for(p)                                     # … or whose private keys are not held
         self.n.db.save_policy("scheduled", signed, payload, anchors, revoked)   # survives a restart (U-4)
-        self._scheduled = (signed, payload, anchors, frozenset(revoked))
+        self._scheduled = (signed, payload, anchors, revoked)
+
+    def revoked_anchors(self) -> set:
+        """The utility's authoritative revoked anchors (audit M-1, DR-050 as amended): what its published
+        KEYREVOKEs revoked, durable in its database. Every policy that is not yet in force is checked against this
+        set when it is scheduled, when it is activated (tick() re-checks a scheduled one), after a restart, when an
+        ACL is compiled for it and when it would be republished. The policy already in force is not re-judged: like a
+        device's installed policy it stays until a newer one (signed by the release anchor of the day) replaces it."""
+        out = set(self.n.db.revoked_anchors())
+        if self.publisher is not None:
+            out |= self.publisher.current_revoked()
+        return out
+
+    def acl_text(self, bootstrap=None) -> str:
+        """The broker ACL for the policy in force (U-8, B-4): compiled from its signed artifact (the stored active one,
+        or `bootstrap` = (signed, payload, anchors) before any activation), the registry and zone membership. A policy
+        in force is verified with the revocations it was activated under (DR-050 as amended); compile_acl() with the
+        current set is what refuses a new policy signed by a revoked anchor."""
+        from .broker import compile_acl
+        stored = self.n.db.load_policy("active")
+        if stored is not None:
+            signed, payload, anchors, revoked = stored
+        elif bootstrap is not None:
+            (signed, payload, anchors), revoked = bootstrap, frozenset()
+        else:
+            raise PolicyError("no activated policy artifact: pass the bootstrap POLICY artifact")
+        with self.lock:
+            members = {n: set(z.members) for n, z in self.n.zones.zones.items()}
+            return compile_acl(signed, payload, anchors, self.n.endpoint.registry.records(), members, revoked)
 
     # ------------------------------------------------------------------------------------------ main loop
     def run(self, stop: threading.Event, interval: float = 1.0) -> None:
@@ -298,6 +358,7 @@ class UtilityMqtt:
 
     def tick(self) -> None:
         from .guard import EXPECTED
+        self.recompile_acl()                                         # L-1: an owed ACL recompile is retried
         if self._scheduled is not None:
             try:
                 if self.activate_policy(*self._scheduled):
@@ -315,6 +376,34 @@ class UtilityMqtt:
                 self.publisher.cleanup(self.c)
             self.n.endpoint.sweep()
         self.ticks += 1
+
+    def _recheck_scheduled(self) -> None:
+        """After a restart: a scheduled policy is re-verified against the revocations of now (M-1)."""
+        from ..fota.policy_artifact import verify_policy_artifact
+        if self._scheduled is None:
+            return
+        signed, payload, anchors, _ = self._scheduled
+        try:
+            verify_policy_artifact(signed, payload, anchors, self.revoked_anchors())
+        except PqgridError as e:
+            self._forget_scheduled()
+            self.refused.append(f"scheduled policy refused after a restart: {e}")
+
+    def recompile_acl(self) -> bool:
+        """Run the ACL hook if an ACL recompile is owed (after an activation or a revocation). A failure (e.g. the
+        broker is restarting) is recorded in acl_failures, never reported as a refusal of the change that needed
+        it, and retried by every tick until it succeeds (audit L-1). E2E refusal never depends on it (H1)."""
+        from .guard import internal_alarm
+        if not self._acl_due or self.acl_hook is None:
+            self._acl_due = False
+            return True
+        try:
+            self.acl_hook()
+        except Exception as e:                                       # noqa: BLE001 - recorded and retried
+            self.acl_failures.append(internal_alarm("acl hook", e))
+            return False
+        self._acl_due = False
+        return True
 
     def _forget_scheduled(self) -> None:
         self.n.db.drop_policy("scheduled")
