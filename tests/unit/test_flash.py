@@ -53,6 +53,32 @@ def test_torn_record_is_ignored_and_the_store_keeps_working():
     assert RecordStore(f).get(T_A, b"k") == b"after reboot"
 
 
+def test_torn_header_near_the_end_of_a_page_does_not_block_later_writes():
+    """Regression: power fails right after the TYPE byte of a record that starts in the last 267 bytes of a page.
+    Its key_len then reads 0xFF, so the header seems to run past the page end. The boot scan must treat that as a
+    tear (the rest of the page is abandoned), not as the end of the log: otherwise the next write programs over
+    the non-erased type byte and every later small write fails, bricking the store."""
+    f = FlashSim(pages=4, page_size=4096)
+    s = RecordStore(f)
+    i = 0
+    while s._pos[1] <= 4096 - (2 + 255 + 10):                 # past the point where a 0xFF key_len overruns
+        s.put(T_A, b"k%03d" % i, b"x" * 40)
+        i += 1
+    page_before = s._pos[0]
+    f.fail_after = 1                                          # exactly one byte (the type) is programmed
+    with pytest.raises(PowerLoss):
+        s.put(T_A, b"torn", b"y" * 20)
+    f.fail_after = None
+    r = RecordStore(f)
+    assert r._pos == (page_before + 1, 0)                     # the torn page's tail is abandoned
+    assert r.get(T_A, b"torn") is None and r.get(T_A, b"k000") == b"x" * 40
+    r.put(T_A, b"after", b"z" * 10)                           # small writes still work …
+    r.put(T_A, b"k000", b"updated")
+    again = RecordStore(f)                                    # … and survive the next reboot
+    assert again.get(T_A, b"after") == b"z" * 10 and again.get(T_A, b"k000") == b"updated"
+    assert state(again) == state(r)
+
+
 def test_compaction_keeps_exactly_the_live_records():
     f = FlashSim(pages=4, page_size=512)
     s = RecordStore(f)
@@ -108,8 +134,12 @@ def test_power_loss_at_every_point_leaves_before_or_after_state():
             except PowerLoss:
                 pass
             c.fail_after = None
-            got = state(RecordStore(c))                       # … the next clean boot still recovers
+            rs = RecordStore(c)
+            got = state(rs)                                   # … the next clean boot still recovers
             assert got in (before, after), f"op {op[0]} failed at {k}/{n}: mixed state"
+            rs.put(T_A, b"z", b"written after recovery")      # … and the recovered store accepts writes
+            assert state(RecordStore(c)) == {**got, (T_A, b"z"): b"written after recovery"}, \
+                f"op {op[0]} failed at {k}/{n}: store unusable after recovery"
             checked += 1
         apply(s, op)
         model = after

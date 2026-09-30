@@ -1241,3 +1241,18 @@ ChaCha group) · ZONESYNC 83 (2-character zone; 113 at 32) · signed manifest 8,
   references).
 - **Status:** implemented and validated in simulation and Docker only. Not complete: hardware validation is
   outstanding, and the final read-only audit decides the status.
+
+## 14. Continuous audit (2026-09-30 onward)
+
+Iterative review after the final remediation pass. Every entry was first shown by a test that fails on the code
+before the fix (the "before" run is recorded in the commit message), then fixed, then checked with the focused
+tests, the full Docker suite and the frozen v2.1 `validate.py` (80/80). Evidence labels as in §13. Nothing is [HW].
+
+**Test environment note.** The canonical images are built from `design-validation/Dockerfile` (Debian trixie).
+Where Debian mirrors are unreachable, an equivalent base (Ubuntu 25.10: OpenSSL 3.5.3, Mosquitto 2.0.22,
+Python 3.13, the same pinned `cryptography`/`paho-mqtt`/`pytest`) was used; it reproduced the 464-test baseline
+and v2.1 80/80 before any change.
+
+| # | Area | Defect (how it was shown) | Fix | Regression test | Label |
+|---|---|---|---|---|---|
+| C1-1 | Device flash record store | A power cut right after the **type byte** of a record starting in the last 267 B of a page left `key_len` = 0xFF; the boot scan stopped there without marking the page torn, so the next small write programmed over the non-erased byte and every later small write failed ("store bug"): the store was unusable. The §16 power-loss test never wrote after recovering, so it could not see this | `_scan_bank` treats a header that runs past its page as a tear (rest of the page abandoned), like a bad CRC | `test_torn_header_near_the_end_of_a_page_does_not_block_later_writes`; `test_power_loss_at_every_point_leaves_before_or_after_state` now also writes (and reboots) after every recovery | [SIM] |

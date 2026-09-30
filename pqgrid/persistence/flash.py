@@ -197,8 +197,9 @@ class RecordStore:
             while off + _HEAD.size <= len(data) and data[off] != ERASED:
                 rtype, klen = _HEAD.unpack_from(data, off)
                 tail = off + _HEAD.size + klen
-                if tail + _TAIL.size > len(data):
-                    break
+                if tail + _TAIL.size > len(data):              # no real record overruns its page: a header torn
+                    end = (i + 1, 0)                           # after its type byte (key_len still 0xFF), so
+                    break                                      # nothing more on this page, as for a bad CRC
                 wseq, plen = _TAIL.unpack_from(data, tail)
                 crc_at = tail + _TAIL.size + plen
                 if crc_at + 4 > len(data) or zlib.crc32(data[off:crc_at]) != struct.unpack_from(">I", data, crc_at)[0]:
