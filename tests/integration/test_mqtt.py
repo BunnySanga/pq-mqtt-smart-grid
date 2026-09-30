@@ -12,6 +12,7 @@ import pytest
 from harness import broker, plant, requires_broker, wait_for          # noqa: F401  (fixtures)
 from pqgrid.e2e.handshake import StoredTicket
 from pqgrid.mqtt import pki, topics, tls
+from pqgrid.errors import CommandError
 from pqgrid.mqtt.device_node import TransportError
 from pqgrid.suite.aead import AeadAlg
 
@@ -297,7 +298,7 @@ def test_H1_live_revocation_over_the_broker_without_any_acl_change(plant):
     d1.mq.send_alert(b"X", b"after revocation")
     assert wait_for(lambda: any("revoked" in r for r in plant.u.refused))     # refused at the E2E layer
     assert all(p != b"after revocation" for _, p, _ in plant.u.alerts)
-    with pytest.raises(Exception, match="revoked"):
+    with pytest.raises(CommandError, match="revoked"):
         plant.u.command(D1, b"TRIP", 300)
     cc = AeadAlg.CHACHA20POLY1305
     assert wait_for(lambda: d2.mq.proc.zones._keys.get(("f7", cc)) and max(d2.mq.proc.zones._keys[("f7", cc)]) ==

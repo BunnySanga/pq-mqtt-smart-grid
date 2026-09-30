@@ -11,6 +11,7 @@ from pqgrid.mqtt.utility_node import publish_size
 from pqgrid.persistence.device import DeviceFlash
 from pqgrid.persistence.flash import FlashSim
 from pqgrid.e2e.handshake import DeviceEndpoint
+from pqgrid.errors import PolicyError
 from pqgrid.registry import DeviceRecord
 from pqgrid.suite.aead import AeadAlg
 
@@ -82,7 +83,7 @@ def test_acl_gives_each_device_only_its_own_topics(world: World):
 
 def test_acl_refuses_a_device_whose_class_is_not_in_the_policy(world: World):
     rec = DeviceRecord(b"x-0001", "unknown_class", b"\x00" * 1216)
-    with pytest.raises(Exception):
+    with pytest.raises(PolicyError, match="unknown_class"):
         render_acl(world.policy, [rec], {})
 
 

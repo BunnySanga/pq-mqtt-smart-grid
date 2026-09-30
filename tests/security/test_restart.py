@@ -18,7 +18,7 @@ from conftest import World, make_policy
 from pqgrid.commands import CommandProcessor, CommandService
 from pqgrid.e2e.envelopes import alert_topic, control_topic
 from pqgrid.e2e.handshake import DeviceEndpoint, UnknownSessionError
-from pqgrid.errors import EnvelopeError, TicketError, TicketReusedError
+from pqgrid.errors import EnvelopeError, ReplayError, TicketError, TicketReusedError
 from pqgrid.persistence.device import DeviceFlash
 from pqgrid.persistence.flash import FlashSim, PowerLoss
 from pqgrid.persistence.utility_db import SqlUsedTickets, UtilityDB, open_utility
@@ -231,7 +231,7 @@ def test_DR048_with_real_flash(p: Plant):
     for env in p.node.zones.zonekeys_for(D1):                          # zones reloaded from the database
         dev.proc.on_control(topic, env)
     queued = p.node.zones.publish("f7", b"E2", 600)[zt]
-    with pytest.raises(Exception, match="broadcast replay"):
+    with pytest.raises(ReplayError, match="broadcast replay"):
         dev.proc.zones.open(zt, seen)
     assert dev.proc.zones.open(zt, queued) == b"E2"
 
