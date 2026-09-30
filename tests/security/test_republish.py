@@ -101,6 +101,10 @@ def test_the_publishers_rollout_state_survives_a_utility_restart(world: World, s
     t[0] += RETENTION_S
     c3 = Client()
     assert pub.cleanup(c3) == 2 and {topic for topic, p, r in c3.msgs if p == b"" and r} == retained
+    db.close()
+    db = UtilityDB(path)                                                         # restart after the clean-up:
+    pub = SqlPublisher(db, world.policy, clock=lambda: t[0])
+    assert pub.live == {} and not pub.retained(rev)                              # it knows nothing is retained
     fw_b = build(station, FIRMWARE, 3, os.urandom(9000), anchor_id=ANCHOR_B)    # B releases after the revocation
     pub.publish(Client(), fw_b)
     db.close()

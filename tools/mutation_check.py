@@ -7,6 +7,7 @@ Run in the test image, against a snapshot of the tree mounted read-only at /src 
         python /t/mutation_check.py $k 4 & done; wait
     python tools/mutation_check.py sel 1,9,10 0 1        # only the listed mutants (same docker wrapper)
 Last full run (after C1-9): 117 mutants, 112 killed, 5 equivalent (24, 28, 40, 110, 112).
+Mutants 117-139 disable the checks added by cycle 1 (C2-2): 23 of 23 killed.
 """
 import shutil
 import subprocess
@@ -187,6 +188,48 @@ M = [
     # ---------------------------------------------------------------- broker / ACL
     ("pqgrid/mqtt/broker.py", "        if not rec.active:\n            continue", "        if False:\n            continue", "ACL revoked"),
     ("pqgrid/mqtt/broker.py", "    if glob.get(\"allow_anonymous\") != \"false\":", "    if False:", "config anonymous"),
+    # ---------------------------------------------------------------- checks added by cycle 1 (C1-x)
+    ("pqgrid/fota/installer.py", "        if hashlib.sha256(payload).digest() != m.payload_sha256:          # as V-F4",
+     "        if False:          # as V-F4", "C1-8 staged policy re-hash"),
+    ("pqgrid/fota/installer.py", "        if hashlib.sha256(raw).digest() != digest:", "        if False:", "C1-8 installed policy digest"),
+    ("pqgrid/fota/installer.py", "            return self.flash.policy_areas[1 - self.prot.policy[0]]",
+     "            return self.flash.policy_areas[self.prot.policy[0]]", "C1-8 stage beside the installed policy"),
+    ("pqgrid/fota/installer.py", "        self.prot.commit(POLICY, m.version, policy=(1 - self.prot.policy[0], m.payload_length, m.payload_sha256))",
+     "        self.prot.commit(POLICY, m.version)", "C1-8 commit records the installed policy"),
+    ("pqgrid/fota/installer.py", "            p.profile(self.cls)                                            # it must",
+     "            pass                                            # it must", "C1-10 policy defines own class"),
+    ("pqgrid/fota/installer.py", "        self.max_packet = p.profile(self.cls).max_packet                   # E61 now",
+     "        pass                   # E61 now", "C1-10 installer limit follows commit"),
+    ("pqgrid/fota/installer.py", "            self.max_packet = installed.profile(self.cls).max_packet\n",
+     "            pass\n", "C1-10 installer limit at boot"),
+    ("pqgrid/fota/installer.py", "        self._finish_interrupted_commits()\n", "", "C1-7 boot reconciliation"),
+    ("pqgrid/mqtt/device_node.py", "            self.outbox.cap = prof.outbox_cap                 # the budget",
+     "            pass                 # the budget", "C1-10 outbox cap follows policy"),
+    ("pqgrid/commands/utility.py", "        self._forget_grants(device_id, s.sid, now)\n", "", "C1-4 GRANT pruning"),
+    ("pqgrid/mqtt/utility_node.py", "                self._forget_scheduled()\n                self.refused.append",
+     "                self.refused.append", "C1-3 refused schedule dropped"),
+    ("pqgrid/mqtt/utility_node.py", "        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer",
+     "        pass  # … and so is one that is not newer", "C1-3 schedule validates version"),
+    ("pqgrid/mqtt/utility_node.py", "            self.n.db.save_policy(\"active\", signed, payload, anchors, revoked)   # durable",
+     "            pass   # durable", "C1-12 active policy persisted"),
+    ("pqgrid/mqtt/utility_node.py", "        self.n.db.save_policy(\"scheduled\", signed, payload, anchors, revoked)   # survives",
+     "        pass   # survives", "C1-12 scheduled policy persisted"),
+    ("pqgrid/persistence/utility_db.py", "        if active.version > policy.version:\n            policy = active",
+     "        if False:\n            policy = active", "C1-12 active policy resumed"),
+    ("pqgrid/fota/publisher.py", "        self._store(key, art, pub)                                 # the rollout state first",
+     "        pass                                 # the rollout state first", "C1-13 publish persisted"),
+    ("pqgrid/fota/publisher.py", "            self._store_revoked(rid)\n", "            pass\n", "C1-13 revocation persisted"),
+    ("pqgrid/fota/publisher.py", "                self._store(key, pub.artifact, None)               # still the newest",
+     "                pass               # still the newest", "C1-13 cleanup persisted"),
+    ("pqgrid/persistence/flash.py", "                    end = (i + 1, 0)                           # after its type byte",
+     "                    pass                           # after its type byte", "C1-1 torn header"),
+    ("pqgrid/registry.py", "    return bool(_DEVICE_ID.fullmatch(device_id))", "    return bool(_DEVICE_ID.match(device_id))",
+     "C1-2 device id fullmatch"),
+    ("pqgrid/commands/codec.py", "    return bool(_TOKEN.fullmatch(s))", "    return bool(_TOKEN.match(s))", "C1-2 token fullmatch"),
+    ("pqgrid/policy/validator.py", "    if not _POLICY_ID.fullmatch(p.policy_id):", "    if not _POLICY_ID.match(p.policy_id):",
+     "C1-2 policy id fullmatch"),
+    ("pqgrid/policy/validator.py", "        if not _CLASS_NAME.fullmatch(name) or c.name != name:",
+     "        if not _CLASS_NAME.match(name) or c.name != name:", "C1-2 class name fullmatch"),
 ]
 
 
