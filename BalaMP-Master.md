@@ -3125,6 +3125,12 @@ implementation.
 These per-day figures were computed from the pre-implementation sizes. With the measured v2.2 sizes they move by
 under 1%, except P3 GRANT (+1.3%, because SETPOINT is 97 B rather than 93 B).
 
+**Not counted above** [ANALYTICAL, continuous audit C3]: for a device in DR zones, every (re)establishment also brings
+the still-valid events of its zones again (M4, §11: ~3.5 KB each for a 64-byte event, at most 64 retained per
+zone), which the device drops by `bseq` if it already accepted them. With few short-lived events this is small; a
+device that wakes often while long-lived events are valid pays it at every wake. Sending only events newer than the
+device's last accepted `bseq` would need a protocol change (a decision record), so it is recorded, not changed.
+
 ## 22.7 MQTT Packet Size
 
 | Item | Size |

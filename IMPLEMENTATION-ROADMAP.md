@@ -1290,6 +1290,12 @@ and v2.1 80/80 before any change.
 - **Mutation analysis:** 5 equivalent mutants (listed in C1-9) remain by construction; `tools/mutation_check.py`
   re-runs the analysis.
 - **[HW]:** unchanged from §13.8.
+- **ACL recompilation (optional hardening):** the ACL hook runs once after a revocation or an activation; if it
+  fails (e.g. the broker is restarting when it is signalled) the failure is visible (it raises to the caller or is
+  an internal alarm of the loop) but is not retried. Since C2-4 and C2-7 a stale ACL gives a revoked device nothing
+  beyond a broker connection (unreadable events, refused messages, public signed artifacts).
+- **DR re-send cost (by design, M4):** each (re)establishment re-sends every still-valid event of the device's zones;
+  the device drops what it already accepted. Recorded in Master §22.6; changing it needs a decision record.
 - **Not implemented in the Python device (Master D-2):** pipelining CONNECT with the first PUBLISH (`DeviceMqtt.connect`
   waits for CONNACK) and MQTT 5 topic aliases for high-rate TELEMETRY (paho 2.1 cannot send them: see
   `design-validation/constrained-audit/test_transport.py`). Both are byte and latency optimisations, measured in
@@ -1321,3 +1327,4 @@ holds the STEK) the database's 0600 mode [DOCKER]; no change.
 | # | Area | Finding | Change | Test | Label |
 |---|---|---|---|---|---|
 | C3-1 | ACL compiler (§10.1, K-5) | One registry record whose class the policy does not define (e.g. a class dropped by a new policy while its devices are still registered) made `render_acl` raise for the whole fleet. The broker then kept its **previous** ACL: fail-stale, not fail-closed, including the rights of devices revoked since the last compile; the activation's ACL hook also raised after the policy was already active. The test pinned the raise | Such a device gets no block (a comment line says why); every other device's rights are still written | `test_acl_gives_no_rights_to_a_device_whose_class_is_not_in_the_policy` (replaces the test that expected the raise) | [SIM] |
+| C3-2 | Documentation (Phase 8) | Two costs were not written down anywhere: the M4 re-send of every still-valid DR event at each establishment (absent from the Master's bandwidth figures) and the unretried ACL hook | Master §22.6 note [ANALYTICAL]; §14.1 entries | Docs only | — |
