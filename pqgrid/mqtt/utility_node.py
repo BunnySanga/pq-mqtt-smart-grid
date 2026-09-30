@@ -263,9 +263,9 @@ class UtilityMqtt:
             return False
         with self.lock:
             validate(p, installed_version=self.n.endpoint.policy.version)
-            self.n.db.save_policy("active", signed, payload, anchors, revoked)   # durable before it takes effect
+            self.n.zones.rotate_all()                                # first: a crash then leaves the old policy
+            self.n.db.save_policy("active", signed, payload, anchors, revoked)   # active; durable before effect
             self.n.endpoint.install_policy(p)                        # old-policy sessions closed (M1)
-            self.n.zones.rotate_all()
             if self.publisher is not None:
                 self.publisher.policy = p
         if self.acl_hook:

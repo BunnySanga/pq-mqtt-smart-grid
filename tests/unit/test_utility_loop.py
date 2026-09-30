@@ -120,3 +120,29 @@ def test_a_policy_scheduled_before_a_restart_is_still_activated_at_its_time(util
     u, node = restart()
     u.tick()
     assert node.endpoint.policy.version == 2 and u._scheduled is None   # activated once, not scheduled again
+
+
+@requires_station
+def test_a_crash_while_activating_never_leaves_the_new_policy_on_the_old_zone_keys(util, monkeypatch):
+    """Key table §4.7: zone keys rotate at a policy change. If the activation is interrupted at the rotation (it
+    fails here as a crash would), the restarted utility must not run the new policy on the old zone keys: the old
+    policy is still active, and the scheduled activation runs again, rotation included."""
+    u, node, now, signed, restart = util
+    node.zones.create("f7")
+    node.zones.add_member("f7", b"der-0001")
+
+    def epoch(n):
+        return n.zones.zones["f7"].groups[AeadAlg.CHACHA20POLY1305].key_epoch
+    e0 = epoch(node)
+    u.schedule_policy(*signed(2, T0 + 60))
+    now[0] = T0 + 60
+
+    def crash():
+        raise RuntimeError("power lost while rotating the zone keys")
+    monkeypatch.setattr(node.zones, "rotate_all", crash)
+    with pytest.raises(RuntimeError):
+        u.tick()
+    u, node = restart()
+    assert node.endpoint.policy.version == 1 and epoch(node) == e0     # nothing half done
+    u.tick()                                                           # the scheduled activation, again
+    assert node.endpoint.policy.version == 2 and epoch(node) == e0 + 1
