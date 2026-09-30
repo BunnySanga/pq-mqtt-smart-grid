@@ -17,7 +17,7 @@ import conftest
 from pqgrid.commands import CommandProcessor
 from pqgrid.e2e.handshake import DeviceEndpoint
 from pqgrid.mqtt import pki, tls
-from pqgrid.fota.artifact import POLICY
+from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.installer import FotaFlash, Installer
 from pqgrid.fota.publisher import Publisher, part_payload_budget
 from pqgrid.fota.station import Station
@@ -184,14 +184,15 @@ class Plant:
         return dev
 
     def boot(self, dev: Dev) -> Dev:
-        """Power-on: every object rebuilt from flash; a new MQTT connection. The device runs its installed policy,
-        kept in flash (Master §4.1), or its factory policy if none was ever installed over the air."""
+        """Power-on: every object rebuilt from flash; a new MQTT connection. The device runs its committed firmware
+        (version 1 from the factory) and its installed policy, kept in flash (Master §4.1), or its factory policy if
+        none was ever installed over the air."""
         df = DeviceFlash(dev.flash, clock=time.time)
         dev.fota = Installer(self.station.anchors, dev.dclass, self.policy.profile(dev.dclass).max_packet,
                              dev.fota_flash, RecordStore(dev.protected, clock=time.time), df.store,
                              clock=lambda: dev.d.now())
         policy = dev.fota.installed_policy() or self.policy
-        dev.d = DeviceEndpoint(dev.did, dev.dclass, policy, 1, dev.kp, flash=df)
+        dev.d = DeviceEndpoint(dev.did, dev.dclass, policy, dev.fota.committed(FIRMWARE) or 1, dev.kp, flash=df)
         dev.proc = CommandProcessor(dev.d, dev.applied.append, lambda t, v: dev.setpoints.append((t, v)),
                                     targets={"P_ACTIVE_W"}, state=df.command_state())
         dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), policy.profile(dev.dclass).outbox_cap)

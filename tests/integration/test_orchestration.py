@@ -119,6 +119,13 @@ def test_M9_firmware_is_committed_by_the_loop_and_the_device_re_handshakes_with_
         assert wait_for(lambda: m.d.confirmed and m.d.fw == 2, 15), m.mq.errors
         assert plant.node.endpoint.current_session(M1).fw_version == 2           # the utility sees the new image
         assert m.d.ticket is None or m.d.ticket.fw_version == 2                   # no ticket of the old image
+    m.mq.disconnect()
+    plant.boot(m)                                                                # power cycle: it runs image 2 …
+    assert m.d.fw == 2
+    with loops(plant, m):
+        assert wait_for(lambda: m.d.confirmed, 15), m.mq.errors
+        assert plant.node.endpoint.current_session(M1).fw_version == 2           # … and says so
+    assert list(plant.u.republished) == []                                       # nothing offered again (E-4)
 
 
 def _cleaned_up(plant, art):
