@@ -1,0 +1,1 @@
+container: X25519 exchange (both sides) 93.8 us | ML-KEM-768 exchange (keygen+encap+decap) 76.9 us | hybrid adds 122% compute, 64 bytes

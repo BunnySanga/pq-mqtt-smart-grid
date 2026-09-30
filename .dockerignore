@@ -1,0 +1,8 @@
+# Only the implementation and its tests go into images built from the project root.
+*
+!pqgrid/
+!tests/
+!pytest.ini
+!requirements.txt
+**/__pycache__
+**/.pytest_cache

@@ -1,0 +1,88 @@
+
+=== CORE (47/47 as expected) ===
+PASS  PCHC full hybrid KEM-MQTT handshake (meter), keys equal                                                     ok
+PASS  PCHC full handshake (DER controller)                                                                        ok
+PASS  tier engine: telemetry/alert/control/unknown -> 1/2/3/3                                                     ok
+PASS  tier engine: overlapping rules -> strongest wins                                                            ok
+PASS  alert end to end (device -> utility) + end-to-end ACK                                                       ok
+PASS  curious broker sees no alert plaintext                                                                      ok
+PASS  control command: AEAD + ML-DSA-65 verified, applied, ACK clears utility queue                               ok
+PASS  tamper POLICY_INFO inside client hello (broker MITM)                                                        rejected: client hello failed authentication
+PASS  tamper POLICY_INFO inside server hello (broker MITM)                                                        rejected: server hello failed authentication
+PASS  client hello replayed onto another device's topic                                                           rejected: identity does not match the device's topic
+PASS  device refuses to seal an ALERT on a TELEMETRY topic                                                        rejected: topic is not ALERT tier under installed policy
+PASS  plaintext (tier-stripped) message on ALERT topic                                                            rejected: unknown session
+PASS  alert replay (same envelope again)                                                                          rejected: seq 1 <= 1
+PASS  forged alert (bad tag) does not consume the sequence number                                                 ok
+PASS  control command replay is acknowledged as DUP but never re-applied                                          ok
+PASS  forged command by holder of session key but not utility signing key                                         rejected: command signature invalid
+PASS  unsafe policy (unicast-control class with PSK-only resume) rejected                                         rejected: der: receives unicast control, so PSK-only resumption (no forward secrecy) is forbidd
+PASS  broadcast DR event: zone key + utility signature                                                            ok
+PASS  broadcast DR replay                                                                                         rejected: broadcast replay
+PASS  captured meter forges DR event (has zone key, lacks utility key)                                            rejected: broadcast signature invalid
+PASS  PASR resume, PSK mode (meter): keys match, new ticket                                                       ok
+PASS  PASR resume, PSK_KEM mode (DER, fresh hybrid KEM)                                                           ok
+PASS  PASR resume again (ticket rotated, chain continues)                                                         ok
+PASS  ticket replay: same resume hello after the duplicate window                                                 rejected: ticket already used
+PASS  ticket reuse: same ticket, fresh resume hello (clone)                                                       rejected: ticket already used
+PASS  stolen ticket blob without PSK (binder forgery)                                                             rejected: binder invalid
+PASS  ...and the forgery did not burn the legitimate ticket                                                       ok
+PASS  ticket presented on another device's channel                                                                rejected: ticket/device identity mismatch
+PASS  expired ticket (2 days later)                                                                               rejected: ticket expired
+PASS  resume-mode downgrade (DER strips fresh KEM: PSK_KEM -> PSK)                                                rejected: resume mode does not match policy
+PASS  stale ticket after firmware update                                                                          rejected: ticket issued for different firmware
+PASS  ticket sealed under a retired STEK                                                                          rejected: ticket key retired
+PASS  revoked device: resumption refused                                                                          rejected: device unknown or revoked
+PASS  revoked device: full handshake refused                                                                      rejected: unknown or revoked device
+PASS  stale ticket after policy change                                                                            rejected: ticket issued under a different policy
+PASS  device still on old policy: full handshake refused (fail closed)                                            rejected: POLICY_INFO mismatch: device must install current policy
+PASS  old-policy session: alerts refused                                                                          rejected: session belongs to an old policy
+PASS  device installs signed policy v2 via PQC-FOTA                                                               ok
+PASS  full handshake under policy v2 succeeds                                                                     ok
+PASS  policy rollback: old signed policy v1 re-served by broker                                                   rejected: rollback: version not newer than installed
+PASS  forged policy (signed by a non-station key)                                                                 rejected: manifest signature invalid
+PASS  tampered firmware chunk                                                                                     rejected: chunk 17 failed Merkle verification
+PASS  tampered firmware manifest                                                                                  rejected: manifest signature invalid
+PASS  firmware v2 install: 1 MiB, 256 chunks, shuffled delivery, committed                                        ok
+PASS  firmware rollback to v1 (validly signed)                                                                    rejected: rollback: version not newer than installed
+PASS  firmware replay of v2 (already installed)                                                                   rejected: rollback: version not newer than installed
+PASS  firmware for another device class                                                                           rejected: manifest targets another device class
+
+=== EDGE (31/31 as expected) ===
+PASS  MQTT QoS 1 duplicate of client hello -> identical answer, handshake completes                               ok
+PASS  duplicate finished -> same final message, exactly one session                                               ok
+PASS  duplicate resume hello -> identical answer (not 'ticket already used')                                      ok
+PASS  lost server hello -> retry completes; the late original reply is rejected                                   ok
+PASS  lost finished -> device will not send until confirmed; resend completes                                     ok
+PASS  lost final/ticket -> resent finished returns the same ticket                                                ok
+PASS  device clock reset to 1970 after outage -> still connects; clock corrected from utility                     ok
+PASS  device clock a day ahead -> fresh commands still accepted (utility time used)                               ok
+PASS  utility restart -> resync hint -> PASR resume -> unacknowledged alert resent and acked                      ok
+PASS  counterfactual: restart WITHOUT persisted STEK -> every ticket dies (why we persist it)                     rejected: ticket not authentic
+PASS  consumed ticket replayed after a utility restart                                                            rejected: ticket already used
+PASS  device reboot -> PASR resume from flash ticket -> pending alert delivered                                   ok
+PASS  lost alert ACK -> resend -> utility recognises the duplicate by alert id                                    ok
+PASS  command sent while device offline -> redelivered on next session, applied once                              ok
+PASS  command ACK lost -> redelivery acknowledged as DUP, never applied twice                                     ok
+PASS  command applied, ACK lost, device reboots -> redelivery is DUP (flash counter), never re-applied            ok
+PASS  expired command is not redelivered, and is refused (EXPIRED) if it arrives late                             ok
+PASS  commands out of order -> newest wins; older one acknowledged, not applied                                   ok
+PASS  forged resync hint -> one cheap resume, further hints rate-limited (DoS only)                               ok
+PASS  device ids with '+', '#', '/', uppercase, spaces, unicode, >32 chars rejected                               ok
+PASS  oversized length field rejected before allocation                                                           rejected: field too large
+PASS  fuzz: 3,300 corrupted messages into 11 handlers -> all rejected cleanly; genuine ticket still valid         ok
+PASS  power loss mid-download -> restart download from retained chunks -> installs                                ok
+PASS  new firmware fails to boot -> revert, counter unchanged; retry works; rollback still blocked                ok
+PASS  chunk from a different firmware version mixed in                                                            rejected: chunk from another artifact
+PASS  device offline across policy v1 -> v4 -> installs v4 directly, v3 refused, handshake under v4               ok
+PASS  cloned device uses ticket first -> genuine device sees 'already used' (alarm), full handshake evicts clone  ok
+PASS  old client hello replayed while a session is live -> live session unaffected                                ok
+PASS  captured meter re-publishes another meter's alert envelope on its own topic                                 rejected: envelope belongs to another device's session
+PASS  handshake flood from one device -> at most one half-open state kept                                         ok
+PASS  member removed from zone (holds old epoch key) cannot read events under the new epoch                       rejected: no key for zone/epoch
+
+=== RISK (2/2 as expected) ===
+PASS  stolen utility E2E key: attacker can read new sessions, but cannot forge commands                           ok
+PASS  stolen STEK: attacker mints tickets and impersonates devices (why the STEK needs an HSM)                    ok
+
+TOTAL 80/80 as expected

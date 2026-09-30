@@ -1,0 +1,17 @@
+N1 genuine session through the proxy delivered: 1
+N1 attacker replays all 16043 captured client bytes on a new connection -> extra messages delivered: 0
+N1 broker log for the replay: ['OpenSSL Error[1]: error:0A000139:SSL routines::record layer failure', 'Client <unknown> disconnected: Protocol error.']
+N2 one bit flipped in the encrypted PUBLISH -> tampered?: True
+N2 -> tampered message delivered: 0
+N2 -> connection dropped by broker: True
+N2 broker log: ['OpenSSL Error[1]: error:0A000139:SSL routines::record layer failure']
+N3 default broker, client offers ONLY classical X25519: Peer Temp Key: X25519, 253 bits
+N3 hybrid-only broker, client offers ONLY classical X25519: HANDSHAKE FAILURE (20A0248AFFFF0000:error:0A000410:SSL routines:ssl3_read_bytes:ssl/tls alert handshake failure:../ssl/record/rec_layer_s3.c:918:SSL alert number 40)
+N3 hybrid-only broker, client with default groups: Negotiated TLS1.3 group: X25519MLKEM768
+N4 genuine device after clone connects: disconnected with: ['Normal disconnection']
+N4 broker log: ['Client meter-0001 already connected, closing old connection.']
+N5 retained manifest after broker restart, persistence ON: [('pqgrid/fota/smart_meter/manifest', 16624)]
+N5 retained manifest after broker restart, persistence OFF: []
+N6 with max_packet_size 300000: delivered sizes: [262144]
+N6 sender of the 400 KB packet was disconnected: ['Normal disconnection']
+N7 session from 127.0.0.1 resumed from a different source IP 172.17.0.2: True

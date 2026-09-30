@@ -1,0 +1,5 @@
+OpenSSL 3.5.7 9 Jun 2026 (Library: OpenSSL 3.5.7 9 Jun 2026)
+algorithm  keygen(s)  sign(s)  verify(s)  keygens/s  signs/s  verifies/s
+                  ML-DSA-65 0.000107s 0.000556s 0.000101s    9316.5    1799.5    9902.5
+          SLH-DSA-SHA2-192s 0.031719s 0.324286s 0.000275s      31.5       3.1    3636.0
+          SLH-DSA-SHA2-128s 0.021489s 0.167500s 0.000164s      46.5       6.0    6105.5

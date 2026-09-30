@@ -1,0 +1,31 @@
+== TLS negotiation (device cert) ==
+Protocol version: TLSv1.3
+Ciphersuite: TLS_AES_256_GCM_SHA384
+Signature type: mldsa65
+Verification: OK
+Negotiated TLS1.3 group: X25519MLKEM768
+== access control, MQTT 5 properties, retained messages, resumption ==
+T1 mTLS connect with ML-DSA-65 client cert: Success
+T2 allowed publish -> PUBACK: Success
+T2 utility received allowed msg: True
+T3 forbidden publish -> PUBACK: Not authorized
+T3 utility received spoofed msg: False
+T4 forbidden subscribe -> SUBACK: ['Granted QoS 1']
+T5 user props / response topic / correlation forwarded: ([('policy_id', 'grid-pol'), ('policy_version', '7')], 'pqgrid/hs/meter-0001/down', b'hs-42')
+T6 retained msgs delivered to late subscriber (topic,len,retain): [('pqgrid/fota/smart_meter/manifest', 16624, True), ('pqgrid/fota/smart_meter/1/chunk/0', 262144, True)]
+T7 full hybrid-TLS + mTLS + MQTT CONNECT latency, median ms (n=30, loopback, first 5 dropped): 91.1
+T8 CONNACK ok: True
+T8 TLS resumption actually reused session (20 tries): 20/20
+T8 full vs resumed TLS+CONNECT median ms: (92.32, 2.73)
+== delivery-time ACL + Nagle effect (broker WITHOUT set_tcp_nodelay) ==
+F1 meter-0001 received meter-0002's control msg: False
+F2 client TCP_NODELAY, server port 8883: full median 52.53 ms | resumed median 46.65 ms
+F3 paho sets TCP_NODELAY: False | wrap_socket call present: True
+== Nagle effect (broker WITH set_tcp_nodelay) ==
+F2 client TCP_NODELAY, server port 8884: full median 1.91 ms | resumed median 0.53 ms
+== paho subclass TLS resumption ==
+paho subclass: TLS resumed 25/25 | full median 10.47 ms | resumed median 3.71 ms  (loopback, ML-DSA-65 certs, TCP_NODELAY both sides)
+== certificate type vs handshake bytes ==
+mldsa65  leaf cert DER  5520 B | full handshake  31702 B total | resumed   8749 B total
+mldsa44  leaf cert DER  3991 B | full handshake  23809 B total | resumed   7213 B total
+ecp256   leaf cert DER   394 B | full handshake   4695 B total | resumed   3613 B total

@@ -1,0 +1,6 @@
+# Runtime + test dependencies for the pqgrid implementation (project-local .venv only).
+# SLH-DSA-SHA2-128s is not in `cryptography`; it is reached through ctypes to OpenSSL >= 3.5
+# (see IMPLEMENTATION-ROADMAP.md §6). Canonical runs stay in Docker.
+cryptography==50.0.1
+pytest==9.1.1
+paho-mqtt==2.1.0

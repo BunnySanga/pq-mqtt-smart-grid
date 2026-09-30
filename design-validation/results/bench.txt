@@ -1,0 +1,18 @@
+ENVIRONMENT: Linux aarch64 | Python 3.13.5 | cryptography 50.0.1 | median of 180 runs after 20 warm-up
+E2E SESSION ESTABLISHMENT
+                                              device ms  utility ms  bytes: msg1/msg2/msg3/ticket = total
+Full handshake (hybrid KEM-MQTT, 3 KEMs)          0.278       0.229  2493/2411/42/266 = 5212
+PASR resume, PSK mode                             0.021       0.030  337/110/42/266 = 755
+Full handshake (DER)                              0.271       0.223  2494/2415/42/271 = 5222
+PASR resume, PSK_KEM mode                         0.144       0.103  1560/1230/42/271 = 3103
+
+PER-MESSAGE (64-byte payload)
+  TELEMETRY  wire = 64 B app payload (TLS only)
+  ALERT      wire = 137 B  (+73 B)   device seal 0.005 ms
+  CONTROL    wire = 3442 B (+3378 B)  device open+verify 0.118 ms
+  BROADCAST  wire = 3468 B (+3404 B)
+
+PQC-FOTA  (1 MiB image, 4 KiB chunks, SLH-DSA-SHA2-192s)
+  signed manifest 16405 B | trust anchor 48 B | chunks 256 | Merkle proof per chunk 256 B
+  flat hash list would be 8192 B in the manifest; Merkle keeps 32 B root
+  station build+sign 472 ms (offline) | device manifest verify median 0.272 ms | full install (256 chunks, shuffled) 3 ms

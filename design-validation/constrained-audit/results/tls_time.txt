@@ -1,0 +1,29 @@
+== T2 TLS 1.3 session-ticket lifetime (broker clock moved with libfaketime) ==
+  ticket received: lifetime hint 7200 s; client-side session timeout 7200 s
+  broker clock + 3600 s (faked now=1790078736): resumption ACCEPTED
+  broker clock + 7000 s (faked now=1790082137): resumption ACCEPTED
+  broker clock + 7300 s (faked now=1790082437): resumption REFUSED -> full hybrid handshake
+  broker clock +90000 s (faked now=1790165137): resumption REFUSED -> full hybrid handshake
+
+== T3 max_fragment_length (RFC 6066): can a small device ask for small TLS records? ==
+  client asks max_fragment_length=None: broker->device records 13, largest 16401 B (ciphertext incl. 17 B overhead); s_client says ['(no MFL line)']
+  client asks max_fragment_length=512: broker->device records 49, largest 529 B (ciphertext incl. 17 B overhead); s_client says ['(no MFL line)']
+  client asks max_fragment_length=1024: broker->device records 29, largest 1041 B (ciphertext incl. 17 B overhead); s_client says ['(no MFL line)']
+
+== T4 device clock and certificate validity vs the TLS hop (ECDSA P-256 PKI) ==
+   certificates: broker     452 B  notBefore=Sep 22 11:05:33 2026 GMT notAfter=Dec 25 11:05:33 2028 GMT  | meter1     426 B  notBefore=Sep 22 11:05:33 2026 GMT notAfter=Dec 25 11:05:33 2028 GMT  | devlong    429 B  notBefore=Sep 22 11:05:33 2026 GMT notAfter=Dec 31 23:59:59 9999 GMT  | devexp     426 B  notBefore=Jan  1 00:00:00 2020 GMT notAfter=Jan  1 00:00:00 2021 GMT
+  a) normal device, correct clock                                            -> CONNECTED, CONNACK 20020000
+  b) device RTC reset to 1970 after power loss (no battery-backed RTC)       -> [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate is not yet valid (_ssl.c:1029)
+  c) same 1970 clock, strict verification (typical embedded default)         -> HANDSHAKE FAILED verify error:num=9:certificate is not yet valid
+  d) same 1970 clock, time checks disabled (X509_V_FLAG_NO_CHECK_TIME)       -> HANDSHAKE OK 
+  e) device clock 3 years ahead (drifted/garbage RTC)                        -> [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1029)
+  f) device certificate expired while the device was offline (correct clock) -> [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] ssl/tls alert certificate expired (_ssl.c:2650)
+  g) device certificate with notAfter 9999-12-31, correct clock              -> CONNECTED, CONNACK 20020000
+   broker log (certificate errors): ['OpenSSL Error[0]: error:0A000412:SSL routines::ssl/tls alert bad certificate', 'OpenSSL Error[0]: error:0A000415:SSL routines::ssl/tls alert certificate expired', 'OpenSSL Error[0]: error:0A000086:SSL routines::certificate verify failed']
+
+== T7 hop authentication with a per-device external PSK instead of ECDSA certificates ==
+  listener tls_version tlsv1.3 + psk_hint, client TLS 1.3: REFUSED SSL alert number 70
+  listener tls_version tlsv1.2 + psk_hint, client TLS 1.3: REFUSED SSL alert number 70
+  listener tls_version tlsv1.2 + psk_hint, client TLS 1.2: ESTABLISHED Protocol version: TLSv1.2 | Ciphersuite: DHE-PSK-AES256-GCM-SHA384 | Peer Temp Key: DH, 3072 bits
+  same, WRONG key:                                         REFUSED SSL alert number 20
+  broker log: ['Client connection from 127.0.0.1 failed: error:0A0000BF:SSL routines::no protocols availab', 'OpenSSL Error[0]: error:1C800066:Provider routines::cipher operation failed']

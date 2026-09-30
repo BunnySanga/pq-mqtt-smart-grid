@@ -1,0 +1,48 @@
+== T1 MQTT 5 Maximum Packet Size vs the signed manifest [REAL DOCKER MEASUREMENT] ==
+  device Maximum Packet Size   8192: received payload sizes [4352] -> manifest NEVER DELIVERED (no error to the device); still connected: True
+  device Maximum Packet Size  16384: received payload sizes [4352] -> manifest NEVER DELIVERED (no error to the device); still connected: True
+  device Maximum Packet Size  16445: received payload sizes [4352, 16405] -> manifest RECEIVED; still connected: True
+  device Maximum Packet Size  16500: received payload sizes [4352, 16405] -> manifest RECEIVED; still connected: True
+  device Maximum Packet Size  32768: received payload sizes [4352, 16405] -> manifest RECEIVED; still connected: True
+  device Maximum Packet Size   None: received payload sizes [4352, 16405] -> manifest RECEIVED; still connected: True
+  broker log lines mentioning size/drop: []
+
+== T5 bytes on the wire, TCP payload (TLS 1.3 hybrid-pinned, ECDSA P-256 mutual) [REAL DOCKER MEASUREMENT] ==
+   (IP/TCP headers are extra: >= 40 B per segment plus ACK segments; not counted here)
+  full TLS handshake + MQTT CONNECT/CONNACK: up 2421 B, down 3841 B, total 6262 B
+    TLS records up  (type,len): [(22, 1528), (20, 1), (23, 650), (23, 96), (23, 69), (23, 47)]
+    TLS records down(type,len): [(22, 1210), (20, 1), (23, 23), (23, 79), (23, 900), (23, 96), (23, 69), (23, 698), (23, 682), (23, 33)]
+  TLS session ticket: lifetime hint 7200 s, timeout 7200 s
+  SUBSCRIBE/SUBACK: 83 B
+  publish TELEMETRY 64 B QoS 0            : up 128 B, down 0 B -> overhead 64 B over the payload
+  publish TELEMETRY 64 B QoS 1            : up 130 B, down 27 B -> overhead 93 B over the payload
+  publish ALERT envelope 137 B QoS 1      : up 204 B, down 27 B -> overhead 94 B over the payload
+  publish CONTROL envelope 3,442 B QoS 1  : up 3509 B, down 27 B -> overhead 94 B over the payload
+  publish TELEMETRY 64 B QoS 0 with MQTT 5 topic alias: up 94 B (topic is 37 B)
+  TLS 1.3 RESUMED handshake + CONNECT/CONNACK (session kept, no SUBSCRIBE needed): 4438 B, resumed=True
+
+== T6 time until the device can send its first end-to-end protected message [RESOURCE-CONSTRAINED SIMULATION] ==
+   link model: one-way delay + serialisation rate per direction + TCP handshake RTT; proxy terminates TCP;
+   no radio scheduling, repetitions, loss or TCP congestion control. Utility is on the broker's LAN.
+  -- LTE-M-like    RTT 0.2 s, 200 kbit/s (assumed parameters; n=3 per scenario) --
+     A  cold start: full TLS + SUBSCRIBE + full E2E handshake             ready    1.72 s   bytes  11857
+     B  reboot (per §4.6): full TLS + SUBSCRIBE + PASR PSK resume         ready    1.53 s   bytes   7413
+     C  wake: TLS resumed + SUBSCRIBE + PASR PSK resume                   ready    1.46 s   bytes   5590
+     C' wake: TLS resumed + SUBSCRIBE + PASR PSK+KEM resume               ready    1.55 s   bytes   7933
+     D  proposal: TLS resumed + persistent MQTT session + 1-RTT PSK       ready    1.02 s   bytes   5866
+     E  telemetry-only wake: TLS resumed + persistent session + 1 publish ready    1.00 s   bytes   4579
+  -- NB-IoT-good   RTT 1.0 s,  20 kbit/s (assumed parameters; n=3 per scenario) --
+     A  cold start: full TLS + SUBSCRIBE + full E2E handshake             ready   10.77 s   bytes  11870
+     B  reboot (per §4.6): full TLS + SUBSCRIBE + PASR PSK resume         ready    8.98 s   bytes   7414
+     C  wake: TLS resumed + SUBSCRIBE + PASR PSK resume                   ready    8.25 s   bytes   5590
+     C' wake: TLS resumed + SUBSCRIBE + PASR PSK+KEM resume               ready    9.18 s   bytes   7933
+     D  proposal: TLS resumed + persistent MQTT session + 1-RTT PSK       ready    6.02 s   bytes   5866
+     E  telemetry-only wake: TLS resumed + persistent session + 1 publish ready    5.84 s   bytes   4579
+  -- NB-IoT-poor   RTT 4.0 s,   2 kbit/s (assumed parameters; n=1 per scenario) --
+     A  cold start: full TLS + SUBSCRIBE + full E2E handshake             ready   71.23 s   bytes  11871
+     B  reboot (per §4.6): full TLS + SUBSCRIBE + PASR PSK resume         ready   53.45 s   bytes   7415
+     C  wake: TLS resumed + SUBSCRIBE + PASR PSK resume                   ready   46.12 s   bytes   5590
+     C' wake: TLS resumed + SUBSCRIBE + PASR PSK+KEM resume               ready   55.49 s   bytes   7933
+     D  proposal: TLS resumed + persistent MQTT session + 1-RTT PSK       ready   35.90 s   bytes   5866
+     E  telemetry-only wake: TLS resumed + persistent session + 1 publish ready   34.20 s   bytes   4595
+EXIT=0

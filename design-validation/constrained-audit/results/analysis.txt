@@ -1,0 +1,101 @@
+
+====================================================================================================
+1. Device public-key work per connection in v2.1 (operation counts from BalaMP.md §5.2/§5.4 + TLS 1.3 client, mutual auth)
+====================================================================================================
+phase                                             ML-KEM    X25519     ECDSA  total Mcyc   @64MHz   @24MHz   M0+@125MHz ms (KEM/X/EC)
+TLS 1.3 full, X25519MLKEM768, ECDSA mutual          1.35      1.25     11.28       13.89     217ms    579ms   38/57/735 = 831
+TLS 1.3 resumed (psk_dhe_ke, hybrid group)          1.35      1.25      0.00        2.60      41ms    108ms   38/57/0 = 95
+E2E full handshake (3 hybrid KEMs)                  2.72      3.13      0.00        5.84      91ms    243ms   79/144/0 = 222
+E2E PASR PSK+KEM resume                             1.35      1.25      0.00        2.60      41ms    108ms   38/57/0 = 95
+E2E PASR PSK resume                                 0.00      0.00      0.00        0.00       0ms      0ms   0/0/0 = 0
+
+cold start (full TLS + full E2E) on Cortex-M4: 19.7 Mcycles = 308 ms @64 MHz, 164 ms @120 MHz (lower bounds)
+  share: ML-KEM 21%  X25519 22%  ECDSA P-256 57%  -> the classical halves cost 79% of the device's public-key time
+energy proxy [TAS23 board-level, P-256 ECDHE used as a stand-in for X25519]: ~39 mJ per cold start
+radio proxy [LUK20]: ONE 64-byte NB-IoT UDP exchange ~282 mAs = 846-1015 mJ at 3.0-3.6 V (voltage not stated in the paper)
+AVR (Kim & Seo device class): one X25519 = 0.87 s at 16 MHz; the whole Kyber-512 KEM-MQTT client = 4.32 s at 7.37 MHz;
+  TLS 1.3 + a second hybrid E2E layer is not feasible in 6 KB SRAM (OpenSSL needs >= 16 KB stack [KS25]).
+
+====================================================================================================
+2. CONTROL authenticity: bytes and device verify cost per command
+====================================================================================================
+  ML-DSA-65 (v2.1)                   envelope  3442 B   verify   37.7 ms @64MHz
+  ML-DSA-44                          envelope  2553 B   verify   22.2 ms @64MHz
+  FN-DSA-512 (draft FIPS 206)        envelope   799 B   verify    7.4 ms @64MHz
+  LMS H10/W8 (stateful!)             envelope  1589 B   verify    (not in pqm4)
+  session AEAD only (grant model)    envelope   133 B   verify    0.0 ms @64MHz
+
+====================================================================================================
+3. Bytes per day per device (payload + E2E + an ANALYTICAL MQTT/TLS per-publish estimate; no TCP/IP headers)
+====================================================================================================
+  P1 AMI meter, 15-min interval reads [AMI]
+     data: telemetry 15.1 kB + alerts 0.2 kB + control 0.0 kB = 15.3 kB/day
+       + reconnect every 15 min, full TLS each time (ticket expired)    601.9 kB -> total   0.62 MB/day, security share  98%, airtime @20 kbit/s    4.1 min/day
+       + reconnect every 15 min, TLS resumed each time                  426.8 kB -> total   0.44 MB/day, security share  97%, airtime @20 kbit/s    2.9 min/day
+       + reconnect 4x/day (batched reads), TLS resumed                   18.5 kB -> total   0.03 MB/day, security share  55%, airtime @20 kbit/s    0.2 min/day
+       + always connected, keepalive 5 min, daily TLS + weekly E2E       20.8 kB -> total   0.04 MB/day, security share  58%, airtime @20 kbit/s    0.2 min/day
+  P2 DER, 2030.5-style: 5-min monitoring, 4 control events/day [IEEE2030.5]
+     data: telemetry 63.6 kB + alerts 0.5 kB + control 14.1 kB = 78.2 kB/day
+       + always connected, keepalive 5 min, daily TLS + weekly E2E       20.8 kB -> total   0.10 MB/day, security share  21%, airtime @20 kbit/s    0.7 min/day
+  P3 Alghawli 'nominal' DER set-point every 5 s (SIMULATED profile) [ALG26]
+     data: telemetry 1909.4 kB + alerts 2.3 kB + control 61084.8 kB = 62996.5 kB/day
+       + always connected, keepalive 5 min, daily TLS + weekly E2E       20.8 kB -> total  63.02 MB/day, security share   0%, airtime @20 kbit/s  420.1 min/day
+     per-command ML-DSA-65: 61.08 MB/day and 17280 verifies (652 s CPU @64 MHz) | hourly signed grant + AEAD set-points: 3.58 MB/day and 24 verifies
+
+====================================================================================================
+3b. Round trips before the first E2E-protected message (ANALYTICAL; T6 simulates the same flows)
+====================================================================================================
+  A cold: TCP 1 + TLS 1 + CONNECT 1 + SUBSCRIBE 1 + E2E full 2                         6 RTT ->    6 s @1 s RTT,   24 s @4 s RTT (+ serialisation)
+  C wake: TCP 1 + TLS(resumed) 1 + CONNECT 1 + SUBSCRIBE 1 + PSK 2                     6 RTT ->    6 s @1 s RTT,   24 s @4 s RTT (+ serialisation)
+  D proposal: TCP 1 + TLS(resumed) 1 + CONNECT 1 (persistent session) + 1-RTT PSK      4 RTT ->    4 s @1 s RTT,   16 s @4 s RTT (+ serialisation)
+  E telemetry-only wake: TCP 1 + TLS 1 + CONNECT 1 + PUBLISH/PUBACK 1                  4 RTT ->    4 s @1 s RTT,   16 s @4 s RTT (+ serialisation)
+
+====================================================================================================
+4. Flash wear of per-event persistent writes (log-structured records, 4 KiB erase page, 16 B record)
+====================================================================================================
+  meter (~100 writes/day: tickets, outbox, counters)       one page lasts     70.1 years; pages needed for 15 years:   1.0 (4 KiB)
+  DER, 4 commands/day                                      one page lasts    116.9 years; pages needed for 15 years:   1.0 (4 KiB)
+  DER, 5-s set-points with per-command flash counter       one page lasts      0.4 years; pages needed for 15 years:  37.0 (148 KiB)
+
+====================================================================================================
+5. Device RAM, peak simultaneous (KB); crypto parts from [PQM4]/[RP2040]; application/RTOS/IP stack NOT included
+====================================================================================================
+  full connection, default TLS buffers, fast PQ code                           50.2 KB
+  full connection, 1 KiB TLS records, small-stack PQ code                      16.7 KB
+  manifest receive + SLH-DSA-192s verify, default TLS, manifest in RAM         51.8 KB
+  manifest streamed to flash + verify from flash, 1 KiB TLS records            10.1 KB
+  CONTROL receive + ML-DSA-65 verify (fast), default TLS                       45.1 KB
+  CONTROL receive + ML-DSA-65 verify (small stack), 1 KiB TLS records           8.1 KB
+  (M0+ reference-C for comparison: ML-KEM-768 decaps 18.9 KB; ML-DSA-65 SIGN 86.7 KB)
+  RFC 7228: Class 1 ~10 KiB RAM -> RED; Class 2 ~50 KiB -> only the small-buffer rows fit, before the application.
+
+====================================================================================================
+6. v2.2 message formats (ANALYTICAL): sizes from the length-prefixed codec (4-byte length per field)
+====================================================================================================
+  CMD envelope (64-byte command, ML-DSA-65)        3454 B
+  GRANT envelope (ML-DSA-65)                       3461 B
+  SETPOINT envelope (session AEAD only)              93 B
+  ZONEKEY envelope (session AEAD only)              132 B
+  signed manifest, SLH-DSA-SHA2-128s               8042 B
+  DF alone                                           46 B
+  DF + one piggybacked ALERT                        193 B
+  P3 total/day, v2.1 per-command ML-DSA-65      : control  61.08 MB, all traffic  63.02 MB, airtime @20 kbit/s  420.1 min
+  P3 total/day, v2.2 hourly GRANT + SETPOINTs   : control   3.30 MB, all traffic   5.23 MB, airtime @20 kbit/s   34.9 min
+  manifest parts at max_packet 4096 B (30 B part header, 37 B topic, ~20 B MQTT): 3 parts
+
+[FIPS203/204/205] NIST FIPS 203, 204, 205 (Aug 2024) parameter-set sizes.  [FALCON] Falcon spec; FIPS 206 not final.
+[RFC8554] LMS sizes computed from RFC 8554 (n=32, W8 p=34, HSS L=1).  [RFC8391] XMSS-SHA2_10_256.
+[PQM4] mupq/pqm4 benchmarks.md (master), NUCLEO-L4R5ZI Cortex-M4 @24 MHz, arm-none-eabi-gcc 11.3.1; stack excludes key/ct/sig buffers.
+[PQM4-R3] pqm4 tag Round3 benchmarks.md, STM32F4DISCOVERY @24 MHz (Falcon; removed from current pqm4).
+[HL19] Haase & Labrique, TCHES 2019: X25519 625,358 cycles, STM32F407.
+[DULL15] Duell et al., Des. Codes Cryptogr. 2015: X25519 AVR 13,900,397; MSP430X 5,301,792; Cortex-M0 3,589,850 cycles.
+[TAS22] Tasopoulos et al., ISPEC 2022: NUCLEO-F439ZI Cortex-M4 @180 MHz, wolfSSL, PQ TLS 1.3 handshake times and bytes.
+[TAS23] Tasopoulos et al., CF'23 MalHIoT workshop: measured energy (PicoScope, shunt) on the same board.
+[RP2040] Chhetri et al., arXiv 2603.19340 (preprint, 2026): RP2040 Cortex-M0+ @125 MHz, PQClean reference C; energy NOT measured.
+[KS25] Kim & Seo, ASIA CCS 2025 (base paper): ATmega4808 6 KB SRAM; KEM-MQTT Kyber-512 31.83M cycles; OpenSSL >= 16 KB stack.
+[LUK20] Lukic et al., arXiv 2005.13648: Quectel BC68 on a live NB-IoT network; charge per UDP echo read from Fig. 6.
+[AMI] 15-minute interval data is the common AMI configuration (utility/vendor sources; see audit document).
+[IEEE2030.5] pollRate default 900 s; CSIP default DERControl polling 10 min (see audit document).
+[ALG26] Alghawli et al., Frontiers 2026, Table 3/10: simulated 802.15.4 smart-grid traffic (not cellular, not MQTT).
+[MBEDTLS] Mbed TLS default MBEDTLS_SSL_IN/OUT_CONTENT_LEN = 16384.
+

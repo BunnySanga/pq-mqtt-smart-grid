@@ -1,0 +1,11 @@
+== persistent-state audit of the v2.1 reference implementation ==
+  S1 utility restart: DEMONSTRATED - 3 commands applied before restart; after restart the new command got seq=1, device last_cmd_seq=3 -> device answered DUP, applied=None, utility still holds it for redelivery: False
+  S2a crash after counter write, before actuation, ACK not sent: DEMONSTRATED - redelivered command answered DUP -> never applied, and the utility dropped it
+  S2b crash after the OK ACK was sent, before actuation: DEMONSTRATED - utility recorded OK and holds nothing to redeliver -> command lost with a false confirmation
+  S3 torn write of used.json: DEMONSTRATED - utility restart fails (JSONDecodeError: Expecting property name enclosed in double quotes: line 1 co); open(path,'w') truncates before writing, no fsync/rename
+  S3 torn write of stek.json: DEMONSTRATED - STEK load fails (JSONDecodeError) -> either no restart, or (if caught) every ticket in the fleet dies
+  S4 used-ticket persistence cost: the whole file is rewritten on every consumed ticket
+        1000 outstanding tickets: file   0.05 MB, one rewrite     0.4 ms -> if each of 1000 devices resumes once a day:      0.0 GB written/day,   0.00 h of rewrite time/day (this container)
+       10000 outstanding tickets: file   0.48 MB, one rewrite     3.9 ms -> if each of 10000 devices resumes once a day:      4.8 GB written/day,   0.01 h of rewrite time/day (this container)
+      100000 outstanding tickets: file   4.80 MB, one rewrite    41.9 ms -> if each of 100000 devices resumes once a day:    480.0 GB written/day,   1.16 h of rewrite time/day (this container)
+  S5 rebuilt resume hello after the first was processed: DEMONSTRATED - identical retransmission answered identically: True; rebuilt hello -> 'ticket already used' -> device must do a full handshake

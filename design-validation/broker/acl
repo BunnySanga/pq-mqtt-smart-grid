@@ -1,0 +1,14 @@
+user utility
+topic readwrite #
+
+user meter-0001
+topic write grid/smart_meter/meter-0001/telemetry
+topic write grid/smart_meter/meter-0001/alert
+topic read  grid/smart_meter/meter-0001/control
+topic write pqgrid/hs/meter-0001/up
+topic read  pqgrid/hs/meter-0001/down
+topic read  pqgrid/fota/smart_meter/#
+
+user meter-0002
+topic write grid/smart_meter/meter-0002/telemetry
+topic read  grid/smart_meter/meter-0002/control
