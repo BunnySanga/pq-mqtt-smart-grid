@@ -6,7 +6,9 @@ commit returns. Every promise is committed before it is communicated (P8):
   * a new STEK before a ticket is sealed under it;
   * a command's sequence together with the queued, signed command, before it is sent (§13.6);
   * a revocation, a zone membership change and its new group keys;
-  * a DR event before it is published (it is re-sent after a member re-establishes: M4).
+  * a DR event before it is published (it is re-sent after a member re-establishes: M4);
+  * the rollout state (Master §4.4, U-4): the active and the scheduled POLICY artifact, with the anchors and
+    revocations they were verified against, before the policy takes effect or is promised.
 Sessions, half-open handshakes and the duplicate cache stay in RAM (recovered through resync + PASR).
 
 u64 values that can exceed 2^63 (cmd_seq = epoch ‖ counter reaches 2^63 in January 2038) are stored as 8-byte
@@ -28,7 +30,7 @@ from ..pasr.stek import StekKey, StekTable
 from ..pasr.tickets import TicketIssuer, UsedTickets
 from ..registry import DeviceRecord, Registry
 from ..suite.aead import AeadAlg
-from ..wire import r64, u64
+from ..wire import dec, dec_list, enc, enc_list, r8, r64, u8, u64
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS utility_epoch(id INTEGER PRIMARY KEY CHECK (id = 1), last_epoch INTEGER NOT NULL);
@@ -52,7 +54,11 @@ CREATE TABLE IF NOT EXISTS zone_members(name TEXT NOT NULL, device_id BLOB NOT N
                                         PRIMARY KEY (name, device_id));
 CREATE TABLE IF NOT EXISTS zone_events(name TEXT NOT NULL, bseq BLOB NOT NULL, expires_at INTEGER NOT NULL,
                                        event BLOB NOT NULL, sig BLOB NOT NULL, PRIMARY KEY (name, bseq));
+CREATE TABLE IF NOT EXISTS policy_state(slot TEXT PRIMARY KEY CHECK (slot IN ('active', 'scheduled')),
+                                        signed BLOB NOT NULL, payload BLOB NOT NULL, anchors BLOB NOT NULL,
+                                        revoked BLOB NOT NULL);
 """
+MAX_ANCHORS = 16
 
 
 class UtilityDB:
@@ -92,6 +98,26 @@ class UtilityDB:
     def one(self, sql: str, params=()):
         rows = self.execute(sql, params)
         return rows[0] if rows else None
+
+    # ------------------------------------------------------------------------------ rollout state (U-4)
+    def save_policy(self, slot: str, signed: bytes, payload: bytes, anchors: dict, revoked) -> None:
+        """The active or the scheduled POLICY artifact, with the anchors and revocations it was verified against:
+        durable before the policy takes effect or is promised (P8)."""
+        blob = enc_list([enc([u8(a), pk]) for a, pk in sorted(anchors.items())], MAX_ANCHORS)
+        self.execute("INSERT OR REPLACE INTO policy_state VALUES (?, ?, ?, ?, ?)",
+                     (slot, signed, payload, blob, bytes(sorted(revoked))))
+
+    def load_policy(self, slot: str):
+        """(signed, payload, anchors, revoked) as saved, or None."""
+        row = self.one("SELECT signed, payload, anchors, revoked FROM policy_state WHERE slot = ?", (slot,))
+        if row is None:
+            return None
+        signed, payload, blob, revoked = row
+        anchors = {r8(a): pk for a, pk in (dec(x, 2) for x in dec_list(blob, MAX_ANCHORS))}
+        return signed, payload, anchors, frozenset(revoked)
+
+    def drop_policy(self, slot: str) -> None:
+        self.execute("DELETE FROM policy_state WHERE slot = ?", (slot,))
 
     def backup_to(self, path: str) -> None:
         """A consistent copy (for restore tests: V-S1)."""
@@ -273,8 +299,17 @@ class UtilityNode:
 
 
 def open_utility(path: str, policy, static, cmd_key, clock) -> UtilityNode:
-    """A utility process whose durable state is the database at `path`. Opening it again is a restart."""
+    """A utility process whose durable state is the database at `path`. Opening it again is a restart. `policy` is
+    the bootstrap configuration: a newer policy the utility activated earlier (rollout state, U-4) is resumed from
+    the database, re-verified against the anchors it was accepted with. Without it a restart after a rollout put
+    the utility back on its bootstrap policy and every device that had switched was refused."""
     db = UtilityDB(path)
+    stored = db.load_policy("active")
+    if stored is not None:
+        from ..fota.policy_artifact import verify_policy_artifact
+        active = verify_policy_artifact(*stored)
+        if active.version > policy.version:
+            policy = active
     tickets = TicketIssuer(SqlStekTable(db), SqlUsedTickets(db))
     endpoint = UtilityEndpoint(policy, static, SqlRegistry(db), clock=clock, tickets=tickets)
     commands = CommandService(endpoint, cmd_key, store=SqlCommandStore(db))

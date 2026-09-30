@@ -105,6 +105,11 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
     with loops(plant, m):
         assert wait_for(lambda: m.d.confirmed and m.d.session.policy_info == new.info(), 30), m.mq.errors
         assert plant.node.endpoint.current_session(M1).policy_info == new.info()   # … and is not locked out
+    plant.restart_utility()                                                    # a utility restart (bootstrap v1):
+    assert plant.node.endpoint.policy.version == 2                             # the rollout state survived (U-4)
+    with loops(plant, m):
+        m.mq.send_alert(b"X", b"after both restarts")                         # resync hint → resume under v2
+        assert wait_for(lambda: (M1, b"after both restarts", False) in plant.u.alerts, 20), m.mq.errors
 
 
 def test_M9_firmware_is_committed_by_the_loop_and_the_device_re_handshakes_with_its_new_version(plant):
