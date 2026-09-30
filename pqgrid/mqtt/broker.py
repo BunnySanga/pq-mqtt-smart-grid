@@ -132,3 +132,14 @@ def install_acl(path: str, text: str, broker_pid: int | None = None, owner: tupl
         os.chown(path, *owner)
     if broker_pid:
         os.kill(broker_pid, signal.SIGHUP)                        # reload without a restart
+
+
+def acl_installer(utility, path: str, broker_pid, owner: tuple[int, int] | None = None, bootstrap=None):
+    """The production ACL hook for UtilityMqtt (U-8, B-4): compile the ACL for the policy in force
+    (UtilityMqtt.acl_text: its signed artifact verified, the registry, zone membership), write it atomically and
+    make the broker reload it. `broker_pid` is the broker's pid or a callable returning it (it changes on restart);
+    `bootstrap` = (signed, payload, anchors) of the bootstrap policy, used until a policy has been activated."""
+    def hook() -> None:
+        pid = broker_pid() if callable(broker_pid) else broker_pid
+        install_acl(path, utility.acl_text(bootstrap), pid, owner)
+    return hook

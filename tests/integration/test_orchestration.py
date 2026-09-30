@@ -8,7 +8,7 @@ import time
 from harness import NoSpread, broker, loops, plant, requires_broker, start, wait_for   # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.publisher import RETENTION_S
-from pqgrid.mqtt.broker import compile_acl
+from pqgrid.mqtt.broker import acl_installer
 from pqgrid.suite.aead import AeadAlg
 
 pytestmark = requires_broker
@@ -39,14 +39,12 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
     new = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, ca_set=plant.policy.ca_set,
                                activate_at=int(time.time()) + 4)
     art = plant.sign_policy(new)
-    acl_versions = []
+    plant.u.acl_hook = acl_installer(plant.u, plant.b.acl, lambda: plant.b.proc.pid,   # the production hook
+                                     bootstrap=(plant.policy_art.signed, plant.policy_art.payload,
+                                                plant.station.anchors))
 
-    def recompile():                                                           # the operator's ACL hook
-        members = {n: set(z.members) for n, z in plant.node.zones.zones.items()}
-        plant.b.load_acl(compile_acl(art.signed, art.payload, plant.station.anchors,
-                                     plant.node.endpoint.registry.records(), members))
-        acl_versions.append(new.version)
-    plant.u.acl_hook = recompile
+    def acl_for() -> str:
+        return open(plant.b.acl).readline()                                    # "# generated for <POLICY_INFO>"
     start(plant)
     with loops(plant, m):
         assert wait_for(lambda: m.d.confirmed, 15)
@@ -60,7 +58,8 @@ def test_M9_scheduled_policy_rollout_end_to_end(plant):
         assert wait_for(lambda: m.d.confirmed and m.d.policy.version == 2 and
                         m.d.session.policy_info == new.info(), 30), m.mq.errors
         assert plant.node.endpoint.policy.version == 2
-        assert wait_for(lambda: acl_versions == [2], 5)                        # recompiled after the switch
+        assert wait_for(lambda: repr(new.info()) in acl_for(), 5)             # recompiled after the switch
+        assert f"user {M1.decode()}" in open(plant.b.acl).read() and not plant.u.acl_failures
         assert plant.node.endpoint.current_session(M1).policy_info == new.info()
         assert plant.node.zones.zones["f7"].groups[AeadAlg.AES256GCM].key_epoch > cc0   # policy change: rotated
         assert m.fota.committed(POLICY) == 2
@@ -288,3 +287,40 @@ def test_utility_key_rotation_rollout_over_the_broker(plant):
         seq = plant.u.command(D1, b"TRIP", 600)
         assert wait_for(lambda: plant.node.commands.outcome(D1, seq) == b"OK", 15), d.mq.errors
     assert d.applied == [b"CLOSE BREAKER 3", b"CURTAIL 50%", b"TRIP"]
+
+
+def test_a_policy_moving_a_class_to_another_aead_moves_its_dr_topic_over_the_broker(plant):
+    """C3-3 and L-1 through the broker (the earlier C3-3 test stubbed paho): a policy moves c2_meter from ChaCha20 to
+    AES-256-GCM, so its zone membership moves to the zone's AES crypto group (DR-047). The production ACL hook
+    recompiles the ACL from the new policy (read right on the AES group topic), the device re-handshakes, gets the
+    AES group key, follows the AES group topic and receives the next event there."""
+    import conftest
+    from pqgrid.fota.publisher import part_payload_budget
+    from pqgrid.mqtt import topics
+    from pqgrid.policy import encode_policy
+    c = plant.add(b"c2-0001", "c2_meter")
+    classes = conftest.replace_class(plant.policy, "c2_meter", aead=AeadAlg.AES256GCM)
+    v2 = conftest.make_policy(plant.u_static.pk, plant.policy.utility_cmd_pk, version=2, classes=classes,
+                              ca_set=plant.policy.ca_set, activate_at=int(time.time()) + 4)
+    art = plant.station.build(POLICY, "c2_meter", 2, encode_policy(v2), 3072,
+                              part_payload_budget(4096, "c2_meter", POLICY, 2), activate_at=v2.activate_at)
+    plant.u.acl_hook = acl_installer(plant.u, plant.b.acl, lambda: plant.b.proc.pid,
+                                     bootstrap=(plant.policy_art.signed, plant.policy_art.payload,
+                                                plant.station.anchors))
+    start(plant)
+    with loops(plant, c):
+        assert wait_for(lambda: c.d.confirmed, 15)
+        plant.node.zones.create("f7")
+        plant.u.join_zone("f7", b"c2-0001")                                   # ACL recompiled by the hook
+        chacha = topics.dr_event("f7", AeadAlg.CHACHA20POLY1305)
+        assert wait_for(lambda: chacha in c.mq.subscribed, 10)
+        plant.u.dr_event("f7", b"SHED 10%", 600)
+        assert wait_for(lambda: ("f7", b"SHED 10%") in c.mq.events, 10), c.mq.dr_refused
+        plant.u.publish_artifact(art)
+        plant.u.schedule_policy(art.signed, art.payload, plant.station.anchors)
+        assert wait_for(lambda: c.d.confirmed and c.d.session.policy_info == v2.info(), 30), c.mq.errors
+        aes = topics.dr_event("f7", AeadAlg.AES256GCM)
+        assert wait_for(lambda: aes in c.mq.subscribed, 10), c.mq.errors
+        plant.u.dr_event("f7", b"SHED 20%", 600)
+        assert wait_for(lambda: ("f7", b"SHED 20%") in c.mq.events, 10), c.mq.dr_refused
+        assert f"topic read {aes}" in open(plant.b.acl).read() and not plant.u.acl_failures

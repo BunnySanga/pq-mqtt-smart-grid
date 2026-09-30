@@ -11,8 +11,9 @@
     (clone) alarm (§10.4, E52). Mosquitto 2.0.21 does not publish the Last Will of a session that is taken over
     [DOCKER, observed in this slice], so the Will alone cannot reveal a clone.
   * Connects with a persistent session, so device messages published while the utility restarts are kept.
-  * run() is the utility's main loop (M9); each tick(): a scheduled policy is activated at activate_at (old-
-    policy sessions closed, every zone key rotated, the ACL recompiled); zone keys at least a week old are
+  * run() is the utility's main loop (M9); each tick(): an owed ACL recompile is retried (L-1); a scheduled policy is
+    activated at activate_at (old-policy sessions closed, every zone key rotated, the ACL recompiled); zone keys at
+    least a week old are
     rotated and sent to live members; retained artifacts past the retention window are removed; sessions whose
     chain ended and expired half-open handshakes are dropped.
 """
@@ -27,7 +28,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from ..e2e.handshake import UnknownSessionError
-from ..errors import EnvelopeError, PolicyError, PolicyMismatchError, PqgridError
+from ..errors import EnvelopeError, PolicyError, PolicyMismatchError, PqgridError, TicketReusedError
 from ..suite.kdf import ct_eq
 from ..wire import peek_tag
 from . import topics
@@ -61,12 +62,15 @@ class UtilityMqtt:
         self.telemetry: list[tuple[bytes, bytes]] = []
         self.statuses: list[tuple[bytes, int, bytes]] = []
         self.takeover_alarms: list[bytes] = []
+        self.ticket_reuse_alarms: list[tuple[bytes, float]] = BoundedLog()   # "ticket already used" (M-1, §27.8)
         self._online: dict[bytes, deque] = {}
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
         self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
         self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
         self.ticks = 0                                                 # completed main-loop steps
         self.zone_syncs: list[tuple[bytes, str]] = BoundedLog()        # answered zone sync requests (E-2)
+        self.acl_failures: list[tuple] = BoundedLog()                  # failed ACL hook runs (type + locations)
+        self._acl_due = False                                          # an ACL recompile is owed (retried by tick)
         self.republished: list[tuple[bytes, list]] = BoundedLog()      # proactive republishes (E-4)
 
     # ------------------------------------------------------------------------------------------ connection
@@ -151,11 +155,16 @@ class UtilityMqtt:
                 raise
             self._publish(did, topics.hs_down(did), sh)
         elif tag == b"RH":
-            self._publish(did, topics.hs_down(did), u.on_resume_hello(did, msg))
+            try:
+                rs = u.on_resume_hello(did, msg)
+            except TicketReusedError:
+                self.ticket_reuse_alarms.append((did, self.clock()))     # M-1 (§27.8): a clone indicator
+                raise
+            self._publish(did, topics.hs_down(did), rs)
         elif tag == b"DF":
             res = u.on_finished(did, msg)
-            self._publish(did, topics.hs_down(did), res.final)
-            self.alerts += [(did, p, dup) for _, p, dup in res.alerts]
+            self.alerts += [(did, p, dup) for _, p, dup in res.alerts]   # to the application BEFORE the reply is
+            self._publish(did, topics.hs_down(did), res.final)           # published: a failed publish cannot lose them
             if not res.replayed:
                 self._flush(did)
                 self._offer(did, types={FIRMWARE_T}, newer_than={FIRMWARE_T: res.session.fw_version},
@@ -236,6 +245,8 @@ class UtilityMqtt:
         with self.lock:
             self.n.zones.add_member(zone, did)
             self._send_zone_keys(zone)                                 # new epoch to every live member
+        self._acl_due = True                                           # the zone's read right (§10.1 ACL)
+        self.recompile_acl()
 
     def revoke_device(self, did: bytes) -> None:
         """Live revocation (H1): durable registry change, sessions and half-open state invalidated, the device
@@ -245,8 +256,8 @@ class UtilityMqtt:
             self.n.endpoint.revoke_device(did)
             for zone in self.n.zones.remove_device(did):
                 self._send_zone_keys(zone)
-        if self.acl_hook:
-            self.acl_hook()
+        self._acl_due = True
+        self.recompile_acl()
 
     def _send_zone_keys(self, zone: str) -> None:
         for member, env in self.n.zones.distribute(zone).items():
@@ -285,8 +296,8 @@ class UtilityMqtt:
             self.n.commands.cmd_key = cmd_key                        # new command key (keys follow the policy)
             if self.publisher is not None:
                 self.publisher.policy = p
-        if self.acl_hook:
-            self.acl_hook()
+        self._acl_due = True
+        self.recompile_acl()                                         # its failure never un-does the activation
         return True
 
     def schedule_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> None:
@@ -342,6 +353,7 @@ class UtilityMqtt:
 
     def tick(self) -> None:
         from .guard import EXPECTED
+        self.recompile_acl()                                         # L-1: an owed ACL recompile is retried
         if self._scheduled is not None:
             try:
                 if self.activate_policy(*self._scheduled):
@@ -371,6 +383,22 @@ class UtilityMqtt:
         except PqgridError as e:
             self._forget_scheduled()
             self.refused.append(f"scheduled policy refused after a restart: {e}")
+
+    def recompile_acl(self) -> bool:
+        """Run the ACL hook if an ACL recompile is owed (after an activation or a revocation). A failure (e.g. the
+        broker is restarting) is recorded in acl_failures, never reported as a refusal of the change that needed
+        it, and retried by every tick until it succeeds (audit L-1). E2E refusal never depends on it (H1)."""
+        from .guard import internal_alarm
+        if not self._acl_due or self.acl_hook is None:
+            self._acl_due = False
+            return True
+        try:
+            self.acl_hook()
+        except Exception as e:                                       # noqa: BLE001 - recorded and retried
+            self.acl_failures.append(internal_alarm("acl hook", e))
+            return False
+        self._acl_due = False
+        return True
 
     def _forget_scheduled(self) -> None:
         self.n.db.drop_policy("scheduled")
