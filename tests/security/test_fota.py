@@ -180,6 +180,23 @@ def test_EF2_failed_boot_reverts_and_the_same_version_can_be_retried(dev, statio
         dev.feed(build(station, FIRMWARE, 1, firmware()), chunks=[])       # rollback still blocked
 
 
+def test_power_loss_between_the_commit_and_dropping_the_staged_record(dev, station):
+    """§15.12: the commit is one protected record; the staging record is dropped after it. A power cut in between
+    leaves a staged manifest whose version is already committed. The next boot must finish the commit (drop it), not
+    re-hash the slot that is now the OLD one and report a false "staged image modified" (a tamper alarm)."""
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art)
+    active = dev.inst.prot.active
+    dev.norm.fail_after = 0                                          # the protected write completes, then power fails
+    with pytest.raises(PowerLoss):
+        dev.inst.boot_staged_firmware(lambda img: img == art.payload)
+    dev.norm.fail_after = None
+    dev.boot()
+    assert dev.inst.committed(FIRMWARE) == 2 and dev.inst.prot.active == 1 - active
+    assert dev.inst.boot_staged_firmware(lambda img: True) == "nothing staged"
+    assert dev.inst.staged == {} and dev.inst.downloads == {}
+
+
 def test_EF3_chunk_from_another_version_is_refused(dev, station):
     a2, a3 = build(station, FIRMWARE, 2, firmware()), build(station, FIRMWARE, 3, firmware())
     dev.feed(a2, chunks=[])

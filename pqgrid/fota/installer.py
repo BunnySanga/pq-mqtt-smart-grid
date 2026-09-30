@@ -100,7 +100,17 @@ class Installer:
             self.downloads[key[0]] = Download(decode_manifest(mraw), mraw, bytearray(have))
         for key, (_, raw) in store.items(T_STAGED).items():
             self.staged[key[0]] = decode_manifest(raw)
+        self._finish_interrupted_commits()
         self._finish_interrupted_keyrevoke()
+
+    def _finish_interrupted_commits(self) -> None:
+        """A commit is one protected record; the staging record is dropped after it. If power failed in between, the
+        artifact is staged (or downloading) at a version already committed: finish the commit by dropping it. For
+        FIRMWARE the other slot is now the OLD image, so re-hashing it would report a false "staged image modified"
+        (found by the power-loss test)."""
+        for t, m in [*self.staged.items(), *((t, d.manifest) for t, d in self.downloads.items())]:
+            if m.version <= self.prot.committed[t]:
+                self._drop(t)
 
     def _finish_interrupted_keyrevoke(self) -> None:
         """A KEYREVOKE is applied as soon as it is staged. If power failed while protected storage was written,
