@@ -19,7 +19,7 @@ from pqgrid.e2e.handshake import DeviceEndpoint
 from pqgrid.mqtt import pki, tls
 from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.installer import FotaFlash, Installer
-from pqgrid.fota.publisher import Publisher, part_payload_budget
+from pqgrid.fota.publisher import part_payload_budget
 from pqgrid.fota.station import Station
 from pqgrid.mqtt.broker import compile_acl, hybrid_openssl_cnf, install_acl, render_config
 from pqgrid.persistence.flash import RecordStore
@@ -29,7 +29,7 @@ from pqgrid.mqtt.utility_node import UtilityMqtt
 from pqgrid.mqtt import topics
 from pqgrid.persistence.device import DeviceFlash
 from pqgrid.persistence.flash import FlashSim
-from pqgrid.persistence.utility_db import open_utility
+from pqgrid.persistence.utility_db import SqlPublisher, open_utility
 from pqgrid.policy import validate
 from pqgrid.registry import DeviceRecord
 from pqgrid.suite.hkem import HybridKeyPair
@@ -161,7 +161,7 @@ class Plant:
         self.node = open_utility(self.db_path, self.policy, self.u_static, self.cmd_sk, time.time)
         self.station = Station(f"{tmp}")
         self.policy_art = self.sign_policy(self.policy)
-        self.publisher = Publisher(self.policy)
+        self.publisher = SqlPublisher(self.node.db, self.policy)
         self.u = UtilityMqtt(self.node, broker.utility_ctx(), "localhost", broker.port, publisher=self.publisher)
         self.devs: dict[bytes, Dev] = {}
 
@@ -209,6 +209,7 @@ class Plant:
         self.u.stop()
         self.node.db.close()
         self.node = open_utility(self.db_path, self.policy, self.u_static, self.cmd_sk, time.time)
+        self.publisher = SqlPublisher(self.node.db, self.node.endpoint.policy)   # only what the database kept
         self.u = UtilityMqtt(self.node, self.b.utility_ctx(), "localhost", self.b.port, publisher=self.publisher)
         self.u.start()
 

@@ -8,7 +8,8 @@ commit returns. Every promise is committed before it is communicated (P8):
   * a revocation, a zone membership change and its new group keys;
   * a DR event before it is published (it is re-sent after a member re-establishes: M4);
   * the rollout state (Master §4.4, U-4): the active and the scheduled POLICY artifact, with the anchors and
-    revocations they were verified against, before the policy takes effect or is promised.
+    revocations they were verified against, before the policy takes effect or is promised; the publisher's newest
+    artifacts, what is retained since when and the anchors its KEYREVOKEs revoked, before the broker is told.
 Sessions, half-open handshakes and the duplicate cache stay in RAM (recovered through resync + PASR).
 
 u64 values that can exceed 2^63 (cmd_seq = epoch ‖ counter reaches 2^63 in January 2038) are stored as 8-byte
@@ -19,6 +20,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -26,6 +28,9 @@ from ..commands.codec import Command
 from ..commands.utility import CommandService, QueuedCommand, UtilityCommandStore
 from ..commands.zones import GroupKey, LogicalEvent, Zone, ZoneManager
 from ..e2e.handshake import UtilityEndpoint
+from ..fota.artifact import MAX_CHUNKS, MAX_PARTS, decode_manifest, split_signed
+from ..fota.publisher import Published, Publisher
+from ..fota.station import Artifact
 from ..pasr.stek import StekKey, StekTable
 from ..pasr.tickets import TicketIssuer, UsedTickets
 from ..registry import DeviceRecord, Registry
@@ -57,8 +62,13 @@ CREATE TABLE IF NOT EXISTS zone_events(name TEXT NOT NULL, bseq BLOB NOT NULL, e
 CREATE TABLE IF NOT EXISTS policy_state(slot TEXT PRIMARY KEY CHECK (slot IN ('active', 'scheduled')),
                                         signed BLOB NOT NULL, payload BLOB NOT NULL, anchors BLOB NOT NULL,
                                         revoked BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS artifacts(dclass TEXT NOT NULL, type INTEGER NOT NULL, signed BLOB NOT NULL,
+                                     payload BLOB NOT NULL, parts BLOB NOT NULL, chunks BLOB NOT NULL,
+                                     retained_at REAL, topics BLOB, PRIMARY KEY (dclass, type));
+CREATE TABLE IF NOT EXISTS revoked_anchors(anchor INTEGER PRIMARY KEY);
 """
 MAX_ANCHORS = 16
+MAX_TOPICS = MAX_PARTS + MAX_CHUNKS
 
 
 class UtilityDB:
@@ -286,6 +296,35 @@ class SqlZoneManager(ZoneManager):
     def _drop_events(self, zone: str, bseqs: list[int]) -> None:
         with self.db.tx() as c:
             c.executemany("DELETE FROM zone_events WHERE name = ? AND bseq = ?", [(zone, u64(b)) for b in bseqs])
+
+
+# ============================================================================================ publisher
+class SqlPublisher(Publisher):
+    """The artifact publisher's rollout state in SQLite (Master §4.4, U-4): per (class, type) the newest artifact and,
+    while it is retained, its topics and publication time; the anchors revoked by the KEYREVOKEs it published.
+    Without it a restarted utility could republish nothing (E-4), never cleaned up what it had retained, and forgot
+    its revocations."""
+
+    def __init__(self, db: UtilityDB, policy, clock=time.time):
+        super().__init__(policy, clock)
+        self.db = db
+        for dclass, t, signed, payload, parts, chunks, at, topics in db.execute(
+                "SELECT dclass, type, signed, payload, parts, chunks, retained_at, topics FROM artifacts"):
+            art = Artifact(decode_manifest(split_signed(signed)[0]), signed, dec_list(parts, MAX_PARTS),
+                           dec_list(chunks, MAX_CHUNKS), payload)
+            self.newest[(dclass, t)] = art
+            if at is not None:
+                self.live[(dclass, t)] = Published(art, [x.decode() for x in dec_list(topics, MAX_TOPICS)], at)
+        self.revoked = {a for (a,) in db.execute("SELECT anchor FROM revoked_anchors")}
+
+    def _store(self, key: tuple[str, int], art: Artifact, retained) -> None:
+        topics = None if retained is None else enc_list([t.encode() for t in retained.topics], MAX_TOPICS)
+        self.db.execute("INSERT OR REPLACE INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (key[0], key[1], art.signed, art.payload, enc_list(art.parts, MAX_PARTS),
+                         enc_list(art.chunks, MAX_CHUNKS), None if retained is None else retained.at, topics))
+
+    def _store_revoked(self, anchor: int) -> None:
+        self.db.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
 
 
 # ================================================================================================= assembly

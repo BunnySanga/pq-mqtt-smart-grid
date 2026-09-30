@@ -9,6 +9,8 @@ Republish (E-4, final remediation), at most once an hour per device, never resur
     newest FIRMWARE when an established device reports an older fw_version and that artifact is not retained.
 Only the newest artifact per (class, type), only if still valid now: its signer is not revoked and holds the
 right role (DR-050 roles, current revocations), and a POLICY is not older than the active one.
+The rollout state (newest artifacts, what is retained since when, published revocations) is kept in memory here;
+persistence.utility_db.SqlPublisher makes it durable (Master §4.4, U-4), written before the broker is told.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 
 from ..mqtt import topics
 from ..wire import dec, enc, r8, u8, u16, u64
-from .artifact import KEYREVOKE, POLICY, TYPE_NAMES, FotaError, check_signer
+from .artifact import KEYREVOKE, MAX_CHUNKS, POLICY, TYPE_NAMES, FotaError, check_signer
 from .station import Artifact
 
 RETENTION_S = 30 * 86400
@@ -49,6 +51,8 @@ class Publisher:
     def messages(self, art: Artifact) -> list[tuple[str, bytes]]:
         m = art.manifest
         name, limit = TYPE_NAMES[m.type], self.policy.profile(m.device_class).max_packet
+        if len(art.chunks) > MAX_CHUNKS:
+            raise FotaError(f"more than {MAX_CHUNKS} chunks: no device accepts it")
         out = [(topics.fota_part(m.device_class, name, m.version, i), p) for i, p in enumerate(art.parts)]
         out += [(topics.fota_chunk(m.device_class, name, m.version, i), c) for i, c in enumerate(art.chunks)]
         for topic, payload in out:
@@ -58,15 +62,17 @@ class Publisher:
 
     def publish(self, client, art: Artifact) -> None:
         msgs = self.messages(art)                                  # all checked before the first publish
+        key = (art.manifest.device_class, art.manifest.type)
+        old, pub = self.live.get(key), Published(art, [t for t, _ in msgs], self.clock())
+        rid = r8(dec(art.payload, 1)[0]) if art.manifest.type == KEYREVOKE else None
+        self._store(key, art, pub)                                 # the rollout state first (U-4), so a restart
+        if rid is not None:                                        # never forgets what it retained or revoked
+            self._store_revoked(rid)
         for topic, payload in msgs:
             client.publish(topic, payload, qos=1, retain=True)
-        key = (art.manifest.device_class, art.manifest.type)
-        old = self.live.get(key)
-        self.live[key] = Published(art, [t for t, _ in msgs], self.clock())
-        self.newest[key] = art
-        if art.manifest.type == KEYREVOKE:
-            (rid,) = dec(art.payload, 1)
-            self.revoked.add(r8(rid))
+        self.live[key], self.newest[key] = pub, art
+        if rid is not None:
+            self.revoked.add(rid)
         if old and old.artifact.manifest.version != art.manifest.version:
             self._remove(client, old)                              # only the newest needs to stay retained
 
@@ -76,8 +82,16 @@ class Publisher:
             if now - pub.at >= RETENTION_S:
                 self._remove(client, pub)
                 del self.live[key]
+                self._store(key, pub.artifact, None)               # still the newest; no longer retained
                 removed += 1
         return removed
+
+    # persistence hooks (persistence.utility_db.SqlPublisher); in memory they do nothing
+    def _store(self, key: tuple[str, int], art: Artifact, retained) -> None:
+        pass
+
+    def _store_revoked(self, anchor: int) -> None:
+        pass
 
     def valid(self, art: Artifact) -> bool:
         """Still valid NOW: signer not revoked and in its role (DR-050), and a POLICY not older than the active."""
