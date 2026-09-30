@@ -17,7 +17,7 @@ _DEVICE_ID = re.compile(rb"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
 def valid_device_id(device_id: bytes) -> bool:
-    return bool(_DEVICE_ID.match(device_id))
+    return bool(_DEVICE_ID.fullmatch(device_id))       # not match(): '$' also matches before a final '\n'
 
 
 @dataclass(frozen=True)

@@ -134,3 +134,56 @@ def test_corrupted_control_messages_are_refused_cleanly(world: World, handler):
         count += 1
     assert count >= N * 0.9
     fn(target)
+
+
+@pytest.mark.parametrize("handler", ["zone_sync", "alert_ack", "resent_event", "setpoint", "zonekey", "fin"])
+def test_corrupted_later_message_types_are_refused_cleanly(world: World, handler):
+    """The message types added after slice 1 (E-2 ZONESYNC, re-sent DR events, SETPOINT, ZONEKEY, ALERT ACK, FIN):
+    every corruption is refused with a controlled error, nothing else escapes, and the genuine message still works."""
+    from pqgrid.commands import CommandProcessor, CommandService, ZoneManager
+    from pqgrid.e2e.envelopes import control_topic, open_zone_sync, verify_alert_ack, zone_sync, zone_sync_sid
+    rng = random.Random(hash(handler) & 0xFFFF)
+    did = b"fuzz-der-2"
+    if handler == "fin":
+        world.utility.tickets = None
+    d = world.device(did, "der_ctrl")
+    if handler == "fin":
+        d.on_server_hello(world.utility.on_client_hello(did, d.client_hello()))
+        target, fn = world.utility.on_finished(did, d.finished()).final, d.on_final
+    else:
+        world.full(d)
+        svc = CommandService(world.utility, world.cmd_sk)
+        proc = CommandProcessor(d, lambda c: None, lambda t, v: None, targets={"P_ACTIVE_W"})
+        topic = control_topic("der_ctrl", did)
+        zm = ZoneManager(svc)
+        zm.create("z1")
+        zm.add_member("z1", did)
+        s_u = world.utility.session_for(did)
+        if handler == "zone_sync":
+            def fn(m):                                   # what UtilityMqtt._zone_sync does with it
+                if zone_sync_sid(m) != s_u.sid:
+                    raise EnvelopeError("zone sync outside the device's current session")
+                return open_zone_sync(s_u, m)
+            target = zone_sync(d.session, "z1", 1)
+        elif handler == "alert_ack":
+            topic_a = alert_topic("der_ctrl", did)
+            ack = world.utility.open_alert(topic_a, d.seal_alert(topic_a, os.urandom(16), b"x"))[1]
+            target, fn = ack, lambda m: verify_alert_ack(d.session, m)
+        elif handler == "resent_event":
+            proc.on_control(topic, zm.distribute("z1")[did])
+            zm.publish("z1", b"SHED", 300)
+            key, target = zm.sync_for(did, "z1")
+            proc.on_control(topic, key)
+            fn = proc.zones.open_resent
+        elif handler == "setpoint":
+            gid, genv = svc.grant(did, "P_ACTIVE_W", 0, 100, 12, 3600)
+            proc.on_control(topic, genv)
+            target, fn = svc.setpoint(did, gid, 5, 30), lambda m: proc.on_control(topic, m)
+        else:
+            target, fn = zm.distribute("z1")[did], lambda m: proc.on_control(topic, m)
+    count = 0
+    for m in mutations(target, rng):
+        assert refused(fn, m), f"{handler}: a corrupted message was accepted"
+        count += 1
+    assert count >= N * 0.9
+    fn(target)                                   # the genuine message is still accepted afterwards

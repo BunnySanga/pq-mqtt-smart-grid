@@ -62,7 +62,7 @@ class UtilityMqtt:
         self.statuses: list[tuple[bytes, int, bytes]] = []
         self.takeover_alarms: list[bytes] = []
         self._online: dict[bytes, deque] = {}
-        self._scheduled = None                                         # a verified policy awaiting activate_at
+        self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
         self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
         self.ticks = 0                                                 # completed main-loop steps
         self.zone_syncs: list[tuple[bytes, str]] = BoundedLog()        # answered zone sync requests (E-2)
@@ -123,7 +123,10 @@ class UtilityMqtt:
                     self._handshake(did, payload)
                 elif kind == "alert":
                     self._alert_topic(did, m.topic, payload)
-                elif kind == "telemetry":
+                elif kind == "telemetry":                            # hop-only tier: the broker ACL admits it,
+                    rec = self.n.endpoint.registry.get(did)          # the registry decides (H1: revocation must
+                    if rec is None or not rec.active or rec.dclass != cls:   # not wait for an ACL recompile)
+                        raise ValueError("telemetry from an unknown or revoked device, or on another class's topic")
                     self.telemetry.append((did, payload))
                 elif kind == "status" and payload == b"online":
                     self._connects(did)
@@ -263,8 +266,9 @@ class UtilityMqtt:
             return False
         with self.lock:
             validate(p, installed_version=self.n.endpoint.policy.version)
+            self.n.zones.rotate_all()                                # first: a crash then leaves the old policy
+            self.n.db.save_policy("active", signed, payload, anchors, revoked)   # active; durable before effect
             self.n.endpoint.install_policy(p)                        # old-policy sessions closed (M1)
-            self.n.zones.rotate_all()
             if self.publisher is not None:
                 self.publisher.policy = p
         if self.acl_hook:
@@ -274,7 +278,10 @@ class UtilityMqtt:
     def schedule_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> None:
         """Keep a verified policy until its activate_at; tick() activates it (§12 Policy Distribution)."""
         from ..fota.policy_artifact import verify_policy_artifact
-        verify_policy_artifact(signed, payload, anchors, revoked)    # a bad artifact is refused now
+        from ..policy import validate
+        p = verify_policy_artifact(signed, payload, anchors, revoked)  # a bad artifact is refused now …
+        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer
+        self.n.db.save_policy("scheduled", signed, payload, anchors, revoked)   # survives a restart (U-4)
         self._scheduled = (signed, payload, anchors, frozenset(revoked))
 
     # ------------------------------------------------------------------------------------------ main loop
@@ -290,8 +297,17 @@ class UtilityMqtt:
             stop.wait(interval)
 
     def tick(self) -> None:
-        if self._scheduled is not None and self.activate_policy(*self._scheduled):
-            self._scheduled = None
+        from .guard import EXPECTED
+        if self._scheduled is not None:
+            try:
+                if self.activate_policy(*self._scheduled):
+                    self._forget_scheduled()
+            except EXPECTED as e:
+                # A refusal is final (its signature, the anchors and the installed version can only keep it
+                # refused, e.g. a newer policy was activated meanwhile): drop it, as the device's installer does,
+                # so it cannot abort the housekeeping below on every tick.
+                self._forget_scheduled()
+                self.refused.append(f"scheduled policy refused at activation: {e}")
         with self.lock:
             for zone in self.n.zones.rotate_due(ZONE_ROTATE_EVERY_S):
                 self._send_zone_keys(zone)
@@ -299,6 +315,10 @@ class UtilityMqtt:
                 self.publisher.cleanup(self.c)
             self.n.endpoint.sweep()
         self.ticks += 1
+
+    def _forget_scheduled(self) -> None:
+        self.n.db.drop_policy("scheduled")
+        self._scheduled = None
 
     def dr_event(self, zone: str, event: bytes, ttl_s: int) -> int:
         """One logical event, one publication per crypto group (M7). Returns the number of publications."""

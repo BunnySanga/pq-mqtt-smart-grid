@@ -17,9 +17,9 @@ import conftest
 from pqgrid.commands import CommandProcessor
 from pqgrid.e2e.handshake import DeviceEndpoint
 from pqgrid.mqtt import pki, tls
-from pqgrid.fota.artifact import POLICY
+from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.installer import FotaFlash, Installer
-from pqgrid.fota.publisher import Publisher, part_payload_budget
+from pqgrid.fota.publisher import part_payload_budget
 from pqgrid.fota.station import Station
 from pqgrid.mqtt.broker import compile_acl, hybrid_openssl_cnf, install_acl, render_config
 from pqgrid.persistence.flash import RecordStore
@@ -29,7 +29,7 @@ from pqgrid.mqtt.utility_node import UtilityMqtt
 from pqgrid.mqtt import topics
 from pqgrid.persistence.device import DeviceFlash
 from pqgrid.persistence.flash import FlashSim
-from pqgrid.persistence.utility_db import open_utility
+from pqgrid.persistence.utility_db import SqlPublisher, open_utility
 from pqgrid.policy import validate
 from pqgrid.registry import DeviceRecord
 from pqgrid.suite.hkem import HybridKeyPair
@@ -161,7 +161,7 @@ class Plant:
         self.node = open_utility(self.db_path, self.policy, self.u_static, self.cmd_sk, time.time)
         self.station = Station(f"{tmp}")
         self.policy_art = self.sign_policy(self.policy)
-        self.publisher = Publisher(self.policy)
+        self.publisher = SqlPublisher(self.node.db, self.policy)
         self.u = UtilityMqtt(self.node, broker.utility_ctx(), "localhost", broker.port, publisher=self.publisher)
         self.devs: dict[bytes, Dev] = {}
 
@@ -184,14 +184,18 @@ class Plant:
         return dev
 
     def boot(self, dev: Dev) -> Dev:
-        """Power-on: every object rebuilt from flash; a new MQTT connection."""
+        """Power-on: every object rebuilt from flash; a new MQTT connection. The device runs its committed firmware
+        (version 1 from the factory) and its installed policy, kept in flash (Master §4.1), or its factory policy if
+        none was ever installed over the air."""
         df = DeviceFlash(dev.flash, clock=time.time)
-        dev.d = DeviceEndpoint(dev.did, dev.dclass, self.policy, 1, dev.kp, flash=df)
+        dev.fota = Installer(self.station.anchors, dev.dclass, self.policy.profile(dev.dclass).max_packet,
+                             dev.fota_flash, RecordStore(dev.protected, clock=time.time), df.store,
+                             clock=lambda: dev.d.now())
+        policy = dev.fota.installed_policy() or self.policy
+        dev.d = DeviceEndpoint(dev.did, dev.dclass, policy, dev.fota.committed(FIRMWARE) or 1, dev.kp, flash=df)
         dev.proc = CommandProcessor(dev.d, dev.applied.append, lambda t, v: dev.setpoints.append((t, v)),
                                     targets={"P_ACTIVE_W"}, state=df.command_state())
-        dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), self.policy.profile(dev.dclass).outbox_cap)
-        dev.fota = Installer(self.station.anchors, dev.dclass, self.policy.profile(dev.dclass).max_packet,
-                             dev.fota_flash, RecordStore(dev.protected, clock=time.time), df.store, clock=dev.d.now)
+        dev.outbox = df.outbox(topics.alert(dev.dclass, dev.did), policy.profile(dev.dclass).outbox_cap)
         dev.mq = DeviceMqtt(dev.d, dev.proc, dev.outbox, self.b.device_ctx(dev.cert), "localhost", self.b.port,
                             reply_timeout=2.0, fota=dev.fota)
         return dev
@@ -205,6 +209,7 @@ class Plant:
         self.u.stop()
         self.node.db.close()
         self.node = open_utility(self.db_path, self.policy, self.u_static, self.cmd_sk, time.time)
+        self.publisher = SqlPublisher(self.node.db, self.node.endpoint.policy)   # only what the database kept
         self.u = UtilityMqtt(self.node, self.b.utility_ctx(), "localhost", self.b.port, publisher=self.publisher)
         self.u.start()
 

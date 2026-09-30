@@ -5,8 +5,6 @@ final ACK. A SETPOINT after the GRANT expired is refused and never acknowledged 
 the main loop's own (_setpoint_ack_step); only the clocks and the publish are controlled."""
 import ssl
 
-import pytest
-
 from conftest import World
 from pqgrid.commands import CommandProcessor, CommandService
 from pqgrid.e2e.envelopes import control_topic

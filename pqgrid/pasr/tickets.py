@@ -76,7 +76,8 @@ class UsedTickets:
 
     An entry is forgotten once its ticket has expired: check 5 already refuses an expired ticket, so the
     record is no longer needed. Pruning uses a min-heap, O(log n) per resume (E28; audit S4).
-    Slice 4 makes consume() durable (SQLite WAL, synchronous = FULL); callers already consume before replying."""
+    persistence.utility_db.SqlUsedTickets makes consume() durable (SQLite WAL, synchronous = FULL); callers consume
+    before replying."""
 
     def __init__(self):
         self._exp: dict[bytes, int] = {}

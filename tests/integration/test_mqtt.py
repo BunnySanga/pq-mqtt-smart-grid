@@ -12,6 +12,7 @@ import pytest
 from harness import broker, plant, requires_broker, wait_for          # noqa: F401  (fixtures)
 from pqgrid.e2e.handshake import StoredTicket
 from pqgrid.mqtt import pki, topics, tls
+from pqgrid.errors import CommandError
 from pqgrid.mqtt.device_node import TransportError
 from pqgrid.suite.aead import AeadAlg
 
@@ -147,6 +148,18 @@ def _tls_connect(ctx, port):
     return ok
 
 
+def _tls_refused(ctx, port):
+    """A client certificate the broker refuses. In TLS 1.3 the client's handshake completes BEFORE the server has
+    checked the client certificate; the server then sends its alert and closes with handshake records unread, which
+    resets the connection. So read, never write, first: the alert is queued ahead of the reset, whereas a write
+    after the reset fails with ECONNRESET and hides the alert (a race under load: failed 5 of 6 runs)."""
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), 5), server_hostname="localhost")
+    try:
+        s.recv(4)
+    finally:
+        s.close()
+
+
 def test_T4_device_tls_ignores_certificate_time_but_not_the_chain(broker, tmp_path):
     dev = pki.device_cert(broker.ca, str(tmp_path), b"der-0009")
     with pytest.raises(ssl.SSLCertVerificationError, match="not yet valid"):
@@ -160,7 +173,7 @@ def test_T4_device_tls_ignores_certificate_time_but_not_the_chain(broker, tmp_pa
     assert _tls_connect(broker.device_ctx(dev), broker.port)                   # the broker is reachable …
     failures = open(broker.log).read().count("certificate verify failed")
     with pytest.raises(ssl.SSLError, match="SSLV3_ALERT_CERTIFICATE_EXPIRED"):  # … and refuses an expired cert
-        _tls_connect(broker.device_ctx(expired), broker.port)
+        _tls_refused(broker.device_ctx(expired), broker.port)
     assert wait_for(lambda: open(broker.log).read().count("certificate verify failed") == failures + 1, 5)
 
 
@@ -297,8 +310,11 @@ def test_H1_live_revocation_over_the_broker_without_any_acl_change(plant):
     d1.mq.send_alert(b"X", b"after revocation")
     assert wait_for(lambda: any("revoked" in r for r in plant.u.refused))     # refused at the E2E layer
     assert all(p != b"after revocation" for _, p, _ in plant.u.alerts)
-    with pytest.raises(Exception, match="revoked"):
+    with pytest.raises(CommandError, match="revoked"):
         plant.u.command(D1, b"TRIP", 300)
+    d1.mq.send_telemetry(b"reading after revocation")                        # hop-only tier: the ACL still
+    assert wait_for(lambda: any("telemetry" in r and "revoked" in r for r in plant.u.refused))   # lets it in, the
+    assert (D1, b"reading after revocation") not in plant.u.telemetry         # utility (registry) does not
     cc = AeadAlg.CHACHA20POLY1305
     assert wait_for(lambda: d2.mq.proc.zones._keys.get(("f7", cc)) and max(d2.mq.proc.zones._keys[("f7", cc)]) ==
                     plant.node.zones.zones["f7"].groups[cc].key_epoch)       # D2 got the new key

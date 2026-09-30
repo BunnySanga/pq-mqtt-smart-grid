@@ -8,8 +8,6 @@ import pytest
 from harness import broker, plant, requires_broker, wait_for          # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, POLICY
 from pqgrid.fota.publisher import part_payload_budget
-from pqgrid.mqtt import topics
-from pqgrid.policy import encode_policy
 
 pytestmark = requires_broker
 C2, M1 = b"c2-0001", b"meter-0001"

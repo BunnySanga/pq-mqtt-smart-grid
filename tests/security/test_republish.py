@@ -76,3 +76,39 @@ def test_requests_are_rate_limited_and_an_empty_offer_costs_nothing(world: World
     assert pub.on_request(Client(), C2, DEV) == []                       # a repeated request within the hour
     t[0] += REPUBLISH_EVERY_S
     assert pub.on_request(Client(), C2, DEV) == [FIRMWARE]
+
+
+def test_the_publishers_rollout_state_survives_a_utility_restart(world: World, station, tmp_path):
+    """Master §4.4 / U-4: the artifact publisher's rollout state is durable. After a restart the utility still knows
+    its newest artifacts (E-4 republish), still removes what it retained once the window has passed, and still
+    knows the anchors revoked by the KEYREVOKEs it published (so it never republishes their releases)."""
+    from pqgrid.fota.publisher import RETENTION_S
+    from pqgrid.persistence.utility_db import SqlPublisher, UtilityDB
+    t, path = [1000.0], str(tmp_path / "u.db")
+    db = UtilityDB(path)
+    pub, c = SqlPublisher(db, world.policy, clock=lambda: t[0]), Client()
+    fw_a = build(station, FIRMWARE, 2, os.urandom(9000))                       # signed by A
+    rev = station.keyrevoke(C2, 1, ANCHOR_A, CHUNK, part_payload_budget(MP, C2, KEYREVOKE, 1))
+    pub.publish(c, fw_a)
+    pub.publish(c, rev)
+    retained = {topic for topic, _, r in c.msgs if r}
+    db.close()
+    db = UtilityDB(path)                                                         # restart
+    pub = SqlPublisher(db, world.policy, clock=lambda: t[0])
+    assert pub.revoked == {ANCHOR_A}
+    c2 = Client()
+    assert pub.on_request(c2, C2, DEV) == [KEYREVOKE]                            # A's firmware: not any more
+    t[0] += RETENTION_S
+    c3 = Client()
+    assert pub.cleanup(c3) == 2 and {topic for topic, p, r in c3.msgs if p == b"" and r} == retained
+    db.close()
+    db = UtilityDB(path)                                                         # restart after the clean-up:
+    pub = SqlPublisher(db, world.policy, clock=lambda: t[0])
+    assert pub.live == {} and not pub.retained(rev)                              # it knows nothing is retained
+    fw_b = build(station, FIRMWARE, 3, os.urandom(9000), anchor_id=ANCHOR_B)    # B releases after the revocation
+    pub.publish(Client(), fw_b)
+    db.close()
+    db = UtilityDB(path)                                                         # restart again
+    pub, c4 = SqlPublisher(db, world.policy, clock=lambda: t[0] + REPUBLISH_EVERY_S), Client()
+    assert pub.on_request(c4, C2, DEV) == [FIRMWARE, KEYREVOKE] and republished(c4, fw_b)
+    db.close()

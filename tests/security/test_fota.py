@@ -180,6 +180,23 @@ def test_EF2_failed_boot_reverts_and_the_same_version_can_be_retried(dev, statio
         dev.feed(build(station, FIRMWARE, 1, firmware()), chunks=[])       # rollback still blocked
 
 
+def test_power_loss_between_the_commit_and_dropping_the_staged_record(dev, station):
+    """§15.12: the commit is one protected record; the staging record is dropped after it. A power cut in between
+    leaves a staged manifest whose version is already committed. The next boot must finish the commit (drop it), not
+    re-hash the slot that is now the OLD one and report a false "staged image modified" (a tamper alarm)."""
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art)
+    active = dev.inst.prot.active
+    dev.norm.fail_after = 0                                          # the protected write completes, then power fails
+    with pytest.raises(PowerLoss):
+        dev.inst.boot_staged_firmware(lambda img: img == art.payload)
+    dev.norm.fail_after = None
+    dev.boot()
+    assert dev.inst.committed(FIRMWARE) == 2 and dev.inst.prot.active == 1 - active
+    assert dev.inst.boot_staged_firmware(lambda img: True) == "nothing staged"
+    assert dev.inst.staged == {} and dev.inst.downloads == {}
+
+
 def test_EF3_chunk_from_another_version_is_refused(dev, station):
     a2, a3 = build(station, FIRMWARE, 2, firmware()), build(station, FIRMWARE, 3, firmware())
     dev.feed(a2, chunks=[])
@@ -296,6 +313,146 @@ def test_policy_activates_at_its_time_and_E57_binds_versions(dev, station, world
     assert dev.inst.committed(POLICY) == 2
 
 
+def _policy_art(station, world: World, version: int, activate_at: int = T0):
+    p = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=version, activate_at=activate_at)
+    return p, build(station, POLICY, version, encode_policy(p), activate_at=activate_at)
+
+
+def test_the_installed_policy_is_kept_in_flash_across_reboots_and_updates(dev, station, world: World):
+    """Master §4.1: the device holds its installed policy in flash. A factory device has none (its factory policy
+    applies); after an activation the exact signed bytes come back after a reboot, and after a factory reset of the
+    normal flash; a newer policy is staged BESIDE the installed one, which stays intact until the next commit.
+    Before the fix nothing persisted it: after a reboot the device ran its factory policy, the utility refused it
+    and the current policy it re-sent was refused as a rollback, for ever."""
+    assert dev.inst.installed_policy() is None
+    v2, a2 = _policy_art(station, world, 2)
+    dev.feed(a2)
+    assert dev.inst.activate_policy(world.policy).raw == v2.raw
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v2.raw
+    v3, a3 = _policy_art(station, world, 3, activate_at=T0 + 600)
+    dev.feed(a3)                                                           # staged ahead of activate_at …
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v2.raw                       # … without touching the installed one
+    dev.now[0] = T0 + 600
+    assert dev.inst.activate_policy(dev.inst.installed_policy()).raw == v3.raw
+    dev.norm = FlashSim()                                                  # factory reset: normal flash erased
+    dev.boot()
+    assert dev.inst.installed_policy().raw == v3.raw and dev.inst.committed(POLICY) == 3
+
+
+def test_a_modified_policy_area_is_refused_at_activation_and_at_boot(dev, station, world: World):
+    """Like the firmware slot (V-F4), a policy read back from flash is checked against its signed SHA-256. A byte
+    changed inside utility_cmd_pk still decodes and validates, so without the check the device committed (and would
+    boot with) a command key nobody signed."""
+    v2, a2 = _policy_art(station, world, 2)
+    dev.feed(a2)
+    area = dev.ff.policy_areas[1 - dev.inst.prot.policy[0]]                 # the staging area
+    off = bytes(area).find(v2.utility_cmd_pk) + 100
+    area[off] ^= 1
+    with pytest.raises(FotaError, match="staged policy modified"):
+        dev.inst.activate_policy(world.policy)
+    assert dev.inst.committed(POLICY) == 0 and dev.inst.installed_policy() is None
+    dev.feed(a2)                                                           # the genuine artifact re-delivered
+    assert dev.inst.activate_policy(world.policy).utility_cmd_pk == v2.utility_cmd_pk
+    dev.ff.policy_areas[dev.inst.prot.policy[0]][off] ^= 1                  # now the INSTALLED copy is modified
+    dev.boot()
+    with pytest.raises(FotaError, match="installed policy"):
+        dev.inst.installed_policy()
+
+
+def test_a_device_rebooted_after_a_policy_update_establishes_under_it(station, world: World):
+    """The lock-out, end to end in process: v2 activated on both sides, the device reboots and boots with its
+    installed policy (not the factory one), and a full handshake under v2 succeeds."""
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    from pqgrid.persistence.device import DeviceFlash
+    from pqgrid.registry import DeviceRecord
+    from pqgrid.suite.hkem import HybridKeyPair
+    v2, a2 = _policy_art(station, world, 2, activate_at=int(world.t))
+    kp, norm, prot, ff = HybridKeyPair.generate(), FlashSim(), FlashSim(), FotaFlash(64 * 1024)
+    world.registry.add(DeviceRecord(b"c2-0001", C2, kp.pk))
+    clock = lambda: world.t                                                # noqa: E731
+
+    def boot():
+        df = DeviceFlash(norm, clock)
+        inst = Installer(station.anchors, C2, MP, ff, RecordStore(prot, clock), df.store, clock)
+        return DeviceEndpoint(b"c2-0001", C2, inst.installed_policy() or world.policy, 1, kp, clock=clock,
+                              flash=df), inst
+    d, inst = boot()
+    for p in a2.parts:
+        inst.on_part(p)
+    for c in a2.chunks:
+        inst.on_chunk(c)
+    d.install_policy(inst.activate_policy(d.policy))
+    world.utility.install_policy(v2)
+    d, inst = boot()                                                       # reboot
+    assert d.policy.info() == v2.info()
+    world.full(d)
+    assert d.confirmed and world.utility.current_session(b"c2-0001").policy_info == v2.info()
+
+
+
+def test_the_installer_follows_the_packet_limit_of_the_policy_it_commits(dev, station, world: World):
+    """E61 checks chunks against the device's packet limit, a class value of the INSTALLED policy. A policy that raises
+    it (the device then declares 8 KiB to the broker and the publisher builds for 8 KiB) must let those artifacts in,
+    now and after a reboot; before the fix the installer kept its factory limit and refused them for ever."""
+    from conftest import replace_class
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=T0,
+                     classes=replace_class(world.policy, C2, max_packet=8192, fota_chunk_size=6144))
+    dev.feed(build(station, POLICY, 2, encode_policy(v2), activate_at=T0))
+    dev.inst.activate_policy(world.policy)
+    art = build(station, FIRMWARE, 2, firmware(), max_packet=8192, chunk=6144)
+    assert dev.feed(art)[1] == [FIRMWARE]
+    dev.boot()                                                             # Dev.boot passes the factory 4 KiB
+    assert dev.inst.max_packet == 8192
+    assert dev.feed(build(station, FIRMWARE, 3, firmware(), max_packet=8192, chunk=6144))[1] == [FIRMWARE]
+
+
+def test_a_policy_without_the_devices_own_class_is_refused_before_commit(dev, station, world: World):
+    """The manifest names the class (F7), but the policy inside might not define it. Committed, it would leave the
+    device with an installed policy it cannot run (every class value comes from it): a lock-out. Refused first."""
+    others = {n: c for n, c in world.policy.classes.items() if n != C2}
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=T0, classes=others)
+    dev.feed(build(station, POLICY, 2, encode_policy(v2), activate_at=T0))
+    with pytest.raises(FotaError, match="c2_meter"):
+        dev.inst.activate_policy(world.policy)
+    assert dev.inst.committed(POLICY) == 0 and dev.inst.installed_policy() is None
+
+
+def test_the_device_loop_applies_every_class_value_of_a_newly_activated_policy(station, world: World):
+    """§12 through the production step (DeviceMqtt.housekeeping, no broker): after the loop activates a policy, the
+    E2E endpoint, the MQTT CONNECT properties, the FOTA installer's packet limit and the outbox cap all follow the
+    new class profile; before the fix the outbox and the installer kept their factory values."""
+    import ssl
+    from conftest import replace_class
+    from pqgrid.commands import CommandProcessor
+    from pqgrid.mqtt.device_node import DeviceMqtt
+    from pqgrid.persistence.device import DeviceFlash
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    from pqgrid.registry import DeviceRecord
+    from pqgrid.suite.hkem import HybridKeyPair
+    v2 = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, activate_at=int(world.t),
+                     classes=replace_class(world.policy, C2, max_packet=8192, fota_chunk_size=6144, outbox_cap=2048,
+                                           session_expiry_s=3600))
+    kp, clock = HybridKeyPair.generate(), (lambda: world.t)
+    world.registry.add(DeviceRecord(b"c2-0001", C2, kp.pk))
+    df = DeviceFlash(FlashSim(), clock)
+    d = DeviceEndpoint(b"c2-0001", C2, world.policy, 1, kp, clock=clock, flash=df)
+    inst = Installer(station.anchors, C2, MP, FotaFlash(64 * 1024), RecordStore(FlashSim(), clock), df.store, clock)
+    outbox = df.outbox("grid/c2_meter/c2-0001/alert", world.policy.profile(C2).outbox_cap)
+    mq = DeviceMqtt(d, CommandProcessor(d, lambda c: None), outbox, ssl.create_default_context(), "localhost", 1,
+                    fota=inst)
+    art = build(station, POLICY, 2, encode_policy(v2), activate_at=int(world.t))
+    for part in art.parts:
+        inst.on_part(part)
+    for chunk in art.chunks:
+        inst.on_chunk(chunk)
+    mq.housekeeping()                                                      # the loop activates it
+    new = v2.profile(C2)
+    assert d.policy.info() == v2.info() and d.profile == new
+    assert mq._props.MaximumPacketSize == 8192 and mq._props.SessionExpiryInterval == 3600
+    assert inst.max_packet == new.max_packet and outbox.cap == new.outbox_cap
+
 def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tmp_path):
     payload = encode_policy(world.policy)
     art = build(station, POLICY, world.policy.version, payload)
@@ -308,8 +465,14 @@ def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tm
     with pytest.raises(FotaError, match="signature invalid"):
         verify_policy_artifact(build(rogue, POLICY, world.policy.version, payload).signed, payload, station.anchors)
     from pqgrid.mqtt.broker import compile_acl
-    with pytest.raises(FotaError):
+    with pytest.raises(FotaError, match="do not match"):
         compile_acl(art.signed, payload + b"x", station.anchors, [], {})
+    as_firmware = build(station, FIRMWARE, world.policy.version, payload)       # validly signed, wrong type
+    with pytest.raises(FotaError, match="not a POLICY artifact"):
+        verify_policy_artifact(as_firmware.signed, payload, station.anchors)
+    liar = build(station, POLICY, world.policy.version + 6, payload)            # manifest 7, policy 1 (E57)
+    with pytest.raises(FotaError, match="E57"):
+        verify_policy_artifact(liar.signed, payload, station.anchors)
 
 
 # ============================================================================================ publisher

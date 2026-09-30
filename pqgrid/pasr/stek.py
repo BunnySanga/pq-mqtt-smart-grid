@@ -6,8 +6,8 @@ The STEK is utility-only (§9.5) and seals tickets with ChaCha20-Poly1305. Rules
     validator rule 4 caps every ticket at 7 days, so no ticket sealed under a key outlives its retirement;
   * key ids are 16 bits (v2.2) and never wrap into a key that is still live.
 
-Storage here is in memory. Slice 4 moves it to SQLite WAL, with a new key committed before the first ticket
-is sealed under it (§16); production uses an HSM (RISK-1: a stolen STEK mints tickets).
+Storage here is in memory; persistence.utility_db.SqlStekTable keeps it in SQLite WAL, with a new key committed
+before the first ticket is sealed under it (§16); production uses an HSM (RISK-1: a stolen STEK mints tickets).
 """
 from __future__ import annotations
 
