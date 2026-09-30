@@ -148,6 +148,18 @@ def _tls_connect(ctx, port):
     return ok
 
 
+def _tls_refused(ctx, port):
+    """A client certificate the broker refuses. In TLS 1.3 the client's handshake completes BEFORE the server has
+    checked the client certificate; the server then sends its alert and closes with handshake records unread, which
+    resets the connection. So read, never write, first: the alert is queued ahead of the reset, whereas a write
+    after the reset fails with ECONNRESET and hides the alert (a race under load: failed 5 of 6 runs)."""
+    s = ctx.wrap_socket(socket.create_connection(("127.0.0.1", port), 5), server_hostname="localhost")
+    try:
+        s.recv(4)
+    finally:
+        s.close()
+
+
 def test_T4_device_tls_ignores_certificate_time_but_not_the_chain(broker, tmp_path):
     dev = pki.device_cert(broker.ca, str(tmp_path), b"der-0009")
     with pytest.raises(ssl.SSLCertVerificationError, match="not yet valid"):
@@ -161,7 +173,7 @@ def test_T4_device_tls_ignores_certificate_time_but_not_the_chain(broker, tmp_pa
     assert _tls_connect(broker.device_ctx(dev), broker.port)                   # the broker is reachable …
     failures = open(broker.log).read().count("certificate verify failed")
     with pytest.raises(ssl.SSLError, match="SSLV3_ALERT_CERTIFICATE_EXPIRED"):  # … and refuses an expired cert
-        _tls_connect(broker.device_ctx(expired), broker.port)
+        _tls_refused(broker.device_ctx(expired), broker.port)
     assert wait_for(lambda: open(broker.log).read().count("certificate verify failed") == failures + 1, 5)
 
 
