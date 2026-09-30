@@ -235,8 +235,10 @@ def test_VF3_revocation_safety(dev, station):
     budget = part_payload_budget(MP, C2, KEYREVOKE, 1)
     with pytest.raises(FotaError, match="recovery anchor B"):              # signed by A: refused (DR-050)
         dev.feed(station.keyrevoke(C2, 1, ANCHOR_B, CHUNK, budget, anchor_id=ANCHOR_A), chunks=[])
+    # B revoking itself is refused by the DR-050 role rule (B may revoke only A). The installer's separate
+    # "last active anchor" guard cannot be reached with anchors {A, B} under DR-050 (Master §15.14): not tested here.
     with pytest.raises(FotaError, match="only the recovery anchor B may revoke the release anchor A"):
-        dev.feed(station.keyrevoke(C2, 1, ANCHOR_B, CHUNK, budget))         # B revoking itself: the last anchor
+        dev.feed(station.keyrevoke(C2, 1, ANCHOR_B, CHUNK, budget))
     assert dev.inst.prot.revoked == set() and dev.inst.committed(KEYREVOKE) == 0
 
 
@@ -587,3 +589,21 @@ def test_publisher_refuses_messages_larger_than_the_class_limit(station, world: 
     oversized = build(station, FIRMWARE, 2, firmware(), max_packet=8192, chunk=6144)   # built for 8 KiB …
     with pytest.raises(FotaError, match="> 4096 B, the largest packet every device of the class can receive"):
         Publisher(world.policy).messages(oversized)                        # … published to a 4 KiB class
+
+
+def test_policy_and_keyrevoke_are_sized_to_the_class_floor_firmware_to_the_current_policy(station, world: World):
+    """DR-052 (audit H-2): after a policy raises c2_meter from 4 KiB to 8 KiB, a device still on the old policy can
+    only receive 4 KiB, so the POLICY (and KEYREVOKE) that updates it must still fit 4 KiB; FIRMWARE may use 8 KiB
+    (a device re-subscribes to retained artifacts after the CONNECT that raised its limit)."""
+    from conftest import replace_class
+    raised = make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2,
+                         classes=replace_class(world.policy, C2, max_packet=8192, fota_chunk_size=6144))
+    pub = Publisher(world.policy)
+    pub.policy = raised                                                  # activated: the floor stays 4096
+    assert pub.floor[C2] == 4096
+    fw = build(station, FIRMWARE, 2, firmware(), max_packet=8192, chunk=6144)
+    assert pub.messages(fw)                                              # FIRMWARE: the current 8 KiB limit
+    big_policy = build(station, POLICY, 3, encode_policy(raised), max_packet=8192, chunk=6144)
+    with pytest.raises(FotaError, match="> 4096 B"):
+        pub.messages(big_policy)                                         # POLICY: the floor
+    assert pub.messages(build(station, POLICY, 3, encode_policy(raised)))   # built for 4 KiB: fine

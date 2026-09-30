@@ -263,8 +263,11 @@ def test_device_refuses_an_authenticated_server_hello_with_another_policy_or_res
     with pytest.raises(HandshakeError, match="resume mode does not match"):
         d.on_server_hello(downgrade)
     assert d.session is None
-    d.on_server_hello(_sh_from_the_utility_key(world, d, ch, world.policy.info(), b"PSK_KEM"))   # the control:
-    assert d.session is not None                                            # the same SH, honest, is accepted
+    honest = _sh_from_the_utility_key(world, d, ch, world.policy.info(), b"PSK_KEM")
+    production = world.utility.on_client_hello(D1, ch)                     # the helper builds exactly the
+    assert [len(f) for f in dec(honest, 6)] == [len(f) for f in dec(production, 6)]   # production SH layout
+    d.on_server_hello(honest)                                               # the control: the same SH, honest,
+    assert d.session is not None                                            # is accepted
 
 
 def test_forged_fin_is_refused_and_the_genuine_one_confirms(world: World):
