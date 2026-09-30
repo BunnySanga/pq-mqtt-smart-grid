@@ -905,6 +905,13 @@ D: verify MAC_U, set clock → DF: MAC_D ‖ bundle(envelopes…) ──▶ U: v
                                     ◀── NT (new ticket, same chain expiry) ‖ ACKs
 ```
 
+**Freshness of utility_time** (DR-053, audit M-2): the device resends its outstanding CH or RH identically, and accepts
+a reply to it, only within the **attempt lifetime** `max(DUP_WINDOW, PENDING_TTL)` of its own clock since the hello was
+built (the longest the utility can still answer it); after that it abandons the hello (an RH together with its ticket)
+and builds a new one. So `utility_time` adopted from SH/RS is never older than that lifetime, whatever a broker holds
+back. A PSK RH kept in flash for a resend after a reboot stores its build time and is dropped at boot if its age is
+unknown or too great.
+
 **DF binds its bundle** (DR-044, decided 2026-09-25):
 
 `MAC_D = HMAC(kc_D, "D-finished" ‖ H(th2, MAC_U, H(bundle)))`
@@ -2065,14 +2072,14 @@ to (largest record − 1) unusable bytes. Default classes (4 KiB outbox), 4 KiB 
 | Intents: 31 interrupted + 1 pending body (1,024 B) — at most one body: an older PENDING becomes INTERRUPTED when a new command is accepted (E37) | 2,624 |
 | FOTA: FIRMWARE, POLICY, KEYREVOKE, one download or staged record each (≤ 1,024 chunks) | 1,032 |
 | Zone `bseq` records (≤ 16 zones per device, refused beyond on both sides) | 896 |
-| Resume hello (PSK) · ticket | 473 · 411 |
+| Resume hello (PSK, with its build time, DR-053) · ticket | 489 · 411 |
 | Command state · time floor · bank markers | 45 · 24 · 34 |
-| **Worst case** (+ largest record, 1,080 B, in flight) | **9,678 + 1,080 = 10,758** |
+| **Worst case** (+ largest record, 1,080 B, in flight) | **9,694 + 1,080 = 10,774** |
 | One bank of 4 pages holds at least 4 × (4,096 − 1,079) | **12,068** |
 
 **Configured store: 2 banks × 4 pages × 4 KiB = 32 KiB.** The device checks this at start-up and before adopting
 a new policy (CapacityError: an impossible configuration is refused, never run); two 8 KiB banks (6,034 B) are
-refused. The worst case built from real records (all states at once, 32-character device ID) measured 7,927 B
+refused. The worst case built from real records (all states at once, 32-character device ID) measured 7,943 B
 live, and survived a power cut at every step of compacting it [SIM].
 
 ## fsync / atomic rename
@@ -2991,6 +2998,19 @@ It had five steps:
 | **Trade-offs** | One extra TCP + TLS + CONNECT per device per policy that changes a CONNECT value (spread by the §12 random delay); a raised max_packet benefits POLICY/KEYREVOKE artifacts only when every earlier policy allowed it |
 | **Evidence** | `tests/integration/test_connect_properties.py` [DOCKER, real Mosquitto]: the broker's own CONNECT log and forwarding behaviour — raise (backlog of 60 alerts, one reconnect, new Keep Alive, 10 kB forwarded afterwards, no reconnect storm), lower (10 kB dropped, 3 s session expiry applied), broker outage across the activation, device reboot, a policy with no CONNECT change (no reconnect), FIRMWARE and a DR event above the old limit delivered, a POLICY above the floor refused, floor kept across a utility restart |
 | **Future trigger** | An MQTT client stack that can update these values without a reconnect |
+
+## DR-053: Freshness of utility_time
+
+| Field | Content |
+|---|---|
+| **Question** | The device takes its clock from the authenticated `utility_time` in SH/RS (§9.4, I-17) and resends its CH/RH identically until answered (D-3). An authentic reply can be held back by the broker: how old may the time it carries be? |
+| **Options** | 1. **Bound the attempt**: resend a hello, and accept a reply to it, only within `max(DUP_WINDOW, PENDING_TTL)` of device-local time since it was built. 2. Adopt the time only after NT/FIN. 3. Only move the clock forward |
+| **Decision** | **1**. After the lifetime the hello is abandoned (an RH with its ticket, which may already be consumed) and a new one is built; a reply to an abandoned or too old hello is refused before its time is believed; a PSK RH persisted for a resend after a reboot carries its build time (authenticated device time) and is resent only if its age is known and within the lifetime |
+| **Why** | The utility itself can answer a hello only that long (identical replies within DUP_WINDOW, a half-open handshake for PENDING_TTL), so nothing legitimate is lost, and the clock error from a delayed reply is bounded by it. Found by the independent release audit (M-2): an SH withheld for 6 h set the device clock 6 h back, which re-opened expired DR events and delayed FOTA activation |
+| **Rejected** | 2: an NT can be held back the same way, and the DF/NT round trip would still carry the same bound. 3: the RTC is often ahead after a reset, and utility time must be able to correct it both ways (§8.9) |
+| **Trade-offs** | A hello unanswered for longer than the lifetime costs a new one (for an RH, a full handshake); the persisted RH record grows by 16 B (§16 budget 10,774 B) |
+| **Evidence** | `tests/security/test_time_freshness.py` [SIM]: SH withheld 6 h (no rollback, no session), acceptance exactly up to the lifetime, a lagging RTC still corrected forward, an expired DR event still refused, a staged policy still activated on time, stale RS and NT refused (ticket dropped, no false clone alarm), reboot within and after the lifetime |
+| **Future trigger** | Authenticated network time on the modem (§30) |
 
 ---
 
@@ -3949,7 +3969,7 @@ TRNG (True RNG) · WAL (Write-Ahead Log) · XMSS (eXtended Merkle Signature Sche
 | DF alone / with one ALERT | 46 / 193 B | [DOCKER, v2.2 code] |
 | Status ACK / DR event (64 B event, ChaCha group) / ZONESYNC (2- / 32-character zone) | 83 / 3,488 / 83–113 B | [DOCKER, v2.2 code]; DR event hand-derived |
 | Alerts per DF | `min(64, (max_packet − 420) ÷ 69)`: 53 at 4,096 B (reply 4,008 B; largest C2 DF 6,109 B) | §9.4 |
-| Device record store | 2 banks × 4 pages × 4 KiB; worst case 10,758 B ≤ 12,068 B per bank | §16 Device Storage Capacity |
+| Device record store | 2 banks × 4 pages × 4 KiB; worst case 10,774 B ≤ 12,068 B per bank | §16 Device Storage Capacity |
 | Intent log / zones per device / FOTA chunks / ALERT payload, kind | 32 / 16 / 1,024 / 1,024 B, 16 B | §13.7, §11, §15, §16 |
 | Retained DR events per zone | 64 (overflow raises an alarm) | §11 |
 | Zone sync | ≤ 1 outstanding per zone (retry 10 s); utility ≤ 1 answer per 5 s per (device, zone) | §11 (E-2) |
@@ -4052,7 +4072,7 @@ landed in this document, and what remains open. Code, tests and results per item
   a zone sync (§11).
 - **E-3 (resolved):** cumulative SETPOINT ACK every 30 s (inclusive), final ACK at GRANT end (§13.5).
 - **E-4 (resolved):** deterministic republish triggers and validity rules, independent of the time floor (§15.8).
-- **Device storage (resolved):** worst case 10,758 B per bank, store 2 × 4 × 4 KiB (§16 Device Storage Capacity);
+- **Device storage (resolved):** worst case 10,774 B per bank (10,758 B before DR-053 added the RH build time), store 2 × 4 × 4 KiB (§16 Device Storage Capacity);
   DF carries at most what its reply can ACK (C2: 53 alerts, §9.4).
 
 **Not claimed:** hardware validation; guaranteed erasure while powered off; exactly-once actuation (the claim is

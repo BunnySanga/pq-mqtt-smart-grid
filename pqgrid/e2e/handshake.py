@@ -85,6 +85,7 @@ class DeviceEndpoint:
         self.ticket: Optional[StoredTicket] = None
         self._rh: Optional[bytes] = None
         self._reph: Optional[HybridKeyPair] = None
+        self._attempt_started = float("-inf")              # local clock when the outstanding CH/RH was built
         self._last_resync = float("-inf")
         self.flash = flash                                  # a persistence.device.DeviceFlash, or None (RAM only)
         if flash is not None:
@@ -96,15 +97,51 @@ class DeviceEndpoint:
             self.ticket = flash.load_ticket(StoredTicket)
             stored = flash.load_rh()
             if stored is not None:
-                if self.ticket is not None and self.ticket.mode is ResumeMode.PSK and stored.startswith(enc([b"RH"])[:6]):
-                    self._rh = stored                       # S5: resend the identical RH after the reboot
-                else:                                       # C8: a PSK_KEM RH cannot be resent; the ticket may
-                    flash.clear_ticket()                    # already be consumed, so drop it (no false clone
-                    flash.clear_rh()                        # alarm) and do a full handshake
-                    self.ticket = None
+                rh, built_at = stored
+                age = self.now() - built_at if built_at is not None else -1
+                if (self.ticket is not None and self.ticket.mode is ResumeMode.PSK and rh is not None
+                        and 0 <= age <= self.attempt_lifetime()):
+                    self._rh = rh                           # S5: resend the identical RH after the reboot, while
+                    self._attempt_started = self.clock() - age   # the utility can still answer it (DR-053)
+                else:                                       # C8: a PSK_KEM RH cannot be resent, and a PSK RH of
+                    flash.clear_ticket()                    # unknown or too great an age could only be answered
+                    flash.clear_rh()                        # stale; the ticket may already be consumed, so drop it
+                    self.ticket = None                      # (no false clone alarm): a full handshake
 
     def now(self) -> int:
         return int(self.clock() + self.offset)
+
+    def attempt_lifetime(self) -> int:
+        """DR-053: how long an outstanding CH/RH may still be answered: the utility answers an identical request
+        from its duplicate cache for DUP_WINDOW and completes a half-open handshake for PENDING_TTL. A reply to an
+        older hello can only be stale (or withheld on purpose), so it is refused, and the hello is not resent."""
+        return max(self.profile.dup_window_s, self.profile.pending_ttl_s)
+
+    def _attempt_fresh(self) -> bool:
+        age = self.clock() - self._attempt_started          # local clock: runs even when it is not the right time
+        return 0 <= age <= self.attempt_lifetime()
+
+    def expire_stale_attempt(self) -> bool:
+        """Abandon an outstanding CH/RH older than attempt_lifetime(). Returns True if one was abandoned."""
+        if (self._ch is None and self._rh is None) or self._attempt_fresh():
+            return False
+        self._abandon_attempt()
+        return True
+
+    def _abandon_attempt(self) -> None:
+        """For an RH the ticket goes too: the first copy may have consumed it, and a resend now would be refused as
+        "already used" (a false clone alarm)."""
+        dropped_resume = self._rh is not None
+        self._new_attempt()
+        if dropped_resume and self.ticket is not None:
+            self.ticket = None
+            if self.flash is not None:
+                self.flash.clear_ticket()
+
+    def _refuse_if_stale(self, what: str) -> None:
+        if not self._attempt_fresh():
+            self._abandon_attempt()
+            raise HandshakeError(f"stale {what}: it answers a hello older than the attempt lifetime (DR-053)")
 
     def _new_attempt(self) -> None:
         """A new CH or RH abandons any other attempt in progress (the ticket itself is kept)."""
@@ -112,12 +149,16 @@ class DeviceEndpoint:
         if self._rh is not None and self.flash is not None:
             self.flash.clear_rh()
         self._ch = self._eph = self._ss_u = self._rh = self._reph = None
+        self._attempt_started = float("-inf")
 
     def client_hello(self) -> bytes:
-        """Build CH, or return the identical CH while it is outstanding (QoS 1 retransmission)."""
+        """Build CH, or return the identical CH while it is outstanding and can still be answered (QoS 1
+        retransmission, DR-053)."""
+        self.expire_stale_attempt()
         if self._ch is not None:
             return self._ch
         self._new_attempt()
+        self._attempt_started = self.clock()
         self._eph = HybridKeyPair.generate()
         self._ss_u, ct_u = hkem.encaps(self.policy.utility_kem_pk)
         n_d, nonce = random_bytes(N_LEN), random_bytes(NONCE_LEN)
@@ -130,6 +171,7 @@ class DeviceEndpoint:
     def on_server_hello(self, sh: bytes) -> Session:
         if self._ch is None or self._eph is None:
             raise HandshakeError("no handshake in progress (late or foreign server hello)")
+        self._refuse_if_stale("server hello")               # DR-053: before utility_time is believed
         try:
             tag, ct_e, n_u, nonce, ct_inner, mu = dec(sh, 6)
         except WireError as e:
@@ -175,26 +217,29 @@ class DeviceEndpoint:
                 and ct_eq(t.policy_info, self.policy.info()) and t.fw_version == self.fw)
 
     def resume_hello(self) -> bytes:
-        """Build RH, or return the identical RH while it is outstanding (S5: a rebuilt RH would be refused as
-        "already used" once the first copy has been processed)."""
+        """Build RH, or return the identical RH while it is outstanding and can still be answered (S5: a rebuilt
+        RH would be refused as "already used" once the first copy has been processed; DR-053)."""
+        self.expire_stale_attempt()
         if self._rh is not None:
             return self._rh
         if not self.can_resume():
             raise HandshakeError("no usable ticket: use a full handshake")
         t = self.ticket
         self._new_attempt()
+        self._attempt_started = self.clock()
         self._reph = HybridKeyPair.generate() if t.mode is ResumeMode.PSK_KEM else None
         fields = [b"RH", t.blob, random_bytes(N_LEN), t.mode.value.encode(), self._reph.pk if self._reph else b"",
                   self.id, self.policy.info(), u64(self.fw), u64(self.now())]
         rh = enc(fields + [mac(keys.binder_key(t.psk), h(*fields))])
         if self.flash is not None:
-            self.flash.save_rh(rh, t.mode)                  # durable before it is sent (§9.8, C8)
+            self.flash.save_rh(rh, t.mode, self.now())      # durable before it is sent (§9.8, C8), with its age
         self._rh = rh
         return self._rh
 
     def on_resume_server(self, rs: bytes) -> Session:
         if self._rh is None or self.ticket is None:
             raise HandshakeError("no resumption in progress (late or duplicate resume reply)")
+        self._refuse_if_stale("resume reply")               # DR-053: before utility_time is believed
         try:
             tag, n_u, ct_e, utime_b, chain_b, mu = dec(rs, 6)
             utime, chain = r64(utime_b), r64(chain_b)
@@ -249,6 +294,7 @@ class DeviceEndpoint:
         s = self.session
         if s is None or self._df is None:
             raise HandshakeError("no finished message outstanding")
+        self._refuse_if_stale("final message")              # DR-053
         ticket = None
         try:
             tag = peek_tag(msg)

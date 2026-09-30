@@ -306,6 +306,8 @@ class DeviceMqtt:
 
     def establish(self) -> None:
         d = self.d
+        with self.lock:
+            d.expire_stale_attempt()                          # DR-053: a hello too old to be answered is dropped
         for resume in ([True, False] if d.can_resume() else [False]):
             with self.lock:
                 msg = d.resume_hello() if resume else d.client_hello()
