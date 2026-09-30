@@ -3,11 +3,9 @@
 zone-key rotation and ACL recompilation. Every test runs the real loops in threads over the real broker; no test
 calls a wired step directly to stand in for its production caller."""
 import os
-import threading
 import time
-from contextlib import contextmanager
 
-from harness import broker, plant, requires_broker, wait_for          # noqa: F401  (fixtures)
+from harness import NoSpread, broker, loops, plant, requires_broker, start, wait_for   # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import FIRMWARE, POLICY
 from pqgrid.fota.publisher import RETENTION_S
 from pqgrid.mqtt.broker import compile_acl
@@ -16,39 +14,6 @@ from pqgrid.suite.aead import AeadAlg
 pytestmark = requires_broker
 M1, D1 = b"meter-0001", b"der-0001"
 DAY = 86400
-
-
-class NoSpread:
-    """rng for the tests: the §12 random re-handshake delay and the back-off jitter become 0."""
-
-    def uniform(self, a, b):
-        return a
-
-
-@contextmanager
-def loops(plant, *devs, interval=0.05, rng=None):
-    """The utility's and the devices' main loops in threads, stopped (and joined) at the end."""
-    stop = threading.Event()
-    threads = [threading.Thread(target=plant.u.run, args=(stop, interval), daemon=True)]
-    for dev in devs:
-        dev.mq.rng = rng or NoSpread()
-        threads.append(threading.Thread(target=dev.mq.run, args=(stop, interval), daemon=True))
-    for t in threads:
-        t.start()
-    try:
-        yield
-    finally:
-        stop.set()
-        for t in threads:
-            t.join(10)
-    for dev in devs:
-        assert dev.mq.internal_errors == [], dev.mq.internal_errors
-    assert plant.u.internal_errors == [], plant.u.internal_errors
-
-
-def start(plant):
-    plant.publish_acl()
-    plant.u.start()
 
 
 def test_M9_device_loop_connects_establishes_and_recovers_from_a_drop_and_a_utility_restart(plant):

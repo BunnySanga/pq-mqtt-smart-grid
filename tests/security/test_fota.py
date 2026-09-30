@@ -450,7 +450,9 @@ def test_the_device_loop_applies_every_class_value_of_a_newly_activated_policy(s
     mq.housekeeping()                                                      # the loop activates it
     new = v2.profile(C2)
     assert d.policy.info() == v2.info() and d.profile == new
-    assert mq._props.MaximumPacketSize == 8192 and mq._props.SessionExpiryInterval == 3600
+    assert mq._connect_props(d.profile) == (8192, 3600, new.keepalive_s)   # what the next CONNECT declares; the
+    # broker-observed effect (one planned reconnect, the new limit enforced) is in tests/integration/
+    # test_connect_properties.py (H-2)
     assert inst.max_packet == new.max_packet and outbox.cap == new.outbox_cap
 
 def test_utility_and_acl_accept_only_a_verified_policy(station, world: World, tmp_path):
@@ -583,5 +585,5 @@ def test_a_validly_signed_but_invalid_policy_is_refused_at_activation(dev, stati
 
 def test_publisher_refuses_messages_larger_than_the_class_limit(station, world: World):
     oversized = build(station, FIRMWARE, 2, firmware(), max_packet=8192, chunk=6144)   # built for 8 KiB …
-    with pytest.raises(FotaError, match="max_packet"):
+    with pytest.raises(FotaError, match="> 4096 B, the largest packet every device of the class can receive"):
         Publisher(world.policy).messages(oversized)                        # … published to a 4 KiB class

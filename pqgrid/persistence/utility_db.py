@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS artifacts(dclass TEXT NOT NULL, type INTEGER NOT NULL
                                      payload BLOB NOT NULL, parts BLOB NOT NULL, chunks BLOB NOT NULL,
                                      retained_at REAL, topics BLOB, PRIMARY KEY (dclass, type));
 CREATE TABLE IF NOT EXISTS revoked_anchors(anchor INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS class_floor(dclass TEXT PRIMARY KEY, max_packet INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS utility_keys(kind TEXT NOT NULL CHECK (kind IN ('kem', 'cmd')), pk BLOB NOT NULL,
                                         sk BLOB NOT NULL, PRIMARY KEY (kind, pk));
 """
@@ -315,13 +316,14 @@ class SqlZoneManager(ZoneManager):
 # ============================================================================================ publisher
 class SqlPublisher(Publisher):
     """The artifact publisher's rollout state in SQLite (Master §4.4, U-4): per (class, type) the newest artifact and,
-    while it is retained, its topics and publication time; the anchors revoked by the KEYREVOKEs it published.
+    while it is retained, its topics and publication time; the anchors revoked by the KEYREVOKEs it published; each
+    class's delivery floor (the smallest max_packet any activated policy gave it, H-2).
     Without it a restarted utility could republish nothing (E-4), never cleaned up what it had retained, and forgot
     its revocations."""
 
     def __init__(self, db: UtilityDB, policy, clock=time.time):
-        super().__init__(policy, clock)
         self.db = db
+        super().__init__(policy, clock)
         for dclass, t, signed, payload, parts, chunks, at, topics in db.execute(
                 "SELECT dclass, type, signed, payload, parts, chunks, retained_at, topics FROM artifacts"):
             art = Artifact(decode_manifest(split_signed(signed)[0]), signed, dec_list(parts, MAX_PARTS),
@@ -339,6 +341,12 @@ class SqlPublisher(Publisher):
 
     def _store_revoked(self, anchor: int) -> None:
         self.db.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
+
+    def _load_floor(self) -> dict[str, int]:
+        return {dclass: mp for dclass, mp in self.db.execute("SELECT dclass, max_packet FROM class_floor")}
+
+    def _store_floor(self, dclass: str, max_packet: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO class_floor VALUES (?, ?)", (dclass, max_packet))
 
 
 # ================================================================================================ keyring

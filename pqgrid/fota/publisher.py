@@ -42,22 +42,49 @@ class Published:
 
 class Publisher:
     def __init__(self, policy, clock=time.time):
-        self.policy, self.clock = policy, clock
+        self.clock = clock
+        self.floor: dict[str, int] = self._load_floor()            # class → smallest max_packet any policy gave it
+        self.policy = policy
         self.live: dict[tuple[str, int], Published] = {}           # (class, type) → what is retained right now
         self.newest: dict[tuple[str, int], Artifact] = {}          # kept after cleanup, for republish requests
         self._last_request: dict[bytes, float] = {}
         self.revoked: set[int] = set()                             # anchors revoked by published KEYREVOKEs
 
+    @property
+    def policy(self):
+        return self._policy
+
+    @policy.setter
+    def policy(self, p) -> None:
+        """The utility's active policy. Every class's max_packet under it lowers that class's delivery floor."""
+        for name, c in p.classes.items():
+            if name not in self.floor or c.max_packet < self.floor[name]:
+                self._store_floor(name, c.max_packet)             # durable before an artifact is sized by it
+                self.floor[name] = c.max_packet
+        self._policy = p
+
+    def limit(self, m) -> int:
+        """The largest PUBLISH an artifact message may be (Master §10.2, §15.9; H-2). A device declares the class
+        max_packet of the policy it has INSTALLED, and a device still on an older policy must still receive the POLICY
+        (and KEYREVOKE) that updates it: those are sized to the smallest max_packet the class has had under any policy
+        this utility activated (its floor). FIRMWARE follows the current policy: a device that has not yet reconnected
+        with it re-subscribes to the retained artifacts when it does (DeviceMqtt.connect)."""
+        cur = self.policy.profile(m.device_class).max_packet
+        if m.type in (POLICY, KEYREVOKE):
+            return min(cur, self.floor.get(m.device_class, cur))
+        return cur
+
     def messages(self, art: Artifact) -> list[tuple[str, bytes]]:
         m = art.manifest
-        name, limit = TYPE_NAMES[m.type], self.policy.profile(m.device_class).max_packet
+        name, limit = TYPE_NAMES[m.type], self.limit(m)
         if len(art.chunks) > MAX_CHUNKS:
             raise FotaError(f"more than {MAX_CHUNKS} chunks: no device accepts it")
         out = [(topics.fota_part(m.device_class, name, m.version, i), p) for i, p in enumerate(art.parts)]
         out += [(topics.fota_chunk(m.device_class, name, m.version, i), c) for i, c in enumerate(art.chunks)]
         for topic, payload in out:
             if topics.publish_size(topic, payload) > limit:
-                raise FotaError(f"{topic} would be {topics.publish_size(topic, payload)} B > {limit} B max_packet")
+                raise FotaError(f"{topic} would be {topics.publish_size(topic, payload)} B > {limit} B, the largest "
+                                f"packet every device of the class can receive")
         return out
 
     def publish(self, client, art: Artifact) -> None:
@@ -91,6 +118,12 @@ class Publisher:
         pass
 
     def _store_revoked(self, anchor: int) -> None:
+        pass
+
+    def _load_floor(self) -> dict[str, int]:
+        return {}
+
+    def _store_floor(self, dclass: str, max_packet: int) -> None:
         pass
 
     def valid(self, art: Artifact) -> bool:

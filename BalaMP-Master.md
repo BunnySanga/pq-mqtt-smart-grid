@@ -1362,7 +1362,7 @@ ends the contradiction with v2.1's own D14.
 | New policy version | All sessions and tickets are invalid after `activate_at`; devices re-handshake under the new policy |
 | Utility key rotation | A new policy carries the new public keys. The utility first **prepares** the matching private keys (held durably in its keyring: an HSM in production, the utility database in the prototype), then schedules the policy; a policy whose private keys it does not hold is refused at scheduling and at activation, before anything changes. The utility always operates with the keys its **active** policy names, so the policy and the keys in use can never disagree, also across a crash or restart. Commands and retained DR events queued before a command-key rotation are re-signed under the new key with the same `cmd_seq` / `bseq`. A device still on the old policy is recognised under the retired E2E key only to be refused and sent the current policy (E-4). DR-051 |
 | CA roll-over | A new policy carries {current, next} CA; the broker switches later |
-| Class profile change | Takes effect at the next connection |
+| Class profile change | Takes effect at the next connection. The class values that travel in MQTT CONNECT (Maximum Packet Size, Session Expiry, Keep Alive) take effect at the device's next **MQTT** connection, which the device makes itself when a newly installed policy changes them: once, at its §12 re-handshake time and before it re-establishes (the broker enforces what the live connection declared, and silently drops anything larger). The other class values apply at once. DR-052 |
 
 ---
 
@@ -1881,7 +1881,10 @@ chunk size: at 64 KiB chunks a 1 MiB image needs 128 B of proof per chunk.
 See §10.2 and the evidence in [DOCKER T1]: a device declaring a limit of 8,192 or 16,384 B never received the
 16,405 B manifest. The broker dropped it silently and the device stayed connected. v2.2 guarantees
 **every** FOTA message (manifest part or chunk) fits the target class's declared maximum, and the validator
-and publisher check it.
+and publisher check it. A device declares the class maximum of the policy it has **installed**, so a POLICY or
+KEYREVOKE (which must also reach devices still on an older policy) is sized to the smallest maximum the class has had
+under any policy the utility activated; FIRMWARE follows the current policy, and a device re-subscribes to the retained
+artifacts after a CONNECT that raised its maximum (DR-052).
 
 ## 15.10 A/B Slots
 
@@ -2974,6 +2977,19 @@ It had five steps:
 | **Trade-offs** | The keyring holds old private keys (prototype: the utility database, L16); a re-signed command carries a new σ over the same fields |
 | **Evidence** | `tests/security/test_key_rotation.py` (KEM, command and both keys; missing and mismatched keys; crash before and after the activation write; restarts; queued commands and DR events; duplicate and older policies; retired-key hellos) [SIM]; rollout through both main loops over the broker, then a device power cycle and a utility restart [DOCKER] |
 | **Future trigger** | HSM integration (§30) |
+
+## DR-052: CONNECT properties after a policy change
+
+| Field | Content |
+|---|---|
+| **Question** | When does a class's Maximum Packet Size, Session Expiry or Keep Alive change for a device that is connected when a new policy is activated (§12 "takes effect at the next connection")? |
+| **Options** | 1. **The device reconnects once when a newly installed policy changes a CONNECT value**, at its §12 re-handshake time and before it re-establishes. 2. Wait for the next natural reconnect. 3. The utility tracks each device's declared values |
+| **Decision** | **1**, plus two sizing rules at the utility: unicast messages follow the current policy (they go only to devices established under it, which reconnected first); POLICY and KEYREVOKE artifacts fit the class **delivery floor**, the smallest max_packet any policy the utility activated gave the class (a device still on an older policy must still receive the policy that updates it), persisted; FIRMWARE follows the current policy, and a device re-subscribes to retained artifacts after a CONNECT that raised its maximum. A policy that changes no CONNECT value causes no reconnect |
+| **Why** | The broker enforces what the live connection declared and drops anything larger silently [DOCKER T1]. Found by the independent release audit (H-2): after a policy raised c2_meter from 4,096 to 16,384 B, the NT answering a DF with an alert backlog was dropped and the device could not re-establish while its (healthy) connection lasted |
+| **Rejected** | 2: silent loss for as long as the connection lasts (indefinitely for PERSISTENT classes). 3: the declared values are not visible to the utility |
+| **Trade-offs** | One extra TCP + TLS + CONNECT per device per policy that changes a CONNECT value (spread by the §12 random delay); a raised max_packet benefits POLICY/KEYREVOKE artifacts only when every earlier policy allowed it |
+| **Evidence** | `tests/integration/test_connect_properties.py` [DOCKER, real Mosquitto]: the broker's own CONNECT log and forwarding behaviour — raise (backlog of 60 alerts, one reconnect, new Keep Alive, 10 kB forwarded afterwards, no reconnect storm), lower (10 kB dropped, 3 s session expiry applied), broker outage across the activation, device reboot, a policy with no CONNECT change (no reconnect), FIRMWARE and a DR event above the old limit delivered, a POLICY above the floor refused, floor kept across a utility restart |
+| **Future trigger** | An MQTT client stack that can update these values without a reconnect |
 
 ---
 

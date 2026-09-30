@@ -8,7 +8,9 @@ import re
 import shutil
 import socket
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import pytest
@@ -238,3 +240,37 @@ def plant(broker, tmp_path):
     p = Plant(broker, tmp_path)
     yield p
     p.close()
+
+
+# ---------------------------------------------------------------------------------------- the production loops
+class NoSpread:
+    """rng for the tests: the §12 random re-handshake delay and the back-off jitter become 0."""
+
+    def uniform(self, a, b):
+        return a
+
+
+@contextmanager
+def loops(plant, *devs, interval=0.05, rng=None):
+    """The utility's and the devices' main loops in threads, stopped (and joined) at the end."""
+    stop = threading.Event()
+    threads = [threading.Thread(target=plant.u.run, args=(stop, interval), daemon=True)]
+    for dev in devs:
+        dev.mq.rng = rng or NoSpread()
+        threads.append(threading.Thread(target=dev.mq.run, args=(stop, interval), daemon=True))
+    for t in threads:
+        t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(10)
+    for dev in devs:
+        assert dev.mq.internal_errors == [], dev.mq.internal_errors
+    assert plant.u.internal_errors == [], plant.u.internal_errors
+
+
+def start(plant):
+    plant.publish_acl()
+    plant.u.start()

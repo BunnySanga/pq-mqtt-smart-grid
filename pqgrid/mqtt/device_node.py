@@ -7,6 +7,10 @@
     is resent (S5); a refused resume is never answered (E49), so the device falls back to a full handshake.
     DF carries the outbox (I-19); NT/FIN acknowledges it; recovery reports are sent afterwards (§13.7).
   * Every reconnect waits a full-jitter back-off (§10.5). The TLS hop resumes with its session ticket (T2).
+  * CONNECT carries the INSTALLED policy's class values. When a new policy changes one of them, the device reconnects
+    once, at its §12 re-handshake time and before it re-establishes (DR-052, audit H-2): the broker enforces what the
+    live connection declared and drops anything larger silently. After a CONNECT that raised the maximum packet
+    size it re-subscribes to the retained FOTA topics, so artifacts dropped under the smaller limit arrive.
   * All protocol state is touched under one lock: paho delivers messages on its own thread.
   * run() is the device main loop (M9); each tick(): flash and intent housekeeping; FOTA (policy activation at
     activate_at, then a re-handshake after a random delay within the class back-off cap: §12; firmware trial
@@ -50,6 +54,8 @@ class TransportError(PqgridError):
 SETPOINT_ACK_EVERY_S = 30.0      # E-3 (§13.5): the cumulative SETPOINT ACK interval; a transport default
 ZONE_SYNC_RETRY_S = 10.0         # E-2: one outstanding zone sync per zone; retried after this if unanswered
 REPUBLISH_STALL_S = 600.0        # E-4: a verified download with no new chunk for this long asks for a republish
+PLANNED_FLUSH_S = 2.0            # H-2: how long a planned reconnect waits for the old connection's PUBACKs
+UNACKED_TRACKED = 256            # bound on the QoS 1 publishes tracked for that wait
 
 
 class _Client(mqtt.Client):
@@ -121,17 +127,47 @@ class DeviceMqtt:
         self.republish_requests = 0
         self.fota_staged: list[int] = []                      # artifact types staged since boot
         self._fota_subscribed = False                         # RAM: once per boot (retained re-delivery)
+        self._declared: Optional[tuple[int, int, int]] = None  # CONNECT properties the live connection declared
+        self.policy_reconnects = 0                            # planned reconnects after a CONNECT-property change
+        self._unacked: list = []                              # recent QoS 1 publishes not yet acknowledged
 
     # ------------------------------------------------------------------------------------------ connection
+    @staticmethod
+    def _connect_props(prof) -> tuple[int, int, int]:
+        """What the class profile puts into CONNECT: Maximum Packet Size, Session Expiry Interval, Keep Alive."""
+        return prof.max_packet, prof.session_expiry_s, prof.keepalive_s
+
     def connect(self, timeout: float = 10.0) -> None:
+        """CONNECT with the INSTALLED policy's class values (§12: a class profile change takes effect at the next
+        connection; _connection_step makes that connection as soon as a new policy changes them)."""
+        prof = self.d.profile
+        want = self._connect_props(prof)
+        if self._declared is not None and want[0] > self._declared[0]:
+            self._fota_subscribed = False                     # retained artifacts dropped under the smaller limit
+        self._props.MaximumPacketSize, self._props.SessionExpiryInterval = prof.max_packet, prof.session_expiry_s
         self.connected.clear()
-        self.c.connect(self.host, self.port, keepalive=self.d.profile.keepalive_s, clean_start=False,
-                       properties=self._props)
+        self.c.connect(self.host, self.port, keepalive=prof.keepalive_s, clean_start=False, properties=self._props)
         self.c.loop_start()
         if not self.connected.wait(timeout):
             raise TransportError("no CONNACK")
+        self._declared = want                                 # what the broker now enforces for this connection
         sock = self.c.socket()
         self.c.tls_session = getattr(sock, "session", None)  # T2: resume the TLS hop next time (RAM only)
+
+    def stale_connect_properties(self) -> bool:
+        """The live connection declared other CONNECT properties than the installed policy's class values."""
+        return self._declared is not None and self._declared != self._connect_props(self.d.profile)
+
+    def _planned_reconnect(self) -> None:
+        """H-2: a newly installed policy changed CONNECT properties. The broker enforces what the live connection
+        declared (a larger reply would be dropped silently, [DOCKER T1]), so the device reconnects once, before it
+        re-establishes: pending QoS 1 publishes get a short chance to be acknowledged (everything that matters is
+        also in the outbox or redelivered by the utility), then DISCONNECT and an immediate CONNECT (no back-off)."""
+        self.flush(PLANNED_FLUSH_S)
+        self.disconnect()
+        self.connected.clear()
+        self._reconnect_at = time.monotonic()
+        self.policy_reconnects += 1
 
     def _reconnect_step(self) -> bool:
         """§10.5 across main-loop ticks (final remediation): before every (re)connect a full-jitter delay whose
@@ -191,6 +227,16 @@ class DeviceMqtt:
         self.c.disconnect()
         self.c.loop_stop()
 
+    def flush(self, timeout: float) -> bool:
+        """True once every QoS 1 message published on this connection has been acknowledged by the broker."""
+        end = time.monotonic() + timeout
+        for info in list(self._unacked):
+            try:
+                info.wait_for_publish(max(0.0, end - time.monotonic()))
+            except (RuntimeError, ValueError):
+                return False
+        return all(i.is_published() for i in self._unacked)
+
     def _on_connect(self, client, userdata, flags, rc, props):
         self.session_present = bool(flags.session_present)
         if not self.session_present:                         # first connect, or the broker lost the session
@@ -237,6 +283,7 @@ class DeviceMqtt:
         info = self.c.publish(topic, payload, qos=1)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise TransportError(f"publish failed: {mqtt.error_string(info.rc)}")
+        self._unacked = [i for i in self._unacked if not i.is_published()][-UNACKED_TRACKED:] + [info]
 
     # ------------------------------------------------------------------------------------- establishment
     def _exchange(self, msg: bytes, accept: Callable[[bytes], object]):
@@ -339,10 +386,9 @@ class DeviceMqtt:
     def _install_policy(self, p) -> None:
         self.d.install_policy(p)                              # the old session and ticket are now useless
         prof = self.d.profile
-        self._props.SessionExpiryInterval, self._props.MaximumPacketSize = prof.session_expiry_s, prof.max_packet
         if self.outbox is not None:
             self.outbox.cap = prof.outbox_cap                 # the budget require_capacity() just checked
-        self._rehandshake_at = time.monotonic() + self._spread()
+        self._rehandshake_at = time.monotonic() + self._spread()   # CONNECT values: at the planned reconnect
 
     def _spread(self) -> float:
         """§12: re-handshake after a random delay within the class back-off cap (no reconnection storm)."""
@@ -364,6 +410,9 @@ class DeviceMqtt:
             self._sp_acked, self._sp_acked_at = cur, time.monotonic()
 
     def _connection_step(self) -> None:
+        if (self.connected.is_set() and self.stale_connect_properties()
+                and time.monotonic() >= self._rehandshake_at):
+            self._planned_reconnect()                         # H-2: at the §12 spread time, before re-establishing
         if not self._reconnect_step():                        # §10.5: waiting for the next attempt
             return
         self._republish_step()
