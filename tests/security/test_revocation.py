@@ -129,3 +129,44 @@ def test_revocation_drops_the_half_open_handshake(world: World):
     assert D1 in world.utility._pending
     world.utility.revoke_device(D1)
     assert D1 not in world.utility._pending                                # nothing of it stays in RAM
+
+
+def test_a_crash_between_revocation_and_zone_removal_still_locks_the_device_out_of_the_zone(tmp_path):
+    """H1 crash window: UtilityMqtt.revoke_device makes the registry revocation durable, then removes the device from
+    its zones (new keys). A utility crash between the two left the revoked device a member HOLDING THE CURRENT ZONE
+    KEY after the restart, so it could read every DR event published afterwards (until the weekly rotation). The
+    restarted utility must finish the removal: no longer a member, new group keys."""
+    import conftest
+    from pqgrid.commands import CommandProcessor
+    from pqgrid.e2e.handshake import DeviceEndpoint
+    from pqgrid.persistence.utility_db import open_utility
+    from pqgrid.policy import validate
+    from pqgrid.registry import DeviceRecord
+    from pqgrid.suite.hkem import HybridKeyPair
+    from pqgrid.suite.sig import mldsa_keygen, mldsa_public_bytes
+    t, path = [1_790_000_000.0], str(tmp_path / "u.db")
+    u_static, cmd_sk = HybridKeyPair.generate(), mldsa_keygen()
+    policy = conftest.make_policy(u_static.pk, mldsa_public_bytes(cmd_sk))
+    validate(policy)
+    node = open_utility(path, policy, u_static, cmd_sk, lambda: t[0])
+    kp = HybridKeyPair.generate()
+    node.endpoint.registry.add(DeviceRecord(D1, "der_ctrl", kp.pk))
+    d1 = DeviceEndpoint(D1, "der_ctrl", policy, 1, kp, clock=lambda: t[0])
+    d1.on_server_hello(node.endpoint.on_client_hello(D1, d1.client_hello()))
+    d1.on_final(node.endpoint.on_finished(D1, d1.finished()).final)
+    p1 = CommandProcessor(d1, lambda c: None)
+    node.zones.create("f7")
+    node.zones.add_member("f7", D1)
+    p1.on_control(control_topic("der_ctrl", D1), node.zones.distribute("f7")[D1])   # D1 holds the zone key
+    epoch = node.zones.zones["f7"].groups[AeadAlg.CHACHA20POLY1305].key_epoch
+    node.endpoint.revoke_device(D1)                        # durable revocation … then the utility crashes
+    node.db.close()
+    node = open_utility(path, policy, u_static, cmd_sk, lambda: t[0])               # restart
+    z = node.zones.zones["f7"]
+    assert D1 not in z.members                                                        # the removal was finished,
+    assert z.groups[AeadAlg.CHACHA20POLY1305].key_epoch > epoch                       # with new keys: D1's is old
+    node.db.close()
+    node = open_utility(path, policy, u_static, cmd_sk, lambda: t[0])               # and only once:
+    assert node.zones.zones["f7"].groups[AeadAlg.CHACHA20POLY1305].key_epoch == z.groups[
+        AeadAlg.CHACHA20POLY1305].key_epoch                                           # no rotation at every start
+    node.db.close()

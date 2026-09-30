@@ -160,6 +160,14 @@ class ZoneManager:
         self.alarms: list[tuple] = []                          # retention overflow (M4): never silent
         self._last_sync: dict[tuple[bytes, str], int] = {}     # (device, zone) → time of the last sync answer
         self.zones: dict[str, Zone] = self._load()
+        self._finish_revocations()
+
+    def _finish_revocations(self) -> None:
+        """H1 at start: revocation is made durable in the registry before the device leaves its zones. A crash in
+        between left a revoked member holding the CURRENT zone key after the restart, able to read every event
+        published afterwards; it leaves its zones now, with new keys (the others get them when they establish)."""
+        for did in sorted({d for z in self.zones.values() for d in z.members if not self.svc.u.active(d)}):
+            self.remove_device(did)
 
     # persistence hooks (persistence.utility_db); in memory they do nothing
     def _load(self) -> dict[str, Zone]:
