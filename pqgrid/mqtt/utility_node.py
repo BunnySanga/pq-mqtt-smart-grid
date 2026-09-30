@@ -123,7 +123,10 @@ class UtilityMqtt:
                     self._handshake(did, payload)
                 elif kind == "alert":
                     self._alert_topic(did, m.topic, payload)
-                elif kind == "telemetry":
+                elif kind == "telemetry":                            # hop-only tier: the broker ACL admits it,
+                    rec = self.n.endpoint.registry.get(did)          # the registry decides (H1: revocation must
+                    if rec is None or not rec.active or rec.dclass != cls:   # not wait for an ACL recompile)
+                        raise ValueError("telemetry from an unknown or revoked device, or on another class's topic")
                     self.telemetry.append((did, payload))
                 elif kind == "status" and payload == b"online":
                     self._connects(did)

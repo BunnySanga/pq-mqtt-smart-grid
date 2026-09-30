@@ -312,6 +312,9 @@ def test_H1_live_revocation_over_the_broker_without_any_acl_change(plant):
     assert all(p != b"after revocation" for _, p, _ in plant.u.alerts)
     with pytest.raises(CommandError, match="revoked"):
         plant.u.command(D1, b"TRIP", 300)
+    d1.mq.send_telemetry(b"reading after revocation")                        # hop-only tier: the ACL still
+    assert wait_for(lambda: any("telemetry" in r and "revoked" in r for r in plant.u.refused))   # lets it in, the
+    assert (D1, b"reading after revocation") not in plant.u.telemetry         # utility (registry) does not
     cc = AeadAlg.CHACHA20POLY1305
     assert wait_for(lambda: d2.mq.proc.zones._keys.get(("f7", cc)) and max(d2.mq.proc.zones._keys[("f7", cc)]) ==
                     plant.node.zones.zones["f7"].groups[cc].key_epoch)       # D2 got the new key
