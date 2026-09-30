@@ -289,7 +289,7 @@ too (§23.7).
 | Device-side validation | Chain to the **pinned CA set**, with **validity-time checks disabled** (`X509_V_FLAG_NO_CHECK_TIME` or equivalent; verified [DOCKER T4-d]). Hostname/SAN checked |
 | Broker-side validation | Normal, including time: the broker has a correct clock |
 | Revocation | Registry deactivation (durable first) → every live session and half-open handshake of the device closed at once, its ALERTs, status ACKs and new commands refused, the device removed from its zones and every crypto-group key of those zones rotated → ACL removal (SIGHUP). E2E refusal never depends on the ACL step (tested P9, H1 [DOCKER, broker with no ACL change]). Optional CRL file at the broker |
-| CA roll-over | The new CA certificate travels in a signed policy **before** the broker switches. Devices pin {current, next} during the overlap (Rationale OPS-1): a device's TLS trust anchors **are** its installed policy's `ca_set` (read back from flash with the policy, §15.11), so the new set applies from its next connection. The broker's client-CA file holds both CAs during the overlap; the utility's trust store is operator configuration. Tested over the broker: a device on the new policy follows the broker's switch to a next-CA certificate (also after a reboot), a device still on the old policy is refused by TLS [DOCKER] |
+| CA roll-over | The new CA certificate travels in a signed policy **before** the broker switches. Devices pin {current, next} during the overlap (Rationale OPS-1): a device's TLS trust anchors **are** its installed policy's `ca_set` (read back from flash with the policy, §15.11), so the new set applies from its next connection. The broker's client-CA file holds both CAs during the overlap; the utility's trust store is operator configuration. Tested over the broker: a device on the new policy follows the broker's switch to a next-CA certificate (also after a reboot), a device still on the old policy is refused by TLS [DOCKER, substitute] |
 
 ## 4.6 Firmware Authority
 
@@ -1023,7 +1023,7 @@ For device-class cycles see §22.1.
 | Device reboot (RAM lost) | PASR resume from the flash ticket; outbox resent in DF | Resume | Session back; alerts delivered once (dedup by alert ID) |
 | Reboot between RS and NT | No ticket (single-use), so a full handshake next time | — | Graceful |
 | Reboot after RH was processed | Resend the **stored identical RH** if it survived; otherwise full handshake | "ticket already used" for a *rebuilt* RH [DOCKER S5] | Graceful; costs one full handshake |
-| Utility restart | Next envelope gets a resync hint, then a resume | Sessions lost; STEK, used tickets, command sequences and queue **persisted**, and the rollout state (active and scheduled policy, published artifacts, U-4) [SIM, DOCKER] | Recovers; unacknowledged alerts resent; unacknowledged commands redelivered; a rollout continues under the policy it activated |
+| Utility restart | Next envelope gets a resync hint, then a resume | Sessions lost; STEK, used tickets, command sequences and queue **persisted**, and the rollout state (active and scheduled policy, published artifacts, U-4) [SIM, DOCKER, substitute] | Recovers; unacknowledged alerts resent; unacknowledged commands redelivered; a rollout continues under the policy it activated |
 | Utility crash mid-write | — | SQLite WAL: a transaction commits entirely or not at all | No torn state (v2.1's JSON files failed here [DOCKER S3]) |
 | Crash between command receipt and actuation | Intent log: PENDING without APPLIED → **INTERRUPTED** reported | Re-issues (as a new command) or cancels | No silent loss, no false "OK" (§13.7) |
 | Broker restart | Full TLS; persistent MQTT sessions survive with `persistence true` | — | Retained artifacts survive (verified N5) |
@@ -1943,7 +1943,7 @@ An overwrite-only bootloader cannot revert, so two slots are needed.
   other of two policy areas (like the firmware slots) and replaces the installed one in the commit's single write;
   the device boots with it, re-checked against that digest. Without it a reboot after a policy update left the
   device on its factory policy, which the utility refuses, while anti-rollback refused the current one: a lock-out
-  (found and fixed in the continuous audit, IMPLEMENTATION-ROADMAP §14, C1-8) [SIM, DOCKER].
+  (found and fixed in the continuous audit, IMPLEMENTATION-ROADMAP §14, C1-8) [SIM, DOCKER, substitute].
 - Tested: firmware rollback and replay (F4, F5), policy rollback (F6), failed boot → revert with the counter
   unchanged, rollback still blocked.
 
@@ -2147,7 +2147,7 @@ It had five steps:
 
 | Label | Meaning |
 |---|---|
-| **[DOCKER]** | Measured in the project container (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, Python 3.13.5, `cryptography` 50.0.1, paho-mqtt 2.1.0) on an Apple-silicon laptop. **Not** a device measurement. **[DOCKER, substitute]**: the 2026-09-30 release audit and its remediation ran in a SUBSTITUTE container because the canonical one could not be built (Docker Hub 429 / Debian mirrors 403): Ubuntu 25.10, OpenSSL 3.5.3, Mosquitto 2.0.22, Python 3.13.7, same Python pins (`docker/substitute-ubuntu.Dockerfile`). Equivalence with the canonical container is **not** demonstrated |
+| **[DOCKER]** | Measured in the project container (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, Python 3.13.5, `cryptography` 50.0.1, paho-mqtt 2.1.0) on an Apple-silicon laptop. **Not** a device measurement. **[DOCKER, substitute]**: the 2026-09-30 continuous audit (cycles 1–3, IMPLEMENTATION-ROADMAP §14), the release audit and its remediation (§15) ran in a SUBSTITUTE container because the canonical one could not be built (Docker Hub 429 / Debian mirrors 403): Ubuntu 25.10, OpenSSL 3.5.3, Mosquitto 2.0.22, Python 3.13.7, same Python pins (`docker/substitute-ubuntu.Dockerfile`). Equivalence with the canonical container is **not** demonstrated |
 | **[SIM]** | Docker plus a modelled link (one-way delay, serialisation rate, TCP handshake RTT). Not NB-IoT, not an MCU |
 | **[LIT]** | From a named paper, standard or datasheet; the source's hardware is always stated (§32) |
 | **[ANALYTICAL]** | Calculated from [LIT]/[DOCKER] inputs in `constrained-audit/analysis.py`; lower bounds where stated |
@@ -2995,11 +2995,11 @@ It had five steps:
 |---|---|
 | **Question** | How does the utility move to new E2E and command keys that a new policy names (§12 Policy Updates, §4.7, §23.7)? |
 | **Options** | 1. **Prepared keys, selected by the active policy**: the utility holds a keyring of private keys (current and prepared), and uses the pair whose public keys its active policy names. 2. A separate "active key" record switched at activation. 3. Private keys delivered inside the policy |
-| **Decision** | **1**. A policy whose private keys the utility does not hold is refused when scheduled and when activated (before any state changes); a utility is never started on a policy whose keys it does not hold. Commands and retained DR events signed before a command-key rotation are re-signed under the active key with the same `cmd_seq` / `bseq` before they are sent (the device classifies by sequence, and verifies with the key of its installed policy). The E2E endpoint keeps the two most recent retired E2E keys only to **recognise** a client hello from a device still on an older policy, refuse it as such and republish the current policy (E-4 trigger 2); a hello under a retired key never establishes a session |
+| **Decision** | **1**. A policy whose private keys the utility does not hold is refused when scheduled and when activated (before any state changes); a utility is never started on a policy whose keys it does not hold. Commands and retained DR events signed before a command-key rotation are re-signed under the active key with the same `cmd_seq` / `bseq` before they are sent (the device classifies by sequence, and verifies with the key of its installed policy). The E2E endpoint keeps a **recognition list** of at most two keyring E2E keys other than the active one, only to **recognise** a client hello from a device still on an older policy, refuse it as such and republish the current policy (E-4 trigger 2); a hello under any key on that list never establishes a session. The list is taken at utility start and at every activation: the two keys most recently added to the keyring, other than the active key. After the documented procedure (prepare the next key, then schedule and activate the policy naming it) these are the two most recently **retired** keys. A key that is **prepared but not yet active** is not retired, yet it also takes a place on the list: while one such key exists (e.g. a utility restart between preparing and activating it) only the most recently retired key is recognised; with keys prepared two or more rotations ahead of their policies, no retired key may be recognised |
 | **Why** | The persisted active policy is the single record of which keys are in use, so a crash or restart can never leave the policy naming one key while the utility uses another. Found by the independent release audit (H-1): activating a policy with new keys used to succeed while the utility kept its old keys, which refused every device's handshake |
 | **Rejected** | 2: a second record that a crash can leave inconsistent with the policy. 3: private keys must never travel in a broadcast artifact |
-| **Trade-offs** | The keyring holds old private keys (prototype: the utility database, L16); a re-signed command carries a new σ over the same fields |
-| **Evidence** | `tests/security/test_key_rotation.py` (KEM, command and both keys; missing and mismatched keys; crash before and after the activation write; restarts; queued commands and DR events; duplicate and older policies; retired-key hellos) [SIM]; rollout through both main loops over the broker, then a device power cycle and a utility restart [DOCKER] |
+| **Trade-offs** | The keyring holds old private keys (prototype: the utility database, L16); a re-signed command carries a new σ over the same fields. Recognition limit: a device on an older policy whose key is not on the recognition list (more than two rotations behind, or pushed off the list by keys prepared ahead) has its hello refused as unauthenticated rather than as old-policy, so E-4 trigger 2 does not republish the current policy to it; it still receives the retained POLICY while that is retained. No security effect: such a hello never yields a session |
+| **Evidence** | `tests/security/test_key_rotation.py` (KEM, command and both keys; missing and mismatched keys; crash before and after the activation write; restarts; queued commands and DR events; duplicate and older policies; retired-key hellos) [SIM]; rollout through both main loops over the broker, then a device power cycle and a utility restart [DOCKER, substitute] |
 | **Future trigger** | HSM integration (§30) |
 
 ## DR-052: CONNECT properties after a policy change
@@ -3642,10 +3642,28 @@ The project **must not** claim:
 | B-3 | Start with `OPENSSL_CONF` → `Groups = X25519MLKEM768:SecP256r1MLKEM768` |
 | B-4 | `acl_file` generated by the ACL compiler from the signed policy + registry; SIGHUP reload |
 | B-5 | `persistence true`; persistence location on durable storage |
-| B-6 | `max_packet_size 300000`; queue limits (`max_queued_messages`) sized for class command queues |
+| B-6 | `max_packet_size 300000`; an explicit per-client queue limit, `max_queued_messages 1000` (the value Mosquitto 2.0 also uses when the option is absent [DOCKER, substitute: 1,100 QoS 1 messages queued for an offline persistent session with the option unset, 1,000 delivered], now set explicitly and required by the config validator); sizing below |
 | B-7 | `set_tcp_nodelay true` (without it every handshake stalls ~40–90 ms, measured) |
 | B-8 | Allow the Session Expiry Intervals the class policies request |
 | B-9 | Logging of connection failures, takeovers ("already connected") and TLS errors, feeding monitoring (§27.8) |
+
+**B-6 queue sizing** [ANALYTICAL]. `max_queued_messages` bounds the QoS 1 messages the broker holds for one client
+whose persistent session is offline (or cannot take them yet); beyond it the broker drops new messages for that
+client. 1,000 per client is sized for:
+- **A sleeping device.** Its queue holds its CONTROL messages (commands, GRANTs, SETPOINTs, ZONEKEYs) and the DR
+  events of its zones' group topics. Commands are few per device per day (the §22.2 sizing assumes ~3 a day), and at
+  most 32 command intents are open on the device at once (H2). DR events: the utility keeps at most 64 still-valid
+  events per zone and a device belongs to at most 16 zones (budget, §16), so the theoretical worst case is
+  16 × 64 = 1,024 events, just above the limit; a typical device is in a few zones (a few hundred at most).
+- **The utility's own client while it restarts.** Device → utility messages (handshakes, alerts, telemetry) queued
+  for it are bounded per client too, so in a large fleet a long utility outage exceeds 1,000.
+
+What overflow costs (nothing in the protocol's correctness depends on the queue): a dropped CONTROL message is
+redelivered from the utility's commands table (U-3); a dropped DR event that is still valid is re-sent at the
+device's next establishment under its current key (§11, M4); a dropped ALERT stays in the device outbox until its
+end-to-end ACK and is resent in the next DF (§9.4); a dropped handshake message is retried by the device (§10.5).
+Only TELEMETRY (hop-only, §11) is lost when dropped. The value is not measured under a production fleet: a deployment
+sizes it from its own sleep intervals, zone counts and utility outage budget.
 
 ## 27.2 Device
 
