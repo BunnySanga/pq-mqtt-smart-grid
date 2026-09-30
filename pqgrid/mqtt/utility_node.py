@@ -27,7 +27,7 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from ..e2e.handshake import UnknownSessionError
-from ..errors import EnvelopeError, PolicyMismatchError, PqgridError
+from ..errors import EnvelopeError, PolicyError, PolicyMismatchError, PqgridError
 from ..suite.kdf import ct_eq
 from ..wire import peek_tag
 from . import topics
@@ -63,6 +63,7 @@ class UtilityMqtt:
         self.takeover_alarms: list[bytes] = []
         self._online: dict[bytes, deque] = {}
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
+        self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
         self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
         self.ticks = 0                                                 # completed main-loop steps
         self.zone_syncs: list[tuple[bytes, str]] = BoundedLog()        # answered zone sync requests (E-2)
@@ -270,6 +271,7 @@ class UtilityMqtt:
         hold is refused before anything changes (KeyringError)."""
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
+        revoked = self.revoked_anchors() | set(revoked)             # M-1: the revocations of NOW, not a snapshot
         p = verify_policy_artifact(signed, payload, anchors, revoked)
         if self.clock() < p.activate_at:
             return False
@@ -291,11 +293,40 @@ class UtilityMqtt:
         """Keep a verified policy until its activate_at; tick() activates it (§12 Policy Distribution)."""
         from ..fota.policy_artifact import verify_policy_artifact
         from ..policy import validate
+        revoked = frozenset(self.revoked_anchors() | set(revoked))    # M-1: the utility's authoritative set
         p = verify_policy_artifact(signed, payload, anchors, revoked)  # a bad artifact is refused now …
         validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer …
         self.n.keyring.keys_for(p)                                     # … or whose private keys are not held
         self.n.db.save_policy("scheduled", signed, payload, anchors, revoked)   # survives a restart (U-4)
-        self._scheduled = (signed, payload, anchors, frozenset(revoked))
+        self._scheduled = (signed, payload, anchors, revoked)
+
+    def revoked_anchors(self) -> set:
+        """The utility's authoritative revoked anchors (audit M-1, DR-050 as amended): what its published
+        KEYREVOKEs revoked, durable in its database. Every policy that is not yet in force is checked against this
+        set when it is scheduled, when it is activated (tick() re-checks a scheduled one), after a restart, when an
+        ACL is compiled for it and when it would be republished. The policy already in force is not re-judged: like a
+        device's installed policy it stays until a newer one (signed by the release anchor of the day) replaces it."""
+        out = set(self.n.db.revoked_anchors())
+        if self.publisher is not None:
+            out |= self.publisher.current_revoked()
+        return out
+
+    def acl_text(self, bootstrap=None) -> str:
+        """The broker ACL for the policy in force (U-8, B-4): compiled from its signed artifact (the stored active one,
+        or `bootstrap` = (signed, payload, anchors) before any activation), the registry and zone membership. A policy
+        in force is verified with the revocations it was activated under (DR-050 as amended); compile_acl() with the
+        current set is what refuses a new policy signed by a revoked anchor."""
+        from .broker import compile_acl
+        stored = self.n.db.load_policy("active")
+        if stored is not None:
+            signed, payload, anchors, revoked = stored
+        elif bootstrap is not None:
+            (signed, payload, anchors), revoked = bootstrap, frozenset()
+        else:
+            raise PolicyError("no activated policy artifact: pass the bootstrap POLICY artifact")
+        with self.lock:
+            members = {n: set(z.members) for n, z in self.n.zones.zones.items()}
+            return compile_acl(signed, payload, anchors, self.n.endpoint.registry.records(), members, revoked)
 
     # ------------------------------------------------------------------------------------------ main loop
     def run(self, stop: threading.Event, interval: float = 1.0) -> None:
@@ -328,6 +359,18 @@ class UtilityMqtt:
                 self.publisher.cleanup(self.c)
             self.n.endpoint.sweep()
         self.ticks += 1
+
+    def _recheck_scheduled(self) -> None:
+        """After a restart: a scheduled policy is re-verified against the revocations of now (M-1)."""
+        from ..fota.policy_artifact import verify_policy_artifact
+        if self._scheduled is None:
+            return
+        signed, payload, anchors, _ = self._scheduled
+        try:
+            verify_policy_artifact(signed, payload, anchors, self.revoked_anchors())
+        except PqgridError as e:
+            self._forget_scheduled()
+            self.refused.append(f"scheduled policy refused after a restart: {e}")
 
     def _forget_scheduled(self) -> None:
         self.n.db.drop_policy("scheduled")

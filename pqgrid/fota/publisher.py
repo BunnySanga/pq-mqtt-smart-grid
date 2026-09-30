@@ -126,11 +126,15 @@ class Publisher:
     def _store_floor(self, dclass: str, max_packet: int) -> None:
         pass
 
+    def current_revoked(self) -> set:
+        """Revoked anchors as of now (persistence.utility_db.SqlPublisher: the utility's authoritative set)."""
+        return set(self.revoked)
+
     def valid(self, art: Artifact) -> bool:
         """Still valid NOW: signer not revoked and in its role (DR-050), and a POLICY not older than the active."""
         m = art.manifest
         try:
-            check_signer(m.type, m.signer_anchor_id, self.revoked)
+            check_signer(m.type, m.signer_anchor_id, self.current_revoked())
         except FotaError:
             return False
         return not (m.type == POLICY and m.version < self.policy.version)

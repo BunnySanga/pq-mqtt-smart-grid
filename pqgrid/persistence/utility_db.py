@@ -136,6 +136,15 @@ class UtilityDB:
     def drop_policy(self, slot: str) -> None:
         self.execute("DELETE FROM policy_state WHERE slot = ?", (slot,))
 
+    # ------------------------------------------------------------------ revoked anchors (DR-050 as amended)
+    def revoked_anchors(self) -> frozenset:
+        """The utility's ONE authoritative set of revoked anchors (audit M-1): every anchor a KEYREVOKE published by
+        this utility revoked, durable before the broker was told."""
+        return frozenset(a for (a,) in self.execute("SELECT anchor FROM revoked_anchors"))
+
+    def add_revoked(self, anchor: int) -> None:
+        self.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
+
     def backup_to(self, path: str) -> None:
         """A consistent copy (for restore tests: V-S1)."""
         dst = sqlite3.connect(path)
@@ -331,7 +340,7 @@ class SqlPublisher(Publisher):
             self.newest[(dclass, t)] = art
             if at is not None:
                 self.live[(dclass, t)] = Published(art, [x.decode() for x in dec_list(topics, MAX_TOPICS)], at)
-        self.revoked = {a for (a,) in db.execute("SELECT anchor FROM revoked_anchors")}
+        self.revoked = set(db.revoked_anchors())
 
     def _store(self, key: tuple[str, int], art: Artifact, retained) -> None:
         topics = None if retained is None else enc_list([t.encode() for t in retained.topics], MAX_TOPICS)
@@ -340,7 +349,10 @@ class SqlPublisher(Publisher):
                          enc_list(art.chunks, MAX_CHUNKS), None if retained is None else retained.at, topics))
 
     def _store_revoked(self, anchor: int) -> None:
-        self.db.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
+        self.db.add_revoked(anchor)
+
+    def current_revoked(self) -> set:
+        return set(self.db.revoked_anchors()) | self.revoked
 
     def _load_floor(self) -> dict[str, int]:
         return {dclass: mp for dclass, mp in self.db.execute("SELECT dclass, max_packet FROM class_floor")}
@@ -406,7 +418,7 @@ def open_utility(path: str, policy, static, cmd_key, clock) -> UtilityNode:
     stored = db.load_policy("active")
     if stored is not None:
         from ..fota.policy_artifact import verify_policy_artifact
-        active = verify_policy_artifact(*stored)
+        active = verify_policy_artifact(*stored)           # its activation-time revocations: in force until superseded
         if active.version > policy.version:
             policy = active
     static, cmd_key = keyring.keys_for(policy)
