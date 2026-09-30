@@ -274,7 +274,9 @@ class UtilityMqtt:
     def schedule_policy(self, signed: bytes, payload: bytes, anchors: dict, revoked=frozenset()) -> None:
         """Keep a verified policy until its activate_at; tick() activates it (§12 Policy Distribution)."""
         from ..fota.policy_artifact import verify_policy_artifact
-        verify_policy_artifact(signed, payload, anchors, revoked)    # a bad artifact is refused now
+        from ..policy import validate
+        p = verify_policy_artifact(signed, payload, anchors, revoked)  # a bad artifact is refused now …
+        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer
         self._scheduled = (signed, payload, anchors, frozenset(revoked))
 
     # ------------------------------------------------------------------------------------------ main loop
@@ -290,8 +292,17 @@ class UtilityMqtt:
             stop.wait(interval)
 
     def tick(self) -> None:
-        if self._scheduled is not None and self.activate_policy(*self._scheduled):
-            self._scheduled = None
+        from .guard import EXPECTED
+        if self._scheduled is not None:
+            try:
+                if self.activate_policy(*self._scheduled):
+                    self._scheduled = None
+            except EXPECTED as e:
+                # A refusal is final (its signature, the anchors and the installed version can only keep it
+                # refused, e.g. a newer policy was activated meanwhile): drop it, as the device's installer does,
+                # so it cannot abort the housekeeping below on every tick.
+                self._scheduled = None
+                self.refused.append(f"scheduled policy refused at activation: {e}")
         with self.lock:
             for zone in self.n.zones.rotate_due(ZONE_ROTATE_EVERY_S):
                 self._send_zone_keys(zone)
