@@ -6,7 +6,9 @@ max_packet_size of at most 300,000 B (§10.2). The TLS 1.2 case matters: the hyb
 [DOCKER T7], so a TLS 1.2 listener would silently fall back to classical key exchange.
 
 The ACL is generated, never hand-edited: one block per active device (its own topics only), zone read rights from
-membership, and a least-privilege utility block. A revoked device simply has no block. It is written atomically
+membership, and a least-privilege utility block. A revoked device simply has no block, nor has one whose class
+the policy does not define (a comment line says why); one such record never stops the fleet's ACL from being
+recompiled. It is written atomically
 and the broker reloads it on SIGHUP (verified in v2.1: no restart needed). The compiler accepts the policy only as
 a verified POLICY artifact (§10.1 "verifies the policy signature"; E13 closed in slice 6).
 """
@@ -110,7 +112,10 @@ def render_acl(policy, registry_records, zone_members: dict[str, set[bytes]], ut
     for rec in sorted(registry_records, key=lambda r: r.device_id):
         if not rec.active:
             continue                                              # revoked: no rights at all
-        alg = policy.profile(rec.dclass).aead                     # a class the policy does not know is refused
+        if rec.dclass not in policy.classes:                      # it could not establish under this policy: no
+            out += ["", f"# no rights for {rec.device_id.decode()}: class {rec.dclass!r} is not in the policy"]
+            continue                                              # rights, and the rest of the fleet's ACL is still
+        alg = policy.profile(rec.dclass).aead                     # written (raising left the broker on a stale ACL)
         did, cls = rec.device_id, rec.dclass
         out += ["", f"user {did.decode()}",
                 f"topic write {topics.telemetry(cls, did)}", f"topic write {topics.alert(cls, did)}",

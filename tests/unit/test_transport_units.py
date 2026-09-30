@@ -11,7 +11,6 @@ from pqgrid.mqtt.utility_node import publish_size
 from pqgrid.persistence.device import DeviceFlash
 from pqgrid.persistence.flash import FlashSim
 from pqgrid.e2e.handshake import DeviceEndpoint
-from pqgrid.errors import PolicyError
 from pqgrid.registry import DeviceRecord
 from pqgrid.suite.aead import AeadAlg
 
@@ -81,10 +80,20 @@ def test_acl_gives_each_device_only_its_own_topics(world: World):
     assert "readwrite" not in util and "topic write pqgrid/hs/+/down" in util and "topic read pqgrid/hs/+/up" in util
 
 
-def test_acl_refuses_a_device_whose_class_is_not_in_the_policy(world: World):
-    rec = DeviceRecord(b"x-0001", "unknown_class", b"\x00" * 1216)
-    with pytest.raises(PolicyError, match="unknown_class"):
-        render_acl(world.policy, [rec], {})
+def test_acl_gives_no_rights_to_a_device_whose_class_is_not_in_the_policy(world: World):
+    """Fail closed per device, never fail stale for the fleet: a device whose class the policy does not define gets
+    no block (it could not establish anyway), and everyone else's rights are still written. Raising instead left
+    the broker on the PREVIOUS ACL, including the rights of devices revoked since."""
+    world.device(b"der-0001", "der_ctrl")
+    world.device(b"meter-0002", "smart_meter")
+    world.registry.revoke(b"meter-0002")
+    recs = [DeviceRecord(b"x-0001", "unknown_class", b"\x00" * 1216)] + \
+        [world.registry.get(d) for d in (b"der-0001", b"meter-0002")]
+    acl = render_acl(world.policy, recs, {})
+    blocks = {b.split("\n", 1)[0]: b for b in acl.split("\n\n")}
+    assert "user x-0001" not in blocks and "user meter-0002" not in blocks
+    assert "topic read grid/der_ctrl/der-0001/control" in blocks["user der-0001"]
+    assert "# no rights for x-0001: class 'unknown_class' is not in the policy" in acl
 
 
 def test_publish_size_is_exact():

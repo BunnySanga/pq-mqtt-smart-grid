@@ -1314,3 +1314,10 @@ under contention: three concurrent full integration runs, 41/41 each [DOCKER].
 policy on old zone keys after a crash (C2-5), a DF's alerts flagged as duplicates after a failed persist (C2-6), a
 revoked device's TELEMETRY accepted until the ACL changes (C2-7); one weak test of cycle 1 (C2-2); fuzzing of the
 later message types found nothing (C2-1). Full suite 535 → 545, v2.1 80/80 throughout. What remains is in §14.1.
+
+**Cycle 3 (fresh scan).** Secrets at rest checked: SQLite gives the WAL and SHM files of the utility database (which
+holds the STEK) the database's 0600 mode [DOCKER]; no change.
+
+| # | Area | Finding | Change | Test | Label |
+|---|---|---|---|---|---|
+| C3-1 | ACL compiler (§10.1, K-5) | One registry record whose class the policy does not define (e.g. a class dropped by a new policy while its devices are still registered) made `render_acl` raise for the whole fleet. The broker then kept its **previous** ACL: fail-stale, not fail-closed, including the rights of devices revoked since the last compile; the activation's ACL hook also raised after the policy was already active. The test pinned the raise | Such a device gets no block (a comment line says why); every other device's rights are still written | `test_acl_gives_no_rights_to_a_device_whose_class_is_not_in_the_policy` (replaces the test that expected the raise) | [SIM] |
