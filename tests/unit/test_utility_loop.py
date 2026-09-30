@@ -146,3 +146,20 @@ def test_a_crash_while_activating_never_leaves_the_new_policy_on_the_old_zone_ke
     assert node.endpoint.policy.version == 1 and epoch(node) == e0     # nothing half done
     u.tick()                                                           # the scheduled activation, again
     assert node.endpoint.policy.version == 2 and epoch(node) == e0 + 1
+
+
+@requires_station
+def test_telemetry_is_accepted_only_from_an_active_device_on_its_own_class_topic(util):
+    """H1 / K-5 through paho's callback (no broker): TELEMETRY is hop-only, so the utility's registry decides."""
+    u, node, now, signed, restart = util
+
+    class Msg:                                                         # what paho hands the callback
+        def __init__(self, topic, payload):
+            self.topic, self.payload = topic, payload
+    u.c.on_message(None, None, Msg("grid/der_ctrl/der-0001/telemetry", b"r1"))
+    u.c.on_message(None, None, Msg("grid/smart_meter/der-0001/telemetry", b"r2"))   # another class's topic
+    u.c.on_message(None, None, Msg("grid/der_ctrl/der-0404/telemetry", b"r3"))      # unknown device
+    node.endpoint.revoke_device(b"der-0001")
+    u.c.on_message(None, None, Msg("grid/der_ctrl/der-0001/telemetry", b"r4"))      # revoked
+    assert u.telemetry == [(b"der-0001", b"r1")] and u.internal_errors == []
+    assert sum("telemetry from an unknown or revoked device" in r for r in u.refused) == 3

@@ -8,6 +8,7 @@ Run in the test image, against a snapshot of the tree mounted read-only at /src 
     python tools/mutation_check.py sel 1,9,10 0 1        # only the listed mutants (same docker wrapper)
 Last full run (after C1-9): 117 mutants, 112 killed, 5 equivalent (24, 28, 40, 110, 112).
 Mutants 117-139 disable the checks added by cycle 1 (C2-2): 23 of 23 killed.
+Mutants 140-143: cycle 2's fixes (C2-8).
 """
 import shutil
 import subprocess
@@ -210,8 +211,8 @@ M = [
      "                self.refused.append", "C1-3 refused schedule dropped"),
     ("pqgrid/mqtt/utility_node.py", "        validate(p, installed_version=self.n.endpoint.policy.version)  # … and so is one that is not newer",
      "        pass  # … and so is one that is not newer", "C1-3 schedule validates version"),
-    ("pqgrid/mqtt/utility_node.py", "            self.n.db.save_policy(\"active\", signed, payload, anchors, revoked)   # durable",
-     "            pass   # durable", "C1-12 active policy persisted"),
+    ("pqgrid/mqtt/utility_node.py", "            self.n.db.save_policy(\"active\", signed, payload, anchors, revoked)   # active; durable",
+     "            pass   # active; durable", "C1-12 active policy persisted"),
     ("pqgrid/mqtt/utility_node.py", "        self.n.db.save_policy(\"scheduled\", signed, payload, anchors, revoked)   # survives",
      "        pass   # survives", "C1-12 scheduled policy persisted"),
     ("pqgrid/persistence/utility_db.py", "        if active.version > policy.version:\n            policy = active",
@@ -230,6 +231,19 @@ M = [
      "C1-2 policy id fullmatch"),
     ("pqgrid/policy/validator.py", "        if not _CLASS_NAME.fullmatch(name) or c.name != name:",
      "        if not _CLASS_NAME.match(name) or c.name != name:", "C1-2 class name fullmatch"),
+    # ---------------------------------------------------------------- checks added by cycle 2 (C2-x)
+    ("pqgrid/commands/zones.py", "        self._finish_revocations()\n", "", "C2-4 revoked members leave at start"),
+    ("pqgrid/mqtt/utility_node.py",
+     "            self.n.zones.rotate_all()                                # first: a crash then leaves the old policy\n"
+     "            self.n.db.save_policy(\"active\", signed, payload, anchors, revoked)   # active; durable before effect\n",
+     "            self.n.db.save_policy(\"active\", signed, payload, anchors, revoked)   # active; durable before effect\n"
+     "            self.n.zones.rotate_all()                                # first: a crash then leaves the old policy\n",
+     "C2-5 rotate before persisting"),
+    ("pqgrid/e2e/handshake.py",
+     "            opened.append((aid, payload))\n",
+     "            opened.append((aid, payload)); self._dedup(s.device_id, aid)\n", "C2-6 dedup after the reply"),
+    ("pqgrid/mqtt/utility_node.py", "                    if rec is None or not rec.active or rec.dclass != cls:   # not wait",
+     "                    if rec is None:   # not wait", "C2-7 telemetry from revoked devices"),
 ]
 
 
