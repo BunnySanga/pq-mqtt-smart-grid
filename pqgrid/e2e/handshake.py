@@ -617,16 +617,17 @@ class UtilityEndpoint:
             envs = decode_bundle(bundle)
         except WireError:
             envs, result.rejected = [], 1
-        topic = alert_topic(s.dclass, s.device_id)
+        topic, opened = alert_topic(s.dclass, s.device_id), []
         for env in envs:
             try:
                 aid, payload, seq = open_alert(self.policy, s, topic, env)
             except (EnvelopeError, ReplayError):
                 result.rejected += 1
                 continue
-            result.alerts.append((aid, payload, self._dedup(s.device_id, aid)))
+            opened.append((aid, payload))
             acks.append(alert_ack(s, seq))
-        result.final = self._final(s, prof, acks, now)
+        result.final = self._final(s, prof, acks, now)       # may fail (e.g. storing a new STEK): then nothing
+        result.alerts = [(aid, p, self._dedup(s.device_id, aid)) for aid, p in opened]   # is recorded as seen
         self._dup.put(key, (s, result.final), now, prof.dup_window_s)
         return result
 

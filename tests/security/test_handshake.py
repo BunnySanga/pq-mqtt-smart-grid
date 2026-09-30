@@ -302,3 +302,23 @@ def test_a_class_that_never_resumes_refuses_a_ticket(world: World):
         d.on_final(nt)
     assert d.ticket is None and not d.confirmed
     assert d.on_final(res.final) == [] and d.confirmed and d.ticket is None    # the genuine FIN
+
+
+def test_alerts_of_a_df_whose_reply_failed_to_persist_arrive_as_new_next_time(world: World, monkeypatch):
+    """Authentication succeeded but persistence failed: issuing the NT's ticket fails (a database error while
+    storing a new STEK). Nothing in that bundle may be recorded as seen, because the application never received it:
+    the device resends the same alerts in its next DF and they must arrive as new, not as duplicates."""
+    d = world.device(M1, "smart_meter")
+    aid = os.urandom(16)
+    alerts = [(alert_topic("smart_meter", M1), aid, b"cover opened")]
+    d.on_server_hello(world.utility.on_client_hello(M1, d.client_hello()))
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("database is locked")
+    monkeypatch.setattr(world.tickets, "issue", broken)
+    with pytest.raises(RuntimeError):
+        world.utility.on_finished(M1, d.finished(alerts))
+    monkeypatch.undo()
+    world.t += 1
+    res, acked = world.full(d, alerts)                                     # the device's next establishment
+    assert res.alerts == [(aid, b"cover opened", False)] and acked == [1]
