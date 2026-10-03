@@ -248,10 +248,14 @@ def test_a_joining_member_gets_its_read_right_before_its_new_zone_key(util):
     u, node, now, signed, restart = util
     order = []
 
+    import paho.mqtt.client as mqtt
+
     class Client:                                                      # the utility's MQTT client, recording
         def publish(self, topic, payload, qos=0, retain=False):
             order.append(("publish", topic))
-            return type("Info", (), {"is_published": lambda self: True})()
+            info = mqtt.MQTTMessageInfo(len(order))                    # what paho returns (rc 0: queued)
+            info._set_as_published()
+            return info
     u.c = Client()
     u.acl_hook = lambda: order.append(("acl", set(node.zones.zones["f7"].members)))
     d = _device(node, now, b"der-0003", "der_ctrl")

@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS policy_state(slot TEXT PRIMARY KEY CHECK (slot IN ('a
                                         revoked BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS artifacts(dclass TEXT NOT NULL, type INTEGER NOT NULL, signed BLOB NOT NULL,
                                      payload BLOB NOT NULL, parts BLOB NOT NULL, chunks BLOB NOT NULL,
-                                     retained_at REAL, topics BLOB, PRIMARY KEY (dclass, type));
+                                     retained_at REAL, topics BLOB, confirmed INTEGER NOT NULL DEFAULT 0,
+                                     PRIMARY KEY (dclass, type));
 CREATE TABLE IF NOT EXISTS revoked_anchors(anchor INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS class_floor(dclass TEXT PRIMARY KEY, max_packet INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS utility_keys(kind TEXT NOT NULL CHECK (kind IN ('kem', 'cmd')), pk BLOB NOT NULL,
@@ -94,6 +95,10 @@ class UtilityDB:
         if self.c.execute("PRAGMA synchronous").fetchone()[0] != 2:
             raise RuntimeError("SQLite synchronous=FULL was not applied")
         self.c.executescript(SCHEMA)
+        if "confirmed" not in {r[1] for r in self.c.execute("PRAGMA table_info(artifacts)")}:
+            # A database from before IMPLEMENTATION-ROADMAP §16 (P1-2): its retained artifacts count as unconfirmed,
+            # so the publisher sends them once more rather than trusting a publication that may never have arrived.
+            self.c.execute("ALTER TABLE artifacts ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
 
     @contextmanager
     def tx(self):
@@ -255,6 +260,11 @@ class SqlCommandStore(UtilityCommandStore):
                           (sid, q.device_id, u64(q.cmd.cmd_seq)))
         q.sends, q.last_sid = q.sends + 1, sid
 
+    def unmark_sent(self, q: QueuedCommand, prev_sid: bytes) -> None:
+        self.db.execute("UPDATE commands SET sends = sends - 1, last_sid = ? WHERE device_id = ? AND cmd_seq = ?",
+                        (prev_sid, q.device_id, u64(q.cmd.cmd_seq)))
+        q.sends, q.last_sid = q.sends - 1, prev_sid
+
     def close(self, q: QueuedCommand, status: bytes) -> None:
         self.db.execute("UPDATE commands SET status = ? WHERE device_id = ? AND cmd_seq = ?",
                           (status, q.device_id, u64(q.cmd.cmd_seq)))
@@ -333,20 +343,22 @@ class SqlPublisher(Publisher):
     def __init__(self, db: UtilityDB, policy, clock=time.time):
         self.db = db
         super().__init__(policy, clock)
-        for dclass, t, signed, payload, parts, chunks, at, topics in db.execute(
-                "SELECT dclass, type, signed, payload, parts, chunks, retained_at, topics FROM artifacts"):
+        for dclass, t, signed, payload, parts, chunks, at, topics, confirmed in db.execute(
+                "SELECT dclass, type, signed, payload, parts, chunks, retained_at, topics, confirmed FROM artifacts"):
             art = Artifact(decode_manifest(split_signed(signed)[0]), signed, dec_list(parts, MAX_PARTS),
                            dec_list(chunks, MAX_CHUNKS), payload)
             self.newest[(dclass, t)] = art
-            if at is not None:
-                self.live[(dclass, t)] = Published(art, [x.decode() for x in dec_list(topics, MAX_TOPICS)], at)
+            if at is not None:                                   # nothing in flight after a restart (P1-2)
+                self.live[(dclass, t)] = Published(art, [x.decode() for x in dec_list(topics, MAX_TOPICS)], at,
+                                                   bool(confirmed))
         self.revoked = set(db.revoked_anchors())
 
     def _store(self, key: tuple[str, int], art: Artifact, retained) -> None:
         topics = None if retained is None else enc_list([t.encode() for t in retained.topics], MAX_TOPICS)
-        self.db.execute("INSERT OR REPLACE INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        self.db.execute("INSERT OR REPLACE INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (key[0], key[1], art.signed, art.payload, enc_list(art.parts, MAX_PARTS),
-                         enc_list(art.chunks, MAX_CHUNKS), None if retained is None else retained.at, topics))
+                         enc_list(art.chunks, MAX_CHUNKS), None if retained is None else retained.at, topics,
+                         int(retained is not None and retained.confirmed)))
 
     def _store_revoked(self, anchor: int) -> None:
         self.db.add_revoked(anchor)

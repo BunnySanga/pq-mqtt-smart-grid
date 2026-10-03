@@ -11,11 +11,16 @@ Only the newest artifact per (class, type), only if still valid now: its signer 
 right role (DR-050 roles, current revocations), and a POLICY is not older than the active one.
 The rollout state (newest artifacts, what is retained since when, published revocations) is kept in memory here;
 persistence.utility_db.SqlPublisher makes it durable (Master §4.4, U-4), written before the broker is told.
+A publication counts as retained by the broker ("confirmed", durable too) only once the broker has acknowledged every
+one of its messages (Codex audit P1-2, IMPLEMENTATION-ROADMAP §16): settle() confirms from the client's
+acknowledgements, retry() publishes again what is unconfirmed with nothing in flight (after a restart, paho's queue
+is gone; after a refused message), at most once per retry_every_s.
 """
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from ..mqtt import topics
 from ..wire import dec, enc, r8, u8, u16, u64
@@ -24,6 +29,7 @@ from .station import Artifact
 
 RETENTION_S = 30 * 86400
 REPUBLISH_EVERY_S = 3600
+RETRY_S = 60                    # an unconfirmed publication with nothing in flight is published again after this
 
 
 def part_payload_budget(max_packet: int, device_class: str, type_: int, version: int) -> int:
@@ -38,6 +44,10 @@ class Published:
     artifact: Artifact
     topics: list
     at: float
+    confirmed: bool = False                                    # the broker acknowledged every message (durable)
+    tokens: Optional[list] = field(default=None, repr=False, compare=False)   # what client.publish returned (RAM);
+    #                                                                           None: nothing in flight
+    tried_at: Optional[float] = field(default=None, compare=False)   # when its messages were last handed over (RAM)
 
 
 class Publisher:
@@ -49,6 +59,7 @@ class Publisher:
         self.newest: dict[tuple[str, int], Artifact] = {}          # kept after cleanup, for republish requests
         self._last_request: dict[bytes, float] = {}
         self.revoked: set[int] = set()                             # anchors revoked by published KEYREVOKEs
+        self.retry_every_s = RETRY_S
 
     @property
     def policy(self):
@@ -93,15 +104,52 @@ class Publisher:
         old, pub = self.live.get(key), Published(art, [t for t, _ in msgs], self.clock())
         rid = r8(dec(art.payload, 1)[0]) if art.manifest.type == KEYREVOKE else None
         self._store(key, art, pub)                                 # the rollout state first (U-4), so a restart
-        if rid is not None:                                        # never forgets what it retained or revoked
-            self._store_revoked(rid)
-        for topic, payload in msgs:
-            client.publish(topic, payload, qos=1, retain=True)
+        if rid is not None:                                        # never forgets what it retained or revoked;
+            self._store_revoked(rid)                               # unconfirmed until the broker has it all (P1-2)
         self.live[key], self.newest[key] = pub, art
         if rid is not None:
             self.revoked.add(rid)
+        self._send(client, pub)
         if old and old.artifact.manifest.version != art.manifest.version:
             self._remove(client, old)                              # only the newest needs to stay retained
+
+    def _send(self, client, pub: Published) -> None:
+        """Hand every message of the publication to the client, retained. If the client raises part-way, nothing is
+        in flight and retry() publishes the whole publication again."""
+        pub.tokens, pub.tried_at = None, self.clock()
+        art = pub.artifact
+        pub.tokens = [client.publish(t, p, qos=1, retain=True) for t, p in zip(pub.topics, [*art.parts, *art.chunks])]
+
+    def settle(self, acked: Callable[[object], Optional[bool]]) -> int:
+        """Confirm (durably) each live publication whose every message the broker accepted; forget what is in flight
+        for one with a refused message, so retry() publishes it again. `acked(token)` is True (accepted), False
+        (refused) or None (no answer yet). Returns the number confirmed."""
+        n = 0
+        for key, pub in self.live.items():
+            if pub.confirmed or not pub.tokens:
+                continue
+            answers = [acked(t) for t in pub.tokens]
+            if False in answers:
+                pub.tokens = None
+            elif all(a is True for a in answers):
+                pub.confirmed, pub.tokens = True, None
+                self._store(key, pub.artifact, pub)
+                n += 1
+        return n
+
+    def retry(self, client) -> int:
+        """Publish again each live, still-valid publication that is unconfirmed with nothing in flight: after a
+        restart (paho's in-memory queue is gone) or after a refused message; at most once per retry_every_s.
+        Retained messages replace themselves at the broker; a device ignores a part or chunk it already has."""
+        now, n = self.clock(), 0
+        for pub in self.live.values():
+            if pub.confirmed or pub.tokens is not None or not self.valid(pub.artifact):
+                continue
+            if pub.tried_at is not None and now - pub.tried_at < self.retry_every_s:
+                continue
+            self._send(client, pub)
+            n += 1
+        return n
 
     def cleanup(self, client) -> int:
         now, removed = self.clock(), 0

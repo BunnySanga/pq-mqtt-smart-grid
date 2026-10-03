@@ -77,6 +77,10 @@ class UtilityCommandStore:
     def mark_sent(self, q: QueuedCommand, sid: bytes) -> None:
         q.sends, q.last_sid = q.sends + 1, sid
 
+    def unmark_sent(self, q: QueuedCommand, prev_sid: bytes) -> None:
+        """Undo mark_sent: the envelope was never handed to the transport (Codex audit P1-2)."""
+        q.sends, q.last_sid = q.sends - 1, prev_sid
+
     def close(self, q: QueuedCommand, status: bytes) -> None:
         q.status = status
 
@@ -146,11 +150,15 @@ class CommandService:
             return QueuedCommand(device_id, topic, Command(cmd_seq, command, exp, idempotent, sig))
         return self.store.allocate_and_enqueue(device_id, self.epoch, build).cmd.cmd_seq
 
-    def outgoing(self, device_id: bytes) -> list[bytes]:
+    def outgoing(self, device_id: bytes, send: Optional[Callable[[bytes], None]] = None) -> list[bytes]:
         """Envelopes to publish for the device's live session: each open, unexpired command once per session,
         in cmd_seq order (same cmd_seq and σ on redelivery, new keys). Expired ones are closed (E38). A command
         queued before a command-key rotation is re-signed under the key the active policy names, with the same
-        cmd_seq, before it is sent (DR-051): the device verifies with that key, and classifies by cmd_seq."""
+        cmd_seq, before it is sent (DR-051): the device verifies with that key, and classifies by cmd_seq.
+        A command is recorded as sent in this session BEFORE its envelope leaves, so a crash can only make the outcome
+        UNKNOWN, never a false EXPIRED. With `send`, each envelope is handed over right after its record; `send` raises
+        only if the envelope was NOT handed to the transport, and then the record is undone and the error re-raised:
+        the next flush of the session sends it (Codex audit P1-2), and if it expires first it is EXPIRED."""
         s = self.u.current_session(device_id)                      # M1: never under an old-policy session
         if s is None:
             return []
@@ -165,8 +173,15 @@ class CommandService:
             signed = cmd_signed_input(device_id, q.topic, c.cmd_seq, c.expires_at, c.idempotent, c.command)
             if not mldsa_verify(self.u.policy.utility_cmd_pk, c.sig, signed):
                 self.store.resign(q, mldsa_sign(self.cmd_key, signed))
+            env, prev = seal_control(self.u.policy, s, q.topic, encode(q.cmd)), q.last_sid
             self.store.mark_sent(q, s.sid)                          # recorded before the envelope leaves
-            out.append(seal_control(self.u.policy, s, q.topic, encode(q.cmd)))
+            if send is not None:
+                try:
+                    send(env)
+                except Exception:
+                    self.store.unmark_sent(q, prev)                 # it never left (P1-2)
+                    raise
+            out.append(env)
         return out
 
     def outcome(self, device_id: bytes, cmd_seq: int) -> Optional[bytes]:

@@ -7,9 +7,10 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
     docker run --rm pqgrid-tests python tools/mutation_check.py --root /app sel 1,9,10 0 1   # only these mutants
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
-147-172 the remediation after the independent release audit (R-x). A mutant may name broker tests (5th element)
-for a check only a real broker exercises; they run in addition to the in-process suite (the test image has
-Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15.
+147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2
+(§16). A mutant may name broker tests (5th element) for a check only a real broker exercises; they run in addition
+to the in-process suite (the test image has Mosquitto). Results and the classification of every survivor:
+IMPLEMENTATION-ROADMAP §15 (and §16 for 173 onwards).
 """
 import os
 import shutil
@@ -313,6 +314,27 @@ M = [
      "            self.recompile_acl()\n            self._send_zone_keys(zone)",
      "            self._send_zone_keys(zone)\n            self.recompile_acl()",
      "R join: read right before the new key"),
+    # ---------------------------------------------------------------- Codex audit P1-2 (IMPLEMENTATION-ROADMAP §16)
+    ("pqgrid/mqtt/utility_node.py", "            info.rc = mqtt.MQTT_ERR_SUCCESS                              # queued",
+     "            pass                              # queued", "P1-2 a publish kept for the reconnect breaks nothing"),
+    ("pqgrid/mqtt/utility_node.py", "        elif info.rc != mqtt.MQTT_ERR_SUCCESS:", "        elif False:",
+     "P1-2 a publish the client did not queue is an error"),
+    ("pqgrid/commands/utility.py", "                    self.store.unmark_sent(q, prev)                 # it never left",
+     "                    pass                 # it never left", "P1-2 a command that never left is not counted as sent"),
+    ("pqgrid/fota/publisher.py", "            elif all(a is True for a in answers):",
+     "            elif any(a is True for a in answers):", "P1-2 confirmed only when every message was acknowledged"),
+    ("pqgrid/fota/publisher.py", "            if False in answers:\n                pub.tokens = None",
+     "            if False:\n                pub.tokens = None", "P1-2 a refused message un-does the publication"),
+    ("pqgrid/mqtt/utility_node.py", "        if not reason_code.is_failure:\n            return",
+     "        if True:\n            return", "P1-2 a refusing PUBACK is recorded"),
+    ("pqgrid/mqtt/utility_node.py", "                self.publisher.retry(self._fota_out)",
+     "                pass", "P1-2 an unconfirmed artifact is published again"),
+    ("pqgrid/persistence/utility_db.py", "                         int(retained is not None and retained.confirmed)))",
+     "                         0))", "P1-2 confirmation is durable"),
+    ("pqgrid/fota/publisher.py", "            if pub.tried_at is not None and now - pub.tried_at < self.retry_every_s:",
+     "            if False:", "P1-2 retries are rate-limited"),
+    ("pqgrid/fota/publisher.py", "            if pub.confirmed or pub.tokens is not None or not self.valid(pub.artifact):",
+     "            if pub.confirmed or pub.tokens is not None:", "P1-2 a retry never resurrects an invalid artifact"),
 ]
 
 

@@ -1552,3 +1552,96 @@ TLS implementation (hybrid groups, max_fragment_length, suite restriction), and 
 behaviour. All of them are open in Master §29, the Hardware Validation Plan, which now has rows for NOR flash, the
 bootloader swap and TRNG/DRBG. The Master's device figures are [ANALYTICAL] or [LIT] (with the source's hardware
 named) and are never presented as measurements; the prototype's device is Python on a Linux container.
+
+## 16. Codex audit (2026-10-03)
+
+An independent read-only audit (OpenAI Codex) of `main` at `65f0f80` reported 1 P0 and 3 P1 findings and 3
+improvements. Each was reproduced or checked against `main` before anything changed (branch
+`fix/p1-2-utility-publish` onward). Severities below are this project's, after reproduction; the audit's own label is
+given with each.
+
+### 16.1 Triage
+
+| # | Audit claim (audit severity) | Reproduced on `65f0f80` | Verdict | Status |
+|---|---|---|---|---|
+| P0-1 | A forged staged FOTA artifact activates after a reboot without re-verifying SLH-DSA (P0) | Yes [SIM]: the staged manifest record and the slot rewritten, reboot → `committed`, version 99 | The code re-reads the staged manifest from the normal record store without its signature (only the manifest bytes are stored). The attack needs write access to that store (internal flash); §15.1's attacker is on EXTERNAL flash, which V-F4 covers. The Master never states that the record store is inside the trust boundary | Open: design decision (an SLH-DSA σ is 7,856 B against the flash budget, or a device-unique MAC) |
+| P1-1 | A class or key change leaves the old session and its commands active (P1) | Yes [SIM]: after `Registry.add` of a changed record, `current_session` still returns the old session and a queued command is still sent | Real. `Registry.add` silently replaces a record; nothing invalidates what the old record authorised. The Master's clone procedure ("revoke and re-provision", §23.11) is safe only because revoking comes first | Open |
+| P1-2 | Failed utility-side publishes lose commands and FOTA state (P1) | The claimed mechanism no; a related defect yes [DOCKER] | §16.2 | **Fixed** (§16.2) |
+| P1-3 | SQLite backups are world-readable (P1) | Yes [SIM]: `backup_to()` → 0644 (umask 022); the database itself 0600 | Real; the backup holds the utility's private keys and STEKs. Only a test calls it today | Open |
+| A | A client could negotiate a classical-only TLS group | n/a | Not a defect: the broker's OpenSSL configuration offers and accepts only hybrid groups and TLS 1.3, proven by `test_N3_T7_only_hybrid_tls13_is_accepted`; Python cannot pin groups on the client (E53) | Unchanged |
+| B | The installer accepts one anchor | From the code | Real, minor: the Master requires ≥ 2 anchors (O7); `Installer` accepts any number, duplicates and wrong sizes (a provisioning check) | Open |
+| C | Unbounded utility collections | From the code | Real, minor: `UtilityMqtt.alerts`, `telemetry`, `statuses`, `takeover_alarms` are plain lists that grow with valid traffic | Open |
+
+### 16.2 P1-2: utility-side publishes
+
+**What the audit got wrong.** A QoS 1 publish made while paho is disconnected returns `MQTT_ERR_NO_CONN` (rc 4), but
+paho 2.1.0 keeps the message and sends it after reconnecting: it reached a persistent subscriber after a Mosquitto
+restart [DOCKER, scratch check against the canonical image]. A utility command is also never recorded as *successful*
+without the device's status ACK, so a lost publish could not make the utility believe a command succeeded.
+
+**The defect found while reproducing it.** The `MQTTMessageInfo` of that message keeps rc 4 for good, and
+`is_published()` then raises `RuntimeError`. The utility's bookkeeping (`_track`) asked every tracked info that
+question on each publish, so ONE publish during a broker outage made every later utility publish raise until a
+restart. The message itself still went out, but everything after the raising publish was skipped: after an
+establishment, the device's queued commands (already recorded as sent in that session, so not sent again until its
+next session), zone keys and DR re-sends; `flush()` (graceful stop) returned at once. Two smaller gaps in the same
+place: a publish paho did not queue at all (rc ≠ 0, 4) went unnoticed and its command stayed recorded as sent; and the
+publisher recorded an artifact as retained before the broker had it, so an artifact that existed only in paho's memory
+when the utility restarted, or that the broker refused (PUBACK 0x87, e.g. a stale ACL), was never published again
+(the E-4 offer at establishment skips an artifact it believes retained) for the whole 30-day window.
+
+**Fix** (no new queue: the commands table and the publisher's rollout state are the durable records):
+
+| Part | Change |
+|---|---|
+| Tracking | `UtilityMqtt._send`: rc 4 is reset to 0 (paho keeps the message), so the info reports the PUBACK like any other; any other rc raises `TransportError` (not queued). Every utility publish goes through it |
+| Commands | `CommandService.outgoing(send=…)`: each command is still recorded as sent BEFORE its envelope leaves (a crash can only make its outcome UNKNOWN, never a false EXPIRED); if `send` raises (not handed over), the record is undone (`unmark_sent`) so the next flush of the session sends it, and a command that expires first is EXPIRED |
+| Broker refusals | `on_publish` records PUBACKs with a failure reason code (`publish_refusals`) |
+| Artifacts | `Published.confirmed` (durable column, default 0 for databases from before §16): set by `Publisher.settle()` only when the broker accepted every message; `Publisher.retry()` (each tick) publishes an unconfirmed, still-valid publication again when nothing is in flight, at most once per `retry_every_s` (60 s): after a restart, or after a refusal |
+
+**Regression tests** (each fails on `65f0f80`):
+
+| Test | Failure on `65f0f80` |
+|---|---|
+| `tests/integration/test_publish_outage.py::…command_issued_during_a_broker_outage…` | `RuntimeError: Message publish failed: The client is not currently connected` on the next command [DOCKER] |
+| `…::…artifact_published_during_an_outage_reaches_the_device_although_the_utility_restarted` | the device never stages the firmware (30 s) [DOCKER] |
+| `…::…artifact_the_broker_refused_is_published_again_once_the_broker_accepts_it` | the device never stages the firmware after the ACL is corrected (30 s) [DOCKER] |
+| `tests/security/test_utility_publish.py` (7 tests: tracking, not-queued commands incl. EXPIRED vs UNKNOWN, zone key and DR event, confirmation, restart, refusal, no resurrection of an invalid artifact) | `RuntimeError` (2), `DID NOT RAISE TransportError`, nothing published after the restart, and the confirmation API absent (2) [SIM]; the validity test passes on `65f0f80` because nothing was ever published again there |
+
+One existing test changed: `test_a_joining_member_gets_its_read_right_before_its_new_zone_key` stubbed paho's
+`publish()` with an object without `rc`; it now returns paho's own `MQTTMessageInfo` (its assertions are unchanged).
+Mutants 173–182 cover the new checks (§16.4).
+
+Not changed: the device side already treats any rc ≠ 0 as a failed publish (`DeviceMqtt._publish`), so it never
+tracks such an info; an artifact *removal* (empty retained publish after the retention window) is not confirmed, so a
+removal lost to a restart leaves a valid, signed, older artifact retained (devices refuse it as a rollback or install
+the newest they see).
+
+### 16.3 Validation of the P1-2 fix (2026-10-03)
+
+Canonical image (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, paho-mqtt 2.1.0), rebuilt from the branch:
+
+| Check | Result |
+|---|---|
+| Before the fix (`65f0f80` code, new tests) | 3 broker tests and 6 of the 7 in-process tests FAIL as listed in §16.2 [DOCKER] |
+| Full suite | **639 passed** (629 + 10 new) [DOCKER] |
+| Broker tests | **54 / 54** in 2 runs; the 3 new outage tests alone 3 / 3 in 3 further runs [DOCKER] |
+| In-process suite on macOS (`.venv`) | 585 passed, 54 skipped (the broker tests) [SIM] |
+| Mutants 173–182 | **10 of 10 KILLED** (canonical image; also locally in the `.venv`) |
+| v2.1 `validate.py` | 80/80 as expected (unchanged reference) |
+| pyflakes 4.0.1 (throwaway container) | `pqgrid`, `tools`: clean; new test files: only the pytest fixture-import idiom |
+
+### 16.4 Mutation analysis for P1-2
+
+| # | Check disabled | Killed by |
+|---|---|---|
+| 173 | rc 4 reset (a publish kept for the reconnect) | `…does_not_break_every_later_publish` |
+| 174 | a publish the client did not queue raises | `…the_client_did_not_queue_is_not_counted_as_sent` |
+| 175 | the sent record of a command that never left is undone | same |
+| 176 | confirmed only when EVERY message was acknowledged | `…counts_as_retained_only_once_the_broker_acknowledged_every_message` |
+| 177 | a refused message un-does the publication | `…the_broker_refused_is_published_again` |
+| 178 | a refusing PUBACK is recorded | same |
+| 179 | tick() publishes an unconfirmed artifact again | `…never_reached_the_broker_is_published_again_after_a_utility_restart` |
+| 180 | confirmation is durable | `…counts_as_retained_only_once…` (reopened database) |
+| 181 | retries rate-limited to retry_every_s | `…the_broker_refused_is_published_again` |
+| 182 | a retry never resurrects an invalid artifact | `…no_longer_valid_is_not_published_again` |

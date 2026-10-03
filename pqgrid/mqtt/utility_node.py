@@ -7,6 +7,11 @@
   * Opens alerts and ACKs them; an alert for an unknown session gets the resync hint on `hs/down` (DR-041, U-6).
   * Refuses to publish anything larger than the device's Maximum Packet Size: the broker would drop it silently
     and the device would never learn of it (§10.2, [DOCKER T1]).
+  * Tracks every QoS 1 publish until the broker's PUBACK (Codex audit P1-2, IMPLEMENTATION-ROADMAP §16). A publish
+    made while disconnected (MQTT_ERR_NO_CONN) is not a failure: paho keeps it and sends it after reconnecting
+    [DOCKER]. Only a publish paho did not queue is one (TransportError), and then nothing counts it as sent. A PUBACK
+    with a failure reason code is recorded (publish_refusals); an artifact is confirmed only when all its messages
+    were accepted, and tick() publishes an unconfirmed one again.
   * Counts each device's "online" announcements (sent after every CONNACK): repeated connects raise a takeover
     (clone) alarm (§10.4, E52). Mosquitto 2.0.21 does not publish the Last Will of a session that is taken over
     [DOCKER, observed in this slice], so the Will alone cannot reveal a clone.
@@ -21,7 +26,8 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.packettypes import PacketTypes
@@ -37,6 +43,7 @@ from .topics import publish_size
 from .device_node import TransportError
 
 TAKEOVER_WINDOW_S, TAKEOVER_LIMIT = 600, 5
+REFUSAL_MEMORY_S, REFUSALS_KEPT = 600, 1024    # refused PUBACKs kept for matching against tracked publishes
 FIRMWARE_T, POLICY_T = 1, 2                                         # fota.artifact types (avoids an import cycle)
 ZONE_ROTATE_EVERY_S = 7 * 86400                                     # key table §4.7: … and weekly
 
@@ -55,6 +62,7 @@ class UtilityMqtt:
         self.c.suppress_exceptions = True
         self.c.on_connect = guarded(self, "connect", self._on_connect, self.refused, self.internal_errors)
         self.c.on_message = guarded(self, "message", self._on_message, self.refused, self.internal_errors)
+        self.c.on_publish = guarded(self, "publish", self._on_publish, self.refused, self.internal_errors)
         self._props = Properties(PacketTypes.CONNECT)
         self._props.SessionExpiryInterval = 86400
         self.connected = threading.Event()
@@ -67,6 +75,10 @@ class UtilityMqtt:
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
         self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
         self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
+        self._ack_lock = threading.Lock()                              # never held while calling into paho
+        self._refused_mids: OrderedDict[int, float] = OrderedDict()    # mid → when its PUBACK refused it
+        self.publish_refusals: list[str] = BoundedLog()                # refused PUBACKs, publishes paho did not queue
+        self._fota_out = _FotaClient(self)                             # what the publisher publishes through
         self.ticks = 0                                                 # completed main-loop steps
         self.zone_syncs: list[tuple[bytes, str]] = BoundedLog()        # answered zone sync requests (E-2)
         self.acl_failures: list[tuple] = BoundedLog()                  # failed ACL hook runs (type + locations)
@@ -101,10 +113,43 @@ class UtilityMqtt:
         size, limit = publish_size(topic, payload), self._max_packet(device_id)
         if size > limit:                                                 # §10.2: never send what gets dropped
             raise TransportError(f"{size} B PUBLISH exceeds {device_id.decode()}'s maximum packet size {limit} B")
-        self._track(self.c.publish(topic, payload, qos=1))
+        self._send(topic, payload)
 
-    def _track(self, info) -> None:
+    def _send(self, topic: str, payload: bytes, retain: bool = False):
+        """Hand one QoS 1 message to paho and track it until the broker acknowledges it; returns its MQTTMessageInfo.
+        MQTT_ERR_NO_CONN is NOT a failure: paho keeps the message and sends it after reconnecting [DOCKER], but the
+        info keeps that rc and then raises whenever it is asked whether it was published, which made every later
+        publish raise (P1-2). Its rc is therefore reset, so the info reports the PUBACK like any other. Any other rc
+        (MQTT_ERR_QUEUE_SIZE in paho 2.1.0) means paho did not keep the message: TransportError, nothing sent.
+        Callers hold self.lock, which also guards _unacked."""
+        info = self.c.publish(topic, payload, qos=1, retain=retain)
+        if info.rc == mqtt.MQTT_ERR_NO_CONN:
+            info.rc = mqtt.MQTT_ERR_SUCCESS                              # queued by paho for the reconnect
+        elif info.rc != mqtt.MQTT_ERR_SUCCESS:
+            self.publish_refusals.append(f"{topic}: not queued by the client: {mqtt.error_string(info.rc)}")
+            raise TransportError(f"{topic}: not queued by the client ({mqtt.error_string(info.rc)})")
         self._unacked = [i for i in self._unacked if not i.is_published()] + [info]
+        return info
+
+    def _on_publish(self, client, userdata, mid, reason_code, properties) -> None:
+        """paho's PUBACK callback (on its own thread, holding its own lock: only in-memory bookkeeping here). paho
+        marks the message published after this returns, whatever the reason code, so a refusal is recorded first."""
+        if not reason_code.is_failure:
+            return
+        now = time.monotonic()
+        with self._ack_lock:
+            self._refused_mids[mid] = now
+            while self._refused_mids and (len(self._refused_mids) > REFUSALS_KEPT or
+                                          next(iter(self._refused_mids.values())) < now - REFUSAL_MEMORY_S):
+                self._refused_mids.popitem(last=False)
+        self.publish_refusals.append(f"mid {mid}: {reason_code}")
+
+    def _acked(self, info) -> Optional[bool]:
+        """True: the broker accepted the message; False: its PUBACK refused it; None: no answer yet."""
+        if info is None or not info.is_published():
+            return None
+        with self._ack_lock:
+            return self._refused_mids.pop(info.mid, None) is None
 
     def flush(self, timeout: float = 10.0) -> bool:
         """True once the broker has acknowledged (stored) every QoS 1 message this node published so far, e.g.
@@ -139,7 +184,7 @@ class UtilityMqtt:
                     rec = self.n.endpoint.registry.get(did)
                     if rec is None or not rec.active or rec.dclass != cls:
                         raise ValueError("republish request from an unknown device or the wrong class")
-                    got = self.publisher.on_request(self.c, cls, did)       # E-4: rate-limited, valid only
+                    got = self.publisher.on_request(self._fota_out, cls, did)   # E-4: rate-limited, valid only
                     if got:
                         self.republished.append((did, got))
         except (PqgridError, ValueError) as e:
@@ -194,7 +239,7 @@ class UtilityMqtt:
         rec = self.n.endpoint.registry.get(did)
         if self.publisher is None or rec is None or not rec.active:
             return
-        got = self.publisher.on_request(self.c, rec.dclass, did, **which)
+        got = self.publisher.on_request(self._fota_out, rec.dclass, did, **which)
         if got:
             self.republished.append((did, got))
 
@@ -220,9 +265,13 @@ class UtilityMqtt:
 
     # ---------------------------------------------------------------------------------- application API
     def _flush(self, did: bytes) -> None:
+        """Commands first, each handed over right after it is recorded as sent (a publish that is not queued undoes
+        its record and stops the flush: P1-2), then zone keys and DR re-sends (nothing records those as sent)."""
         rec, z = self.n.endpoint.registry.get(did), self.n.zones
-        for env in self.n.commands.outgoing(did) + z.zonekeys_for(did) + z.resend_for(did):
-            self._publish(did, topics.control(rec.dclass, did), env)      # one topic: keys before events
+        topic = topics.control(rec.dclass, did)
+        self.n.commands.outgoing(did, send=lambda env: self._publish(did, topic, env))
+        for env in z.zonekeys_for(did) + z.resend_for(did):
+            self._publish(did, topic, env)                               # one topic: keys before events
 
     def command(self, did: bytes, command: bytes, ttl_s: int, idempotent: bool = False) -> int:
         with self.lock:
@@ -269,8 +318,10 @@ class UtilityMqtt:
             self._publish(member, topics.control(self.n.endpoint.registry.get(member).dclass, member), env)
 
     def publish_artifact(self, art) -> None:
+        """Retained until the retention window ends; confirmed once the broker has acknowledged every message, and
+        published again by tick() while it is not (P1-2)."""
         with self.lock:
-            self.publisher.publish(self.c, art)
+            self.publisher.publish(self._fota_out, art)
 
     def prepare_keys(self, kem=None, cmd=None, expect_kem_pk: bytes | None = None,
                      expect_cmd_pk: bytes | None = None) -> None:
@@ -373,7 +424,9 @@ class UtilityMqtt:
             for zone in self.n.zones.rotate_due(ZONE_ROTATE_EVERY_S):
                 self._send_zone_keys(zone)
             if self.publisher is not None:
-                self.publisher.cleanup(self.c)
+                self.publisher.cleanup(self._fota_out)
+                self.publisher.settle(self._acked)                     # P1-2: confirmed only on the broker's PUBACKs
+                self.publisher.retry(self._fota_out)                   # … and published again while it is not
             self.n.endpoint.sweep()
         self.ticks += 1
 
@@ -418,5 +471,16 @@ class UtilityMqtt:
         with self.lock:
             pubs = self.n.zones.publish(zone, event, ttl_s, fits)
             for topic, env in pubs.items():
-                self._track(self.c.publish(topic, env, qos=1))
+                self._send(topic, env)                                   # retained by the utility (M4) either way
             return len(pubs)
+
+
+class _FotaClient:
+    """What the artifact publisher publishes through: the utility's tracked publish, so every artifact message is
+    followed to its PUBACK (P1-2). publish() returns the MQTTMessageInfo the publisher keeps as its token."""
+
+    def __init__(self, utility: UtilityMqtt):
+        self.u = utility
+
+    def publish(self, topic: str, payload: bytes, qos: int = 1, retain: bool = False):
+        return self.u._send(topic, payload, retain=retain)
