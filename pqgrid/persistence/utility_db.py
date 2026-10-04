@@ -55,7 +55,8 @@ CREATE INDEX IF NOT EXISTS used_tickets_expiry ON used_tickets(expires_at);
 CREATE TABLE IF NOT EXISTS stek(kid INTEGER PRIMARY KEY, key BLOB NOT NULL, created_at INTEGER NOT NULL,
                                 retire_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS registry(device_id BLOB PRIMARY KEY, dclass TEXT NOT NULL, e2e_pk BLOB NOT NULL,
-                                    active INTEGER NOT NULL, max_packet INTEGER);
+                                    active INTEGER NOT NULL, max_packet INTEGER,
+                                    provisioned_at INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS zones(name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS zone_groups(name TEXT NOT NULL, aead TEXT NOT NULL, key_epoch INTEGER NOT NULL,
                                        key BLOB NOT NULL, rotated_at INTEGER NOT NULL, PRIMARY KEY (name, aead));
@@ -95,6 +96,9 @@ class UtilityDB:
         if self.c.execute("PRAGMA synchronous").fetchone()[0] != 2:
             raise RuntimeError("SQLite synchronous=FULL was not applied")
         self.c.executescript(SCHEMA)
+        if "provisioned_at" not in {r[1] for r in self.c.execute("PRAGMA table_info(registry)")}:
+            # A database from before §16 (P1-1): no device was re-provisioned under the floor yet.
+            self.c.execute("ALTER TABLE registry ADD COLUMN provisioned_at INTEGER NOT NULL DEFAULT 0")
         if "confirmed" not in {r[1] for r in self.c.execute("PRAGMA table_info(artifacts)")}:
             # A database from before IMPLEMENTATION-ROADMAP §16 (P1-2): its retained artifacts count as unconfirmed,
             # so the publisher sends them once more rather than trusting a publication that may never have arrived.
@@ -284,12 +288,14 @@ class SqlRegistry(Registry):
     def __init__(self, db: UtilityDB):
         super().__init__()
         self.db = db
-        for did, dclass, pk, active, mp in db.execute("SELECT * FROM registry"):
-            self._d[did] = DeviceRecord(did, dclass, pk, bool(active), mp)
+        for did, dclass, pk, active, mp, prov in db.execute(
+                "SELECT device_id, dclass, e2e_pk, active, max_packet, provisioned_at FROM registry"):
+            self._d[did] = DeviceRecord(did, dclass, pk, bool(active), mp, prov)
 
     def _store(self, rec: DeviceRecord) -> None:
-        self.db.execute("INSERT OR REPLACE INTO registry VALUES (?, ?, ?, ?, ?)",
-                          (rec.device_id, rec.dclass, rec.e2e_pk, int(rec.active), rec.max_packet))
+        self.db.execute("INSERT OR REPLACE INTO registry (device_id, dclass, e2e_pk, active, max_packet, "
+                        "provisioned_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (rec.device_id, rec.dclass, rec.e2e_pk, int(rec.active), rec.max_packet, rec.provisioned_at))
 
 
 class SqlZoneManager(ZoneManager):
@@ -408,6 +414,19 @@ class UtilityNode:
     commands: CommandService
     zones: ZoneManager
     keyring: UtilityKeyring
+
+    def reprovision(self, rec: DeviceRecord) -> list[str]:
+        """Codex audit P1-1: a registered device's class and/or E2E key change, and nothing authorised under its old
+        record survives: its sessions and half-open handshakes (RAM), its resumption tickets (refused by the record's
+        provisioning time), its open commands and GRANTs, and the zone keys it could hold. Crash-coherent order: the
+        zone keys are rotated first (alone, a crash leaves an extra rotation); then the record and the closing of its
+        commands are ONE transaction, so a restart sees either the old record with its commands or the new record
+        without them; then the RAM state goes. Returns the zones whose live members need the new keys."""
+        zones = self.zones.rotate_device(rec.device_id)
+        with self.db.tx():
+            self.commands.cancel_device(rec.device_id)
+            self.endpoint.reprovision_device(rec)
+        return zones
 
     def keys_match_policy(self) -> bool:
         """DR-051 invariant: the keys in use are exactly those the active policy names."""

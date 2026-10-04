@@ -184,6 +184,18 @@ class CommandService:
             out.append(env)
         return out
 
+    def cancel_device(self, device_id: bytes) -> int:
+        """Codex audit P1-1: the device was re-provisioned, so what was authorised under its old record ends. Each
+        open command is closed, UNKNOWN if it was ever sent (it may have been executed) and CANCELLED if not (a
+        utility-side outcome; nothing is sent), and its GRANTs are forgotten (their session is gone too). Returns
+        the commands closed."""
+        n = 0
+        for q in self.store.open_commands(device_id):
+            self.store.close(q, b"UNKNOWN" if q.sends else b"CANCELLED")
+            n += 1
+        self._grants.pop(self._grant_sid.pop(device_id, b""), None)
+        return n
+
     def outcome(self, device_id: bytes, cmd_seq: int) -> Optional[bytes]:
         q = self.store.get(device_id, cmd_seq)
         return q.status if q else None

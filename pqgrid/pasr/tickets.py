@@ -129,6 +129,8 @@ class TicketIssuer:
             raise TicketError("device unknown or revoked")                                     # 4
         if rec.dclass != t.dclass:
             raise TicketError("ticket class does not match the registry")                      # 4 (E22)
+        if rec.provisioned_at and t.issued_at <= rec.provisioned_at:
+            raise TicketError("ticket issued before the device was re-provisioned")            # 4 (P1-1)
         if not (now < t.expires_at and now < t.chain_expires_at):
             raise TicketError("ticket expired")                                                # 5
         if not (ct_eq(t.policy_info, policy_info) and ct_eq(policy_info, policy.info())):

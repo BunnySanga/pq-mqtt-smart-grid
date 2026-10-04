@@ -463,6 +463,16 @@ class UtilityEndpoint:
         takes effect), then every live session and half-open handshake of the device is invalidated, so nothing
         it sends afterwards is accepted, whatever the broker ACL says. Returns the number of sessions closed."""
         self.registry.revoke(device_id)
+        return self._drop_device(device_id)
+
+    def reprovision_device(self, rec) -> int:
+        """Codex audit P1-1: the device's class and/or E2E key change (registry.reprovision: durable, and it refuses
+        every ticket issued until now). Then every live session and half-open handshake of the old record is
+        invalidated, as at revocation: what it authorised must not outlive it. Returns the sessions closed."""
+        self.registry.reprovision(rec, self.now())
+        return self._drop_device(rec.device_id)
+
+    def _drop_device(self, device_id: bytes) -> int:
         closed = 0
         for sid, s in list(self.sessions.items()):
             if s.device_id == device_id:
@@ -498,9 +508,9 @@ class UtilityEndpoint:
         """The device's live session, only if the device is active, the session belongs to the current policy and
         its chain has not ended: what the utility may seal commands and zone keys under, and accept status ACKs
         from."""
-        s = self.session_for(device_id)
-        if (s is None or not self.active(device_id) or not ct_eq(s.policy_info, self.policy.info())
-                or self.end_expired_chain(s)):
+        s, rec = self.session_for(device_id), self.registry.get(device_id)
+        if (s is None or rec is None or not rec.active or s.dclass != rec.dclass       # P1-1: the record's class
+                or not ct_eq(s.policy_info, self.policy.info()) or self.end_expired_chain(s)):
             return None
         return s
 

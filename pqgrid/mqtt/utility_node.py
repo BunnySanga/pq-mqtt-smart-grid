@@ -313,6 +313,17 @@ class UtilityMqtt:
         self._acl_due = True
         self.recompile_acl()
 
+    def reprovision_device(self, rec) -> None:
+        """Codex audit P1-1: the device's class and/or E2E key change (UtilityNode.reprovision: its sessions, tickets,
+        open commands, GRANTs and zone keys end), the remaining members of its zones get the new keys, and the broker
+        ACL is recompiled for the new record (its class decides its topics). The device establishes again under its
+        new identity; a failed ACL hook is retried by tick() (L-1)."""
+        with self.lock:
+            for zone in self.n.reprovision(rec):
+                self._send_zone_keys(zone)
+        self._acl_due = True
+        self.recompile_acl()
+
     def _send_zone_keys(self, zone: str) -> None:
         for member, env in self.n.zones.distribute(zone).items():
             self._publish(member, topics.control(self.n.endpoint.registry.get(member).dclass, member), env)

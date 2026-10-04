@@ -229,6 +229,14 @@ class ZoneManager:
         z = self.zones[name]
         self._rotate(z, list(z.groups))
 
+    def rotate_device(self, device_id: bytes) -> list[str]:
+        """Re-provisioning (Codex audit P1-1): the device stays in its zones, but every group key it could hold under
+        its old record is replaced. Returns the affected zones (their members need the new keys)."""
+        affected = [z.name for z in self.zones.values() if device_id in z.members]
+        for name in affected:
+            self.rotate(name)
+        return affected
+
     def rotate_all(self) -> list[str]:
         """A policy change (key table §4.7): every group of every zone gets a new key."""
         for z in self.zones.values():
