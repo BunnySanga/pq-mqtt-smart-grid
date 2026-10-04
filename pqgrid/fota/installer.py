@@ -28,7 +28,7 @@ from typing import Callable, Optional
 from ..errors import CapacityError, PolicyError, WireError
 from ..policy import decode_policy, validate
 from ..persistence.flash import RecordStore
-from ..suite.sig import slh_verify
+from ..suite.sig import SLH_PK_LEN, slh_verify
 from ..wire import dec, enc, r8, r32, r64, u8, u32, u64
 from . import merkle
 from .artifact import (ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, MAX_CHUNKS, MAX_PARTS, POLICY, FotaError, Manifest,
@@ -97,9 +97,23 @@ class Download:
         return all(self.have[i // 8] >> (i % 8) & 1 for i in range(self.manifest.chunk_count))
 
 
+def check_anchors(anchors: dict[int, bytes]) -> None:
+    """The burned-in anchors (Master O7, §15.13-§15.14, DR-050; Codex audit B): exactly A (release) and B (recovery),
+    each an SLH-DSA-SHA2-128s public key, and two DIFFERENT keys. With one anchor, or the same key twice, a stolen
+    station key could never be revoked: KEYREVOKE needs the other anchor. Checked when the installer is built, i.e.
+    at provisioning and at every boot."""
+    if set(anchors) != {ANCHOR_A, ANCHOR_B}:
+        raise FotaError("the device needs exactly two anchors, A (release) and B (recovery); only A and B exist")
+    if any(len(pk) != SLH_PK_LEN for pk in anchors.values()):
+        raise FotaError(f"an anchor is not a {SLH_PK_LEN}-byte SLH-DSA-SHA2-128s public key")
+    if anchors[ANCHOR_A] == anchors[ANCHOR_B]:
+        raise FotaError("anchors A and B must be distinct keys (separate custodians)")
+
+
 class Installer:
     def __init__(self, anchors: dict[int, bytes], device_class: str, max_packet: int, flash: FotaFlash,
                  protected: RecordStore, store: RecordStore, clock: Callable[[], float]):
+        check_anchors(anchors)
         self.anchors, self.cls = dict(anchors), device_class
         self.flash, self.store, self.clock = flash, store, clock
         self.prot = Protected(protected)
