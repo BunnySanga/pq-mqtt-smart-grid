@@ -7,8 +7,8 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
     docker run --rm pqgrid-tests python tools/mutation_check.py --root /app sel 1,9,10 0 1   # only these mutants
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
-147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2
-(§16). A mutant may name broker tests (5th element) for a check only a real broker exercises; they run in addition
+147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2,
+183-200 its other fixes (§16). A mutant may name broker tests (5th element) for a check only a real broker exercises; they run in addition
 to the in-process suite (the test image has Mosquitto). Results and the classification of every survivor:
 IMPLEMENTATION-ROADMAP §15 (and §16 for 173 onwards).
 """
@@ -35,8 +35,8 @@ M = [
      "        if False:\n            raise EnvelopeError(\"session belongs", "alert: old-policy session"),
     ("pqgrid/e2e/handshake.py", "        if self.now() < s.chain_expires:\n            return False\n        if self.sessions",
      "        if True:\n            return False\n        if self.sessions", "utility chain end"),
-    ("pqgrid/e2e/handshake.py", "        if (s is None or not self.active(device_id) or not ct_eq(s.policy_info, self.policy.info())",
-     "        if (s is None or not ct_eq(s.policy_info, self.policy.info())", "current_session: revoked"),
+    ("pqgrid/e2e/handshake.py", "        if (s is None or rec is None or not rec.active or s.dclass != rec.dclass",
+     "        if (s is None or rec is None or s.dclass != rec.dclass", "current_session: revoked"),
     ("pqgrid/e2e/handshake.py", "        self._pending.pop(device_id, None)\n        return closed",
      "        return closed", "revoke: half-open kept"),
     # ---------------------------------------------------------------- handshake (device)
@@ -206,7 +206,8 @@ M = [
      "        pass                   # E61 now", "C1-10 installer limit follows commit"),
     ("pqgrid/fota/installer.py", "            self.max_packet = installed.profile(self.cls).max_packet\n",
      "            pass\n", "C1-10 installer limit at boot"),
-    ("pqgrid/fota/installer.py", "        self._finish_interrupted_commits()\n", "", "C1-7 boot reconciliation"),
+    ("pqgrid/fota/installer.py", "        self._finish_interrupted_commits()                             # by the committed versions (trusted)\n",
+     "", "C1-7 boot reconciliation"),
     ("pqgrid/mqtt/device_node.py", "            self.outbox.cap = prof.outbox_cap                 # the budget",
      "            pass                 # the budget", "C1-10 outbox cap follows policy"),
     ("pqgrid/commands/utility.py", "        self._forget_grants(device_id, s.sid, now)\n", "", "C1-4 GRANT pruning"),
@@ -222,7 +223,7 @@ M = [
      "        if False:\n            policy = active", "C1-12 active policy resumed"),
     ("pqgrid/fota/publisher.py", "        self._store(key, art, pub)                                 # the rollout state first",
      "        pass                                 # the rollout state first", "C1-13 publish persisted"),
-    ("pqgrid/fota/publisher.py", "            self._store_revoked(rid)\n", "            pass\n", "C1-13 revocation persisted"),
+    ("pqgrid/fota/publisher.py", "            self._store_revoked(rid)", "            pass", "C1-13 revocation persisted"),
     ("pqgrid/fota/publisher.py", "                self._store(key, pub.artifact, None)               # still the newest",
      "                pass               # still the newest", "C1-13 cleanup persisted"),
     ("pqgrid/persistence/flash.py", "                    end = (i + 1, 0)                           # after its type byte",
@@ -335,6 +336,51 @@ M = [
      "            if False:", "P1-2 retries are rate-limited"),
     ("pqgrid/fota/publisher.py", "            if pub.confirmed or pub.tokens is not None or not self.valid(pub.artifact):",
      "            if pub.confirmed or pub.tokens is not None:", "P1-2 a retry never resurrects an invalid artifact"),
+    # ---------------------------------------------------- Codex audit P0-1, P1-1, P1-3, B, C (IMPLEMENTATION-ROADMAP §16)
+    ("pqgrid/fota/installer.py", "        self._reverify_recovered()\n        self._finish_interrupted_keyrevoke()",
+     "        self._finish_interrupted_keyrevoke()", "P0-1 recovered artifacts re-verified at boot"),
+    ("pqgrid/fota/installer.py", "            m = self._reverify(FIRMWARE, m)                                # P0-1",
+     "            pass                                # P0-1", "P0-1 firmware re-verified before activation"),
+    ("pqgrid/fota/installer.py", "        m = self._reverify(POLICY, m)                                      # P0-1",
+     "        pass                                      # P0-1", "P0-1 policy re-verified before activation"),
+    ("pqgrid/fota/installer.py", "            if kept != m:", "            if False:",
+     "P0-1 the record must be the kept signed manifest"),
+    ("pqgrid/fota/installer.py",
+     "        cap = (self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size) - SIGNED_RESERVE",
+     "        cap = (self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size)",
+     "P0-1 capacity leaves room for the kept signed manifest"),
+    ("pqgrid/registry.py",
+     "        if old is not None and (old.dclass, old.e2e_pk, old.active) != (rec.dclass, rec.e2e_pk, rec.active):",
+     "        if False:", "P1-1 the registry never overwrites a device"),
+    ("pqgrid/pasr/tickets.py", "        if rec.provisioned_at and t.issued_at <= rec.provisioned_at:", "        if False:",
+     "P1-1 tickets of the old record refused"),
+    ("pqgrid/e2e/handshake.py",
+     "        self.registry.reprovision(rec, self.now())\n        return self._drop_device(rec.device_id)",
+     "        self.registry.reprovision(rec, self.now())\n        return 0", "P1-1 the old record's sessions end"),
+    ("pqgrid/commands/utility.py", "            self.store.close(q, b\"UNKNOWN\" if q.sends else b\"CANCELLED\")",
+     "            pass", "P1-1 the old record's commands close"),
+    ("pqgrid/persistence/utility_db.py", "        zones = self.zones.rotate_device(rec.device_id)",
+     "        zones = []", "P1-1 the old record's zone keys rotate"),
+    ("pqgrid/persistence/utility_db.py",
+     "        with self.db.tx():\n            self.commands.cancel_device(rec.device_id)",
+     "        if True:\n            self.commands.cancel_device(rec.device_id)",
+     "P1-1 record and commands change in one transaction"),
+    ("pqgrid/mqtt/utility_node.py",
+     "        self._acl_due = True\n        self.recompile_acl()\n\n    def _send_zone_keys(self, zone: str) -> None:",
+     "        pass\n\n    def _send_zone_keys(self, zone: str) -> None:", "P1-1 the ACL follows the new record"),
+    ("pqgrid/persistence/utility_db.py", "            os.fchmod(fd, DB_MODE)", "            pass",
+     "P1-3 an existing backup target is narrowed first"),
+    ("pqgrid/persistence/utility_db.py",
+     "        require_owner_only(path)                              # an existing file, or a restored backup",
+     "        pass                              # an existing file, or a restored backup",
+     "P1-3 a database readable by others is refused"),
+    ("pqgrid/fota/installer.py", "        check_anchors(anchors)\n", "", "B exactly the two distinct anchors"),
+    ("pqgrid/mqtt/guard.py", "        super().extend(items)\n        self._trim()", "        super().extend(items)",
+     "C a bounded log stays bounded when extended"),
+    ("pqgrid/mqtt/utility_node.py", "        self.telemetry: list[tuple[bytes, bytes]] = BoundedLog(INBOX_CAP)",
+     "        self.telemetry: list[tuple[bytes, bytes]] = []", "C the telemetry inbox is bounded"),
+    ("pqgrid/mqtt/utility_node.py", "        self.alerts: list[tuple[bytes, bytes, bool]] = BoundedLog(INBOX_CAP)",
+     "        self.alerts: list[tuple[bytes, bytes, bool]] = []", "C the alert inbox is bounded"),
 ]
 
 

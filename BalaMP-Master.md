@@ -1803,6 +1803,7 @@ been measured. (3) is not implemented in the Python prototype (a prototype choic
 | Network / broker | Cross-class firmware | Class field in the signed manifest (F7) |
 | Broker | Withhold updates | Not preventable (DoS). The stretch goal, a freshness heartbeat signed with ML-DSA-65, lets devices detect it |
 | Attacker with access to external flash | Modify a staged image after the download checks | **v2.2:** the bootloader re-verifies the payload hash before booting or swapping from an external slot; a policy is re-checked against its signed SHA-256 whenever it is read back from flash (activation, boot) [SIM] |
+| Attacker who can rewrite the device's flash (record store, slots, areas) | Make a forged staged artifact boot, install or revoke after a reboot | The signed manifest (manifest + SLH-DSA signature) is kept in the tail of the artifact's own area and verified again at every boot and right before activation; the record store's copy of the manifest is only an index that must match it (Codex audit P0-1, IMPLEMENTATION-ROADMAP §16) [SIM]. Protected storage (committed versions, revocations) stays trusted |
 | Thief of a station key | Sign malicious firmware | **v2.2:** anchor revocation by the other anchor (§15.14) |
 | A future quantum computer or lattice break | Forge signatures | Hash-based SLH-DSA (hash assumptions only) |
 
@@ -1922,8 +1923,10 @@ An overwrite-only bootloader cannot revert, so two slots are needed.
 | C3 (1–2 MB) and C4 | Yes |
 
 **Procedure:**
-1. collect the manifest parts → verify the signature (from flash) → check magic, class and limits →
-   `version > committed[type]`;
+1. collect the manifest parts → verify the signature (from flash) → check magic, class and limits (the payload
+   must fit the area minus the kept signed manifest, 8,704 B) → `version > committed[type]` → keep the signed
+   manifest in the tail of the artifact's area (P0-1); after a reboot nothing recovered is believed until that copy
+   verifies again and matches the record, and it is verified once more right before activation;
 2. write verified chunks into the inactive slot;
 3. check the length and SHA-256: **staged**;
 4. by artifact type:
@@ -2285,7 +2288,7 @@ It had five steps:
 | Y10 | RNG unstated | TRNG + SP 800-90A DRBG required (§7.13) |
 | Y11 | Watchdog vs long crypto | Per-class budget; crypto yields (§15.12, §27.2) |
 | Y12 | Modem-offloaded TLS is not PQ | TLS on the application MCU with a hybrid-capable library (§8.1) |
-| Y13 | Generic FOTA limits; external slot B unverified at boot | Limit = own slot size; re-verify the external slot (§15.8, §15.10) |
+| Y13 | Generic FOTA limits; external slot B unverified at boot | Limit = own slot size (minus the kept signed manifest, P0-1); re-verify the external slot (§15.8, §15.10) |
 | Y14 | 8-bit STEK key id; manual retirement | 16-bit kid; automatic retirement (§14.4) |
 
 ---
@@ -3542,7 +3545,7 @@ Bounded costs:
 | V-F2 | KEYREVOKE(A) signed by B → A-signed artifacts refused; B-signed accepted | as stated | — | Revocation | PASS-v2.2 |
 | V-F3 | KEYREVOKE(A) signed by A, or revoking the last anchor | Refused | — | Revocation safety | PASS-v2.2 |
 | V-F4 | External slot B modified after staging | Boot refuses (hash mismatch) | — | Integrity | NEW **[HW]** |
-| V-F5 | Manifest with payload length > own slot | Refused before download | — | Resource safety | PASS-v2.2 |
+| V-F5 | Manifest with payload length > own slot (minus the kept signed manifest, P0-1) | Refused before download | — | Resource safety | PASS-v2.2 |
 
 ## 24.4 Network and broker (real Mosquitto, interception proxy)
 
@@ -3837,6 +3840,7 @@ redirects v2.1's ESP32 stretch goal to the actual target classes.
 | **v2.2 + continuous audit, cycles 2–3** | 2026-09-30 | A revoked member keeps no zone key after a crash (zone removal finished at start); rotation before the policy is persisted; a DF's alerts recorded as seen only after its reply is built; revoked devices' TELEMETRY refused; an undefined class gets no ACL rights (the rest of the fleet's ACL is still written); a device follows its new crypto group's DR topic after an AEAD change. 147 mutants, 142 killed, 5 equivalent (re-classified by the release remediation, next row) | IMPLEMENTATION-ROADMAP §14 |
 | **v2.2 + independent release audit remediation** | 2026-09-30 | Utility key rotation through the policy (DR-051); reconnect when a policy changes CONNECT properties, POLICY/KEYREVOKE sized to the class floor (DR-052); one authoritative revocation set at the utility (DR-050 amended); fresh utility_time: bounded attempt lifetime (DR-053); CA roll-over through `ca_set` (§4.5); ACL hook failures retried, never reported as refusals; DF alerts reach the application before the reply; clone alarm on a reused ticket; explicit broker user and queue limit; composed attack I1 over the broker; a live zone join grants the ACL read right before the new zone key; documentation reconciled (§24 statuses, anchor rule, V-G5, D-1/D-2, limitations L16–L23); evidence labelled [DOCKER, substitute]. Mutation re-run: 173 mutants, 170 killed by test failures, 3 classified survivors (one equivalent, one unreachable under DR-050, one equivalent under SHA-256 second-preimage resistance); two of the earlier "equivalent" ones now have direct tests. Tests 546 → 629, all passing | Independent read-only release audit (IMPLEMENTATION-ROADMAP §15) |
 | **v2.2 + Codex audit, P1-2** | 2026-10-03 | Utility-side publishes followed to the broker's PUBACK: a publish made during a broker outage no longer breaks every later one; a publish the client did not queue is an error and its command is not counted as sent; an artifact is confirmed only when the broker accepted every message and is published again until it is (U-3, U-7). No design decision changed. Triage of the whole audit: IMPLEMENTATION-ROADMAP §16 |
+| **v2.2 + Codex audit, remaining findings** | 2026-10-04 | P0-1: the staged signed manifest is kept beside the artifact and re-verified at boot and before activation (§15 procedure, threat model, V-F5). P1-1: re-provisioning (`reprovision`) ends the old record's sessions, tickets (provisioning time), commands, GRANTs and zone keys; the registry never overwrites a device. P1-3: every copy of the utility database is owner-only. B: exactly the two distinct anchors A and B. C: the utility's application inboxes are bounded. Triage and evidence: IMPLEMENTATION-ROADMAP §16 |
 
 **Semester 1 (separate):** the SLE-KEMQTT prototype (`pq-mqtt-session-security/`), its design spec and the
 Semester 1 PDFs were removed from this folder on 2026-09-22. They were moved to the macOS Trash folder

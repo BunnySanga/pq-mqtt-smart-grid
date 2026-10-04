@@ -195,6 +195,7 @@ def test_power_loss_between_the_commit_and_dropping_the_staged_record(dev, stati
     assert dev.inst.committed(FIRMWARE) == 2 and dev.inst.prot.active == 1 - active
     assert dev.inst.boot_staged_firmware(lambda img: True) == "nothing staged"
     assert dev.inst.staged == {} and dev.inst.downloads == {}
+    assert dev.inst.recovery_refused == []                           # finished, not refused as a forgery (P0-1)
 
 
 def test_EF3_chunk_from_another_version_is_refused(dev, station):

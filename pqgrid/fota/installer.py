@@ -2,7 +2,10 @@
 E57–E63).
 
 Order of trust for every artifact:
-  1. the signed manifest, verified against a burned-in, non-revoked anchor before any field is believed;
+  1. the signed manifest, verified against a burned-in, non-revoked anchor before any field is believed; a copy of
+     it (manifest and signature) is kept in the tail of the artifact's own area, and nothing recovered from flash is
+     believed until that copy verifies again: at every boot, and once more right before activation (Codex audit
+     P0-1). The record store's copy of the manifest is only an index that must match it;
   2. class, type, limits (payload ≤ this device's own slot: V-F5; chunks fit its packet limit: E61) and
      version > committed[type] (anti-rollback: F4–F6), all before downloading anything;
   3. each chunk against the signed Merkle root (F1), written to the inactive slot, then its bit in the bitmap
@@ -37,6 +40,8 @@ from .artifact import (ANCHOR_A, ANCHOR_B, FIRMWARE, KEYREVOKE, MAX_CHUNKS, MAX_
 T_PROTECTED = 1                              # in the protected store
 T_DOWNLOAD, T_STAGED = 30, 31                # in the device's normal record store
 CHUNK_RECORD, MQTT_RESERVE = 37, 128         # E11
+SIGNED_RESERVE = 8704                        # tail of every artifact area: u32 length ‖ the signed manifest (8,042 B
+#                                              at SLH-DSA-SHA2-128s): payload capacity = area − this (P0-1)
 STAGING_CAP = 16 * 1024                      # manifest parts (8,042 B signed manifest at 128s)
 MAX_ASSEMBLIES = 4                           # manifests assembled at once; the least recently used is evicted
 
@@ -127,13 +132,37 @@ class Installer:
         self._parts: dict[tuple[int, int], dict] = {}
         self.downloads: dict[int, Download] = {}
         self.staged: dict[int, Manifest] = {}
+        self.recovery_refused: list[str] = []                          # recovered artifacts not believed (P0-1)
         for key, (_, raw) in store.items(T_DOWNLOAD).items():          # resume after a reboot (E-F1)
-            mraw, have = dec(raw, 2)
-            self.downloads[key[0]] = Download(decode_manifest(mraw), mraw, bytearray(have))
+            try:
+                mraw, have = dec(raw, 2)
+                self.downloads[key[0]] = Download(decode_manifest(mraw), mraw, bytearray(have))
+            except (WireError, FotaError):
+                store.delete(T_DOWNLOAD, key)
         for key, (_, raw) in store.items(T_STAGED).items():
-            self.staged[key[0]] = decode_manifest(raw)
-        self._finish_interrupted_commits()
+            try:
+                self.staged[key[0]] = decode_manifest(raw)
+            except (WireError, FotaError):
+                store.delete(T_STAGED, key)
+        self._finish_interrupted_commits()                             # by the committed versions (trusted)
+        self._reverify_recovered()
         self._finish_interrupted_keyrevoke()
+
+    def _reverify_recovered(self) -> None:
+        """Codex audit P0-1: an artifact recovered from flash (downloading or staged) is believed only if the signed
+        manifest kept in its area verifies now and is the one its record names. Before, the records were decoded and
+        believed as they were: rewriting the staged record and the slot made a forged image boot and commit."""
+        recovered = [(t, d.manifest) for t, d in self.downloads.items()] + list(self.staged.items())
+        for t, m in recovered:
+            try:
+                kept = self._reverify(t, m)
+            except FotaError as e:
+                self.recovery_refused.append(f"type {t}: {e}")
+                continue
+            if t in self.downloads:
+                self.downloads[t].manifest = kept
+            else:
+                self.staged[t] = kept
 
     def _finish_interrupted_commits(self) -> None:
         """A commit is one protected record; the staging record is dropped after it. If power failed in between, the
@@ -182,9 +211,9 @@ class Installer:
         del self._parts[(t, v)]
         return self.accept_signed(b"".join(slot["p"][k] for k in range(n)), label=(t, v))
 
-    def accept_signed(self, signed: bytes, label: Optional[tuple[int, int]] = None) -> Optional[Manifest]:
-        """`label`: the (type, version) the parts claimed. Part headers are not signed, so they must match the
-        signed manifest: an old manifest re-wrapped under a newer label is refused, whatever the early checks."""
+    def _verify(self, signed: bytes) -> tuple[Manifest, bytes]:
+        """The signed manifest's signature against a burned-in, non-revoked anchor in its DR-050 role. Returns the
+        manifest (believed from here on) and its signed bytes."""
         raw, sig = split_signed(signed)
         m = decode_manifest(raw)                                         # parsed, not yet believed
         if m.signer_anchor_id not in self.anchors:
@@ -194,14 +223,22 @@ class Installer:
         if not slh_verify(self.anchors[m.signer_anchor_id], sig, raw):
             raise FotaError("manifest signature invalid")                 # F2, F3
         check_signer(m.type, m.signer_anchor_id, self.prot.revoked)       # DR-050 roles (H4)
+        return m, raw
+
+    def accept_signed(self, signed: bytes, label: Optional[tuple[int, int]] = None) -> Optional[Manifest]:
+        """`label`: the (type, version) the parts claimed. Part headers are not signed, so they must match the
+        signed manifest: an old manifest re-wrapped under a newer label is refused, whatever the early checks."""
+        m, raw = self._verify(signed)
         if label is not None and label != (m.type, m.version):
             raise FotaError("manifest parts labelled with another type or version")
         # ------------------------------------------------------------------- trusted from here on
         if m.device_class != self.cls:
             raise FotaError("manifest targets another device class")      # F7
-        cap = self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size
+        cap = (self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size) - SIGNED_RESERVE
         if m.payload_length > cap:
-            raise FotaError("payload larger than this device's slot")        # V-F5, before any download
+            raise FotaError("payload larger than this device's slot")        # V-F5, before any download (the slot
+        if 4 + len(signed) > SIGNED_RESERVE:                               # minus the kept signed manifest)
+            raise FotaError("signed manifest larger than the copy the device keeps of it")
         if m.chunk_count > MAX_CHUNKS:
             raise FotaError(f"more than {MAX_CHUNKS} chunks: the download record would not fit its budget")
         if m.chunk_size + merkle.HASH_LEN * merkle.max_path_len(m.chunk_count) + CHUNK_RECORD + MQTT_RESERVE \
@@ -219,9 +256,45 @@ class Installer:
             if m.version < cur.manifest.version:
                 raise FotaError("older than the artifact already in progress")   # E-F4
         self._drop(m.type)                                                 # a newer version replaces it
+        self._keep_signed(m.type, signed)                                  # P0-1: before the record that needs it
         self.downloads[m.type] = Download(m, raw, bytearray((m.chunk_count + 7) // 8))
         self._save_download(m.type)
         return m
+
+    # ------------------------------------------------------------------------- the kept signed manifest (P0-1)
+    def _keep_signed(self, t: int, signed: bytes) -> None:
+        area = self._area(t)
+        area[len(area) - SIGNED_RESERVE:] = (u32(len(signed)) + signed).ljust(SIGNED_RESERVE, b"\0")
+
+    def _verified_copy(self, t: int) -> Manifest:
+        """Codex audit P0-1: the signed manifest kept in the tail of type t's area, verified NOW (anchor, signature,
+        DR-050 role with the revocations of now) and checked to be for this type and class. The record store, the
+        slot and the copy can all be rewritten by someone with access to flash; only a valid signature is believed.
+        Raises FotaError."""
+        area = self._area(t)
+        tail = len(area) - SIGNED_RESERVE
+        n = r32(bytes(area[tail:tail + 4]))
+        if not 0 < n <= SIGNED_RESERVE - 4:
+            raise FotaError("no signed manifest kept beside the staged artifact")
+        try:
+            m, _ = self._verify(bytes(area[tail + 4:tail + 4 + n]))
+        except WireError as e:
+            raise FotaError("the kept signed manifest is malformed") from e
+        if m.type != t or m.device_class != self.cls:
+            raise FotaError("the kept signed manifest is for another artifact type or class")
+        return m
+
+    def _reverify(self, t: int, m: Manifest) -> Manifest:
+        """The kept copy verifies and is the very manifest the record (or RAM) names; otherwise the artifact is dropped
+        and FotaError raised."""
+        try:
+            kept = self._verified_copy(t)
+            if kept != m:
+                raise FotaError("the recorded manifest is not the signed one kept beside the artifact")
+        except FotaError:
+            self._drop(t)
+            raise
+        return kept
 
     # ----------------------------------------------------------------------------------------- chunks
     def _area(self, t: int) -> bytearray:
@@ -278,6 +351,10 @@ class Installer:
         except FotaError:
             self._drop(FIRMWARE)
             return "refused: signer revoked"
+        try:
+            m = self._reverify(FIRMWARE, m)                                # P0-1: the signature, once more
+        except FotaError:
+            return "refused: staged manifest not verified"
         new = 1 - self.prot.active
         image = bytes(self.flash.slots[new][:m.payload_length])
         if hashlib.sha256(image).digest() != m.payload_sha256:
@@ -301,6 +378,7 @@ class Installer:
         except FotaError:
             self._drop(POLICY)
             raise FotaError("staged policy signed by a revoked anchor")
+        m = self._reverify(POLICY, m)                                      # P0-1: the signature, once more
         payload = bytes(self._area(POLICY)[:m.payload_length])
         if hashlib.sha256(payload).digest() != m.payload_sha256:          # as V-F4 for firmware: re-read from flash,
             self._drop(POLICY)                                             # so re-checked against the signed hash
