@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import contextmanager
@@ -77,6 +78,22 @@ CREATE TABLE IF NOT EXISTS utility_keys(kind TEXT NOT NULL CHECK (kind IN ('kem'
                                         sk BLOB NOT NULL, PRIMARY KEY (kind, pk));
 """
 MAX_ANCHORS = 16
+DB_MODE = 0o600                                   # the database holds private keys and STEKs (P1-3)
+
+
+def require_owner_only(path: str) -> None:
+    """Codex audit P1-3: the utility database holds the utility's private keys and the STEKs, so its file and the
+    files SQLite keeps beside it (-wal, -shm, -journal) must belong to this process's user and be readable or
+    writable by nobody else. Checked when a database (or a restored backup) is opened and when a backup is written;
+    raises PermissionError otherwise."""
+    for f in (path, path + "-wal", path + "-shm", path + "-journal"):
+        try:
+            st = os.stat(f)
+        except FileNotFoundError:
+            continue
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            raise PermissionError(f"{f}: mode {stat.S_IMODE(st.st_mode):04o}, owner uid {st.st_uid}: the utility "
+                                  f"database holds private keys and STEKs and must be owner-only (chmod 600)")
 MAX_TOPICS = MAX_PARTS + MAX_CHUNKS
 
 
@@ -84,7 +101,8 @@ class UtilityDB:
     def __init__(self, path: str):
         self.path = path
         if not os.path.exists(path):                          # holds the STEK: owner-only (0600)
-            os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+            os.close(os.open(path, os.O_CREAT | os.O_RDWR, DB_MODE))
+        require_owner_only(path)                              # an existing file, or a restored backup (P1-3)
         # One connection shared by the MQTT thread and the application: every statement and transaction runs
         # under self.lock, so check_same_thread can be off without two threads ever interleaving on it.
         self.lock = threading.RLock()
@@ -155,7 +173,16 @@ class UtilityDB:
         self.execute("INSERT OR IGNORE INTO revoked_anchors VALUES (?)", (anchor,))
 
     def backup_to(self, path: str) -> None:
-        """A consistent copy (for restore tests: V-S1)."""
+        """A consistent copy (for restore tests: V-S1). It holds the same private keys and STEKs, so it is owner-only
+        like the database (P1-3): created 0600 whatever the umask, and an existing file is narrowed to 0600 before
+        anything is written into it (sqlite3.connect alone created it with the default mode, 0644 under umask 022).
+        SQLite gives the copy's journal the copy's mode."""
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY, DB_MODE)
+        try:
+            os.fchmod(fd, DB_MODE)                            # an existing file keeps its old mode on open
+        finally:
+            os.close(fd)
+        require_owner_only(path)
         dst = sqlite3.connect(path)
         with dst:
             self.c.backup(dst)
