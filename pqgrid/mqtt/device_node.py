@@ -141,6 +141,8 @@ class DeviceMqtt:
         self._declared: Optional[tuple[int, int, int]] = None  # CONNECT properties the live connection declared
         self.policy_reconnects = 0                            # planned reconnects after a CONNECT-property change
         self._unacked: list = []                              # recent QoS 1 publishes not yet acknowledged
+        self._unacked_lock = threading.Lock()                 # _publish runs on paho's thread and the main loop's;
+        #                                                       never held while calling into paho
 
     # ------------------------------------------------------------------------------------------ connection
     @staticmethod
@@ -241,12 +243,14 @@ class DeviceMqtt:
     def flush(self, timeout: float) -> bool:
         """True once every QoS 1 message published on this connection has been acknowledged by the broker."""
         end = time.monotonic() + timeout
-        for info in list(self._unacked):
+        with self._unacked_lock:
+            pending = list(self._unacked)
+        for info in pending:
             try:
                 info.wait_for_publish(max(0.0, end - time.monotonic()))
             except (RuntimeError, ValueError):
                 return False
-        return all(i.is_published() for i in self._unacked)
+        return all(i.is_published() for i in pending)
 
     def _on_connect(self, client, userdata, flags, rc, props):
         self.session_present = bool(flags.session_present)
@@ -294,7 +298,8 @@ class DeviceMqtt:
         info = self.c.publish(topic, payload, qos=1)
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
             raise TransportError(f"publish failed: {mqtt.error_string(info.rc)}")
-        self._unacked = [i for i in self._unacked if not i.is_published()][-UNACKED_TRACKED:] + [info]
+        with self._unacked_lock:                              # two threads publish: no update may be lost
+            self._unacked = [i for i in self._unacked if not i.is_published()][-UNACKED_TRACKED:] + [info]
 
     # ------------------------------------------------------------------------------------- establishment
     def _exchange(self, msg: bytes, accept: Callable[[bytes], object]):

@@ -1487,7 +1487,7 @@ exercises them.
 
 | Run | Code | Result |
 |---|---|---|
-| Full run, 4 slices (substitute image) | `d460e3a` (the production code of the final tree is identical apart from comments and docstrings, checked by AST comparison, except `UtilityMqtt.join_zone`) | 172 mutants (0–171): **168 KILLED**, each by exactly one failing test; **4 SURVIVED** (40, 110, 112, 155); 0 ERROR |
+| Full run, 4 slices (substitute image) | `d460e3a` (the production code of the final tree is identical apart from comments and docstrings, checked by AST comparison, except `UtilityMqtt.join_zone`) | 172 mutants (0–171): **168 KILLED**, each by a failing test (the run stops at the first failure, `pytest -x`, so every result line shows 1 failed: that is the tool, not a measure of how many tests catch the mutant); **4 SURVIVED** (40, 110, 112, 155); 0 ERROR |
 | Re-run of every mutant in `pqgrid/mqtt/utility_node.py`, plus 155 and 172 | final code, `a55a227` | **17 of 17 KILLED** (the 15 in `utility_node.py`, 155 with its new test, 172) |
 
 **Scores, kept apart.** In-process (unit and security suites): 170 mutants on the final code (169 of the full run plus 172), 167 KILLED; the 3 survivors are classified below. Broker-assisted (154, 155, 166): 3 of 3 KILLED on the final code (155 only since the test added in `a55a227`). Overall: 173 mutants, 170 killed by test failures, 3 classified survivors, 0 errors.
