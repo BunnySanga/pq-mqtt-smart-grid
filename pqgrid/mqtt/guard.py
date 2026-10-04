@@ -37,13 +37,36 @@ def guarded(node, where: str, fn, protocol_log: list, alarms: list):
 
 
 class BoundedLog(list):
-    """A local log that keeps the newest `cap` entries: a flood of refusals cannot grow a node's memory."""
+    """A local log, or the inbox a node hands its application (alerts, telemetry, statuses, alarms), that keeps the
+    newest `cap` entries: a flood of refusals or of valid traffic cannot grow a node's memory (Codex audit C). What
+    falls off is counted in `dropped`, never silent; the application takes its entries with drain(). append(),
+    extend() and += are all bounded (before the audit only append() was, and the utility added a DF's alerts
+    with +=)."""
 
     def __init__(self, cap: int = 1000):
         super().__init__()
-        self.cap = cap
+        self.cap, self.dropped = cap, 0
 
     def append(self, item) -> None:
         super().append(item)
-        if len(self) > self.cap:
-            del self[0]
+        self._trim()
+
+    def extend(self, items) -> None:
+        super().extend(items)
+        self._trim()
+
+    def __iadd__(self, items):
+        self.extend(items)
+        return self
+
+    def _trim(self) -> None:
+        over = len(self) - self.cap
+        if over > 0:
+            del self[:over]
+            self.dropped += over
+
+    def drain(self) -> list:
+        """Every entry, oldest first, removed from the log: the consumer's API."""
+        out = list(self)
+        self.clear()
+        return out

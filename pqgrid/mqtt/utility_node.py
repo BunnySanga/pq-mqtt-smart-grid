@@ -44,6 +44,7 @@ from .device_node import TransportError
 
 TAKEOVER_WINDOW_S, TAKEOVER_LIMIT = 600, 5
 REFUSAL_MEMORY_S, REFUSALS_KEPT = 600, 1024    # refused PUBACKs kept for matching against tracked publishes
+INBOX_CAP = 1000                               # entries per application inbox (alerts, telemetry, statuses, alarms)
 FIRMWARE_T, POLICY_T = 1, 2                                         # fota.artifact types (avoids an import cycle)
 ZONE_ROTATE_EVERY_S = 7 * 86400                                     # key table §4.7: … and weekly
 
@@ -66,10 +67,12 @@ class UtilityMqtt:
         self._props = Properties(PacketTypes.CONNECT)
         self._props.SessionExpiryInterval = 86400
         self.connected = threading.Event()
-        self.alerts: list[tuple[bytes, bytes, bool]] = []              # (device, payload, duplicate)
-        self.telemetry: list[tuple[bytes, bytes]] = []
-        self.statuses: list[tuple[bytes, int, bytes]] = []
-        self.takeover_alarms: list[bytes] = []
+        # What the utility hands its application, bounded (Codex audit C): the application drains them; an overflow
+        # drops the oldest entries and counts them (`dropped`), so valid traffic cannot grow the utility's memory.
+        self.alerts: list[tuple[bytes, bytes, bool]] = BoundedLog(INBOX_CAP)   # (device, payload, duplicate)
+        self.telemetry: list[tuple[bytes, bytes]] = BoundedLog(INBOX_CAP)
+        self.statuses: list[tuple[bytes, int, bytes]] = BoundedLog(INBOX_CAP)
+        self.takeover_alarms: list[bytes] = BoundedLog(INBOX_CAP)
         self.ticket_reuse_alarms: list[tuple[bytes, float]] = BoundedLog()   # "ticket already used" (M-1, §27.8)
         self._online: dict[bytes, deque] = {}
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
