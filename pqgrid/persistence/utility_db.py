@@ -31,7 +31,7 @@ from ..commands.utility import CommandService, QueuedCommand, UtilityCommandStor
 from ..commands.zones import GroupKey, LogicalEvent, Zone, ZoneManager
 from ..e2e.handshake import UtilityEndpoint
 from ..fota.artifact import MAX_CHUNKS, MAX_PARTS, decode_manifest, split_signed
-from ..fota.publisher import Published, Publisher
+from ..fota.publisher import Published, Publisher, Removal
 from ..fota.station import Artifact
 from ..keyring import UtilityKeyring
 from ..pasr.stek import StekKey, StekTable
@@ -72,6 +72,8 @@ CREATE TABLE IF NOT EXISTS artifacts(dclass TEXT NOT NULL, type INTEGER NOT NULL
                                      payload BLOB NOT NULL, parts BLOB NOT NULL, chunks BLOB NOT NULL,
                                      retained_at REAL, topics BLOB, confirmed INTEGER NOT NULL DEFAULT 0,
                                      PRIMARY KEY (dclass, type));
+CREATE TABLE IF NOT EXISTS artifact_removals(dclass TEXT NOT NULL, type INTEGER NOT NULL, version INTEGER NOT NULL,
+                                             topics BLOB NOT NULL, PRIMARY KEY (dclass, type, version));
 CREATE TABLE IF NOT EXISTS revoked_anchors(anchor INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS class_floor(dclass TEXT PRIMARY KEY, max_packet INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS utility_keys(kind TEXT NOT NULL CHECK (kind IN ('kem', 'cmd')), pk BLOB NOT NULL,
@@ -405,6 +407,19 @@ class SqlPublisher(Publisher):
 
     def _load_floor(self) -> dict[str, int]:
         return {dclass: mp for dclass, mp in self.db.execute("SELECT dclass, max_packet FROM class_floor")}
+
+    def _load_removals(self) -> list:
+        return [Removal((dclass, t), v, [x.decode() for x in dec_list(topics, MAX_TOPICS)])
+                for dclass, t, v, topics in self.db.execute(
+                    "SELECT dclass, type, version, topics FROM artifact_removals ORDER BY dclass, type, version")]
+
+    def _store_removal(self, r: Removal) -> None:
+        self.db.execute("INSERT OR REPLACE INTO artifact_removals VALUES (?, ?, ?, ?)",
+                        (r.key[0], r.key[1], r.version, enc_list([t.encode() for t in r.topics], MAX_TOPICS)))
+
+    def _forget_removal(self, r: Removal) -> None:
+        self.db.execute("DELETE FROM artifact_removals WHERE dclass = ? AND type = ? AND version = ?",
+                        (r.key[0], r.key[1], r.version))
 
     def _store_floor(self, dclass: str, max_packet: int) -> None:
         self.db.execute("INSERT OR REPLACE INTO class_floor VALUES (?, ?)", (dclass, max_packet))

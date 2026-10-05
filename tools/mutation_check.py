@@ -8,9 +8,10 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
 147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2,
-183-200 its other fixes, 201-215 the fixes of the second Codex review (§16). A mutant may name broker tests (5th
-element) for a check only a real broker exercises; they run in addition to the in-process suite (the test image has
-Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15 (§16 from 173 on).
+183-200 its other fixes, 201-215 the fixes of the second Codex review, 216-221 the follow-up (§16). A mutant may
+name broker tests (5th element) for a check only a real broker exercises; they run in addition to the in-process
+suite (the test image has Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15
+(§16 from 173 on).
 """
 import os
 import shutil
@@ -322,8 +323,10 @@ M = [
      "P1-2 a publish the client did not queue is an error"),
     ("pqgrid/commands/utility.py", "                    self.store.unmark_sent(q, prev)                 # it never left",
      "                    pass                 # it never left", "P1-2 a command that never left is not counted as sent"),
-    ("pqgrid/fota/publisher.py", "            elif all(a is True for a in answers):",
-     "            elif any(a is True for a in answers):", "P1-2 confirmed only when every message was acknowledged"),
+    ("pqgrid/fota/publisher.py",
+     "            elif all(a is True for a in answers):\n                pub.confirmed, pub.tokens = True, None",
+     "            elif any(a is True for a in answers):\n                pub.confirmed, pub.tokens = True, None",
+     "P1-2 confirmed only when every message was acknowledged"),
     ("pqgrid/fota/publisher.py", "            if False in answers:\n                pub.tokens = None",
      "            if False:\n                pub.tokens = None", "P1-2 a refused message un-does the publication"),
     ("pqgrid/mqtt/utility_node.py", "        if not reason_code.is_failure:\n            return",
@@ -418,6 +421,20 @@ M = [
      "        if False:         # finding 6: backpressure", "R2-6 open commands per device are capped"),
     ("pqgrid/mqtt/device_node.py", "        self.events: list[tuple[str, bytes]] = BoundedLog(1000)",
      "        self.events: list[tuple[str, bytes]] = []", "R2-6 the device's event list is bounded"),
+    # ---------------------------------------------------------------- follow-up items 1 and 2 (§16.8)
+    ("pqgrid/mqtt/device_node.py",
+     "        self.c.max_queued_messages_set(self._queue_cap())   # §16.8: bounded while the broker is down\n", "",
+     "F-1 the device's paho queue is bounded"),
+    ("pqgrid/mqtt/device_node.py",
+     "        self.c.max_queued_messages_set(self._queue_cap())     # §16.8: follows the class's outbox size\n", "",
+     "F-1 the bound follows the class's outbox"),
+    ("pqgrid/fota/publisher.py", "            self._send_removal(client, r)\n        return n",
+     "            pass\n        return n", "F-2 an unacknowledged removal is sent again"),
+    ("pqgrid/fota/publisher.py", "        self._store_removal(r)\n", "", "F-2 a removal is durable before it is sent"),
+    ("pqgrid/fota/publisher.py", "            if False in answers:\n                r.tokens = None",
+     "            if False:\n                r.tokens = None", "F-2 a refused removal is sent again"),
+    ("pqgrid/fota/publisher.py", "            self._drop_removal(r)                                  # published again",
+     "            pass                                  # published again", "F-2 a republish cancels its pending removal"),
 ]
 
 

@@ -14,7 +14,10 @@ persistence.utility_db.SqlPublisher makes it durable (Master §4.4, U-4), writte
 A publication counts as retained by the broker ("confirmed", durable too) only once the broker has acknowledged every
 one of its messages (Codex audit P1-2, IMPLEMENTATION-ROADMAP §16): settle() confirms from the client's
 acknowledgements, retry() publishes again what is unconfirmed with nothing in flight (after a restart, paho's queue
-is gone; after a refused message), at most once per retry_every_s.
+is gone; after a refused message), at most once per retry_every_s. A removal (the empty retained messages that delete a
+publication after the retention window, or when a newer version replaces it) is kept the same way until the broker
+acknowledged all of it (IMPLEMENTATION-ROADMAP §16.8): otherwise a removal lost with a restart left an old artifact
+retained for good while the utility believed it gone.
 """
 from __future__ import annotations
 
@@ -50,6 +53,17 @@ class Published:
     tried_at: Optional[float] = field(default=None, compare=False)   # when its messages were last handed over (RAM)
 
 
+@dataclass
+class Removal:
+    """The deletion of one publication from the broker: durable until the broker acknowledged every empty retained
+    message (§16.8), sent again while it has not."""
+    key: tuple
+    version: int
+    topics: list
+    tokens: Optional[list] = field(default=None, repr=False, compare=False)   # what client.publish returned (RAM)
+    tried_at: Optional[float] = field(default=None, compare=False)            # when last handed over (RAM)
+
+
 class Publisher:
     def __init__(self, policy, clock=time.time):
         self.clock = clock
@@ -60,6 +74,7 @@ class Publisher:
         self._last_request: dict[bytes, float] = {}
         self.revoked: set[int] = set()                             # anchors revoked by published KEYREVOKEs
         self.retry_every_s = RETRY_S
+        self.removals: list[Removal] = self._load_removals()       # deletions not yet acknowledged by the broker
 
     @property
     def policy(self):
@@ -109,7 +124,9 @@ class Publisher:
         self.live[key], self.newest[key] = pub, art
         if rid is not None:
             self.revoked.add(rid)
-        self._send(client, pub)
+        for r in [r for r in self.removals if (r.key, r.version) == (key, art.manifest.version)]:
+            self._drop_removal(r)                                  # published again: its pending deletion would
+        self._send(client, pub)                                    # delete the new copy (§16.8)
         if old and old.artifact.manifest.version != art.manifest.version:
             self._remove(client, old)                              # only the newest needs to stay retained
 
@@ -135,6 +152,14 @@ class Publisher:
                 pub.confirmed, pub.tokens = True, None
                 self._store(key, pub.artifact, pub)
                 n += 1
+        for r in list(self.removals):                              # §16.8: deletions, the same way
+            if not r.tokens:
+                continue
+            answers = [acked(t) for t in r.tokens]
+            if False in answers:
+                r.tokens = None
+            elif all(a is True for a in answers):
+                self._drop_removal(r)
         return n
 
     def retry(self, client) -> int:
@@ -149,6 +174,10 @@ class Publisher:
                 continue
             self._send(client, pub)
             n += 1
+        for r in self.removals:                                    # §16.8: deletions, the same way
+            if r.tokens is not None or (r.tried_at is not None and now - r.tried_at < self.retry_every_s):
+                continue
+            self._send_removal(client, r)
         return n
 
     def cleanup(self, client) -> int:
@@ -170,6 +199,15 @@ class Publisher:
 
     def _load_floor(self) -> dict[str, int]:
         return {}
+
+    def _load_removals(self) -> list:
+        return []
+
+    def _store_removal(self, r: Removal) -> None:
+        pass
+
+    def _forget_removal(self, r: Removal) -> None:
+        pass
 
     def _store_floor(self, dclass: str, max_packet: int) -> None:
         pass
@@ -211,5 +249,18 @@ class Publisher:
         return [a.manifest.type for a in arts]
 
     def _remove(self, client, pub: Published) -> None:
-        for t in pub.topics:
-            client.publish(t, b"", qos=1, retain=True)             # an empty retained message deletes it
+        """Delete a publication from the broker: durably recorded first (§16.8), then the empty retained messages."""
+        m = pub.artifact.manifest
+        r = Removal((m.device_class, m.type), m.version, list(pub.topics))
+        self._store_removal(r)
+        self.removals.append(r)
+        self._send_removal(client, r)
+
+    def _send_removal(self, client, r: Removal) -> None:
+        r.tokens, r.tried_at = None, self.clock()
+        r.tokens = [client.publish(t, b"", qos=1, retain=True) for t in r.topics]   # an empty retained message
+        #                                                                             deletes the retained one
+
+    def _drop_removal(self, r: Removal) -> None:
+        self.removals.remove(r)
+        self._forget_removal(r)

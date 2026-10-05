@@ -3693,7 +3693,7 @@ sizes it from its own sleep intervals, zone counts and utility outage budget.
 | U-4 | SQLite WAL, `synchronous = FULL`: registry, used tickets, STEK (or HSM), sequences, commands, zone keys, rollout state |
 | U-5 | Zone manager: ZONEKEY per member session; rotation on membership change + weekly |
 | U-6 | Resync hint rate limit (1 per 30 s per device) |
-| U-7 | Artifact publisher: parts and chunks ≤ class `max_packet`; retention window; republish requests rate-limited; an artifact counts as retained only once the broker has acknowledged every message (PUBACK without a failure code), and an unconfirmed one is published again, also after a restart (IMPLEMENTATION-ROADMAP §16, P1-2) |
+| U-7 | Artifact publisher: parts and chunks ≤ class `max_packet`; retention window; republish requests rate-limited; an artifact counts as retained only once the broker has acknowledged every message (PUBACK without a failure code), and an unconfirmed one is published again, also after a restart (IMPLEMENTATION-ROADMAP §16, P1-2); a removal likewise counts as done only once acknowledged, and is durable until then (§16.8) |
 | U-8 | ACL compiler: verify the policy signature, compile, SIGHUP; config validator (B-2) |
 
 ## 27.4 FOTA
@@ -3842,6 +3842,7 @@ redirects v2.1's ESP32 stretch goal to the actual target classes.
 | **v2.2 + Codex audit, P1-2** | 2026-10-03 | Utility-side publishes followed to the broker's PUBACK: a publish made during a broker outage no longer breaks every later one; a publish the client did not queue is an error and its command is not counted as sent; an artifact is confirmed only when the broker accepted every message and is published again until it is (U-3, U-7). No design decision changed. Triage of the whole audit: IMPLEMENTATION-ROADMAP §16 |
 | **v2.2 + Codex audit, remaining findings** | 2026-10-04 | P0-1: the staged signed manifest is kept beside the artifact and re-verified at boot and before activation (§15 procedure, threat model, V-F5). P1-1: re-provisioning (`reprovision`) ends the old record's sessions, tickets (provisioning time), commands, GRANTs and zone keys; the registry never overwrites a device. P1-3: every copy of the utility database is owner-only. B: exactly the two distinct anchors A and B. C: the utility's application inboxes are bounded. Triage and evidence: IMPLEMENTATION-ROADMAP §16 |
 | **v2.2 + second Codex review** | 2026-10-05 | A command the broker refused is sent again in its session (U-3); sessions and queued commands carry the device record's provisioning time and are refused once it changes (the lower-level re-provisioning steps are internal); damaged recovered FOTA records are refused at boot instead of aborting it; a failed re-provisioning still sends the rotated zone keys; bounded client queue, tracking, per-device command quota and device event list; a thread-safe inbox drain. IMPLEMENTATION-ROADMAP §16.7 |
+| **v2.2 + follow-up** | 2026-10-05 | The device's MQTT client queue is bounded by its class's outbox; an artifact removal is durable and confirmed like a publication (U-7). IMPLEMENTATION-ROADMAP §16.8 |
 
 **Semester 1 (separate):** the SLE-KEMQTT prototype (`pq-mqtt-session-security/`), its design spec and the
 Semester 1 PDFs were removed from this folder on 2026-09-22. They were moved to the macOS Trash folder

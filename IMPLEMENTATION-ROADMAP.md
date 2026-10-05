@@ -1612,10 +1612,9 @@ One existing test changed: `test_a_joining_member_gets_its_read_right_before_its
 `publish()` with an object without `rc`; it now returns paho's own `MQTTMessageInfo` (its assertions are unchanged).
 Mutants 173–182 cover the new checks (§16.4).
 
-Not changed: the device side already treats any rc ≠ 0 as a failed publish (`DeviceMqtt._publish`), so it never
-tracks such an info; an artifact *removal* (empty retained publish after the retention window) is not confirmed, so a
-removal lost to a restart leaves a valid, signed, older artifact retained (devices refuse it as a rollback or install
-the newest they see).
+Not changed here: the device side already treats any rc ≠ 0 as a failed publish (`DeviceMqtt._publish`), so it never
+tracks such an info (its paho queue is bounded since §16.8); an artifact *removal* was not confirmed here (since
+§16.8 it is).
 
 ### 16.3 Validation of the P1-2 fix (2026-10-03)
 
@@ -1685,3 +1684,13 @@ Mutants 201–215 cover the new checks (and 191, 198 and the P1-1 session/transa
 rewritten lines). Not mutated, by construction: the record-type match in recovery (the signature re-check drops such
 a record anyway) and the lock in `drain()` (only a race can show it).
 Validation (§16.6) now covers these as well; nothing here is claimed fixed until it has run.
+
+### 16.8 Follow-up: the two open items of §16.7's review (2026-10-05): written, not yet run
+
+| # | Gap | Fix | Regression tests (written) |
+|---|---|---|---|
+| F-1 | `DeviceMqtt._publish` raises on rc ≠ 0, but on MQTT_ERR_NO_CONN paho still keeps the message for the reconnect, and nothing bounded paho's queue: each publish attempt during a long broker outage grew the device's memory (the device-side mirror of §16.7 finding 6) | `max_queued_messages_set(outbox_cap // Outbox.OVERHEAD + QUEUE_HEADROOM)` (64), set at start and again whenever a policy changes the class's outbox: the burst after an establishment (every outbox entry that did not fit in DF goes live at once) always fits, and beyond it paho keeps nothing (MQTT_ERR_QUEUE_SIZE): alerts stay in the outbox, handshakes are retried | `tests/unit/test_device_queue.py` (2) |
+| F-2 | A removal (the empty retained messages that delete a publication after the retention window, or when a newer version replaces it) was not confirmed: lost with a restart, or refused, it left an old artifact retained for good while the database said it was gone | `Removal`, durable (`artifact_removals` table) BEFORE the empties are sent; confirmed by `settle()` only when every empty was acknowledged; `retry()` sends an unacknowledged one again (after a restart, or a refusal, at most once per `retry_every_s`); publishing the same version again cancels its pending removal, so a retry can never delete the newer copy | `…removal_lost_with_a_restart_is_sent_again`, `…removal_the_broker_refused_is_sent_again`, `…publishing_the_same_version_again_cancels_its_pending_removal` |
+
+Mutants 216–221 cover these checks (mutant 176's pattern now names the line after it: the removal loop reuses the
+same "every message acknowledged" test). Validation (§16.6) covers §16.5, §16.7 and §16.8.

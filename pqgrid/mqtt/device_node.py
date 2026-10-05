@@ -55,6 +55,8 @@ SETPOINT_ACK_EVERY_S = 30.0      # E-3 (§13.5): the cumulative SETPOINT ACK int
 ZONE_SYNC_RETRY_S = 10.0         # E-2: one outstanding zone sync per zone; retried after this if unanswered
 REPUBLISH_STALL_S = 600.0        # E-4: a verified download with no new chunk for this long asks for a republish
 PLANNED_FLUSH_S = 2.0            # H-2: how long a planned reconnect waits for the old connection's PUBACKs
+QUEUE_HEADROOM = 64              # paho's queue = the most outbox entries the class allows + this (handshakes, status
+#                                  ACKs, telemetry): IMPLEMENTATION-ROADMAP §16.8
 UNACKED_TRACKED = 256            # bound on the QoS 1 publishes tracked for that wait
 
 
@@ -97,6 +99,7 @@ class DeviceMqtt:
         self.c = _Client(mqtt.CallbackAPIVersion.VERSION2, client_id=did.decode(), protocol=mqtt.MQTTv5,
                          reconnect_on_failure=False)
         self.c.tls_set_context(tls_ctx)
+        self.c.max_queued_messages_set(self._queue_cap())   # §16.8: bounded while the broker is down
         self.c.will_set(topics.status(self.cls, did), b"offline", qos=1)
         self.errors: list[str] = BoundedLog()                 # expected protocol refusals (local log only)
         self.internal_errors: list[tuple] = BoundedLog()      # unexpected: type + code locations only (H3)
@@ -410,7 +413,17 @@ class DeviceMqtt:
         prof = self.d.profile
         if self.outbox is not None:
             self.outbox.cap = prof.outbox_cap                 # the budget require_capacity() just checked
+        self.c.max_queued_messages_set(self._queue_cap())     # §16.8: follows the class's outbox size
         self._rehandshake_at = time.monotonic() + self._spread()   # CONNECT values: at the planned reconnect
+
+    def _queue_cap(self) -> int:
+        """IMPLEMENTATION-ROADMAP §16.8: a publish made while disconnected raises here (rc ≠ 0) but paho still keeps
+        it for the reconnect, so without a bound every attempt during a long broker outage grew the device's memory.
+        The bound must still take the burst after an establishment (every outbox entry that did not fit in DF goes
+        live at once), and the outbox never holds more than outbox_cap // Outbox.OVERHEAD entries. Beyond the bound
+        paho keeps nothing (MQTT_ERR_QUEUE_SIZE): alerts stay in the outbox, handshakes are retried."""
+        from ..persistence.device import Outbox
+        return self.d.profile.outbox_cap // Outbox.OVERHEAD + QUEUE_HEADROOM
 
     def _spread(self) -> float:
         """§12: re-handshake after a random delay within the class back-off cap (no reconnection storm)."""

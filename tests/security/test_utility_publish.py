@@ -294,3 +294,85 @@ def test_an_unconfirmed_artifact_that_is_no_longer_valid_is_not_published_again(
     u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
     u.tick()
     assert paho.queued == []
+
+
+# ================================================================ §16.8 item 2: removals confirmed like publications
+def empties(paho: Paho, art) -> list[str]:
+    """Topics of `art` that were sent an empty retained message (a deletion)."""
+    return [t for t, payload, retain, _ in paho.queued if payload == b"" and retain and
+            f"/firmware/{art.manifest.version}/" in t]
+
+
+@requires_station
+def test_a_removal_lost_with_a_restart_is_sent_again(tmp_path, station):
+    """The retention window ends while the broker is down, so the deletion exists only in paho's memory, and the
+    utility restarts. Before the fix its database already said "not retained" and nothing sent the deletion again:
+    the old artifact stayed retained at the broker for good."""
+    from pqgrid.fota.publisher import RETENTION_S
+    p = Plant(tmp_path)
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    art = firmware(p, station)
+    u.publish_artifact(art)
+    paho.puback(u)
+    u.tick()                                                              # retained and confirmed
+    p.t += RETENTION_S
+    paho.rc = mqtt.MQTT_ERR_NO_CONN
+    u.tick()                                                              # the deletion: in paho's memory only
+    assert u.publisher.live == {} and len(u.publisher.removals) == 1
+    p.restart()
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    u.tick()
+    expected = [t for t, _ in u.publisher.messages(art)]
+    assert empties(paho, art) == expected                                 # before the fix: []
+    paho.puback(u)
+    u.tick()
+    u.tick()
+    assert empties(paho, art) == expected                                 # acknowledged: not again
+    assert SqlPublisher(p.node.db, p.policy, clock=lambda: p.t).removals == []     # durable
+
+
+@requires_station
+def test_a_removal_the_broker_refused_is_sent_again(tmp_path, station):
+    from pqgrid.fota.publisher import RETENTION_S
+    p = Plant(tmp_path)
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    art = firmware(p, station)
+    u.publish_artifact(art)
+    paho.puback(u)
+    u.tick()
+    p.t += RETENTION_S
+    u.tick()                                                              # the deletion is sent …
+    paho.puback(u, ok=False, only=lambda t: t.endswith("/chunk/0"))       # … and partly refused
+    paho.puback(u)
+    u.tick()
+    n = len(empties(paho, art))
+    u.tick()
+    assert len(empties(paho, art)) == n                                   # not before retry_every_s
+    p.t += u.publisher.retry_every_s
+    u.tick()
+    assert len(empties(paho, art)) == 2 * n                               # the whole deletion again
+    paho.puback(u)
+    u.tick()
+    assert u.publisher.removals == []
+
+
+@requires_station
+def test_publishing_the_same_version_again_cancels_its_pending_removal(tmp_path, station):
+    """A pending deletion must never delete a copy published after it (e.g. an E-4 republish of the same version)."""
+    from pqgrid.fota.publisher import RETENTION_S
+    p = Plant(tmp_path)
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    art = firmware(p, station)
+    u.publish_artifact(art)
+    paho.puback(u)
+    u.tick()
+    p.t += RETENTION_S
+    paho.rc = mqtt.MQTT_ERR_NO_CONN
+    u.tick()                                                              # deletion pending
+    paho.rc = mqtt.MQTT_ERR_SUCCESS
+    u.publish_artifact(art)                                               # published again
+    assert u.publisher.removals == []
+    n = len(empties(paho, art))
+    p.t += u.publisher.retry_every_s
+    u.tick()
+    assert len(empties(paho, art)) == n                                   # no deletion after the new copy
