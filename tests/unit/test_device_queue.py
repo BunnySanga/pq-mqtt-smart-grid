@@ -48,3 +48,22 @@ def test_the_bound_follows_a_policy_that_changes_the_outbox_size_from_the_next_c
     fill(mq, v2.profile("smart_meter").outbox_cap // Outbox.OVERHEAD + QUEUE_HEADROOM)
     with pytest.raises(TransportError, match="queue full"):
         mq._publish(TOPIC, b"one too many")
+
+
+def test_a_grown_outbox_makes_the_connection_stale_a_smaller_one_does_not(world):
+    """Third Codex review, finding 7: paho changes the bound only between connections, and a policy that only grows
+    the outbox caused no reconnect, so the old, too small bound could stay for good. A larger bound now makes the
+    connection stale (one planned reconnect, H-2); a smaller one still waits for the next connection."""
+    d, mq = device(world)
+    mq._declared = mq._connect_props(d.profile)                            # as after a CONNACK (no broker here)
+    assert not mq.stale_connect_properties()
+
+    def policy(version, outbox_cap):
+        classes = conftest.replace_class(world.policy, "smart_meter", outbox_cap=outbox_cap)
+        return conftest.make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=version,
+                                    classes=classes)
+    cap = d.profile.outbox_cap
+    mq._install_policy(policy(2, cap // 2))
+    assert not mq.stale_connect_properties()                               # smaller: no reconnect for it
+    mq._install_policy(policy(3, 4 * cap))
+    assert mq.stale_connect_properties()                                   # larger: before the fix, False

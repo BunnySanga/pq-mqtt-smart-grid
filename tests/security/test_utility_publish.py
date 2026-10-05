@@ -397,3 +397,84 @@ def test_flush_is_not_broken_by_a_publish_that_lands_while_it_checks(tmp_path):
     u._unacked.append(Racing())
     u._unacked.append(Racing())
     assert u.flush(0) is True                                             # before the fix: RuntimeError
+
+
+# ======================================================================= third Codex review, findings 2 and 4
+def test_no_refused_command_is_forgotten_however_many_are_outstanding(tmp_path):
+    """Finding 2: command tracking was a list capped at 1,024 (the oldest dropped) and refusals were remembered in a
+    list capped at 1,024 mids, so under load a refused command stayed recorded as sent and was never sent again.
+    Each publish now carries its own outcome, and nothing unresolved is ever evicted."""
+    p = Plant(tmp_path)
+    devs = [p.device(b"der-%04d" % i, "der_ctrl") for i in range(1, 6)]
+    for d in devs:
+        p.full(d)
+    u, paho = utility(p)
+    issued = [(d.did, u.command(d.did, b"C%d" % i, 600)) for d in devs for i in range(210)]   # 1,050 outstanding
+    paho.puback(u, ok=False)                                              # the broker refuses every one
+    u.tick()
+    store = p.node.commands.store
+    assert [did for did, seq in issued if store.get(did, seq).last_sid != b""] == []   # before: the oldest stayed
+
+
+def test_a_refusal_that_arrives_before_its_publish_is_registered_is_not_lost(tmp_path):
+    """Finding 2: paho's thread can deliver the PUBACK before publish() has returned and the utility has registered
+    the message. That outcome is held until the registration picks it up."""
+    p = Plant(tmp_path)
+    d = p.device(D1, "der_ctrl")
+    p.full(d)
+    u, paho = utility(p)
+    u._on_publish(paho, None, paho.mid + 1, ReasonCode(PacketTypes.PUBACK, "Not authorized"), None)   # first …
+    seq = u.command(D1, b"CMD-A", 600)                                    # … then the publish it answers
+    paho.queued[-1][3]._set_as_published()                                # what paho does after the callback
+    u.tick()
+    assert p.node.commands.store.get(D1, seq).last_sid == b""             # refused: not counted as sent
+
+
+@requires_station
+def test_a_republish_and_the_end_of_its_pending_deletion_are_one_transition(tmp_path, station, monkeypatch):
+    """Finding 4: the new publication was stored, then the pending deletion of the same version cancelled, in two
+    steps. A power loss in between left both durable: after the restart the copy was published and then deleted."""
+    from pqgrid.fota.publisher import RETENTION_S
+    p = Plant(tmp_path)
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    art = firmware(p, station)
+    u.publish_artifact(art)
+    paho.puback(u)
+    u.tick()
+    p.t += RETENTION_S
+    paho.rc = mqtt.MQTT_ERR_NO_CONN
+    u.tick()                                                              # its deletion: pending
+    paho.rc = mqtt.MQTT_ERR_SUCCESS
+
+    def power_loss(r):
+        raise OSError("power lost")
+    monkeypatch.setattr(u.publisher, "_forget_removal", power_loss)       # inside the transition
+    with pytest.raises(OSError):
+        u.publish_artifact(art)
+    p.restart()
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    u.tick()
+    sent = ["empty" if payload == b"" else "data" for t, payload, _, _ in paho.queued
+            if t.endswith("/firmware/2/manifest/0")]
+    assert sent == ["empty"]                                              # before the fix: ["data", "empty"]
+
+
+@requires_station
+def test_replacing_a_version_and_recording_the_old_ones_deletion_are_one_transition(tmp_path, station, monkeypatch):
+    """Finding 4: the newer version was stored and SENT before the older one's deletion was recorded, so a power loss
+    in between left the older version retained for good."""
+    p = Plant(tmp_path)
+    u, paho = utility(p, SqlPublisher(p.node.db, p.policy, clock=lambda: p.t))
+    v2, v3 = firmware(p, station, 2), firmware(p, station, 3)
+    u.publish_artifact(v2)
+    paho.puback(u)
+    u.tick()
+
+    def power_loss(r):
+        raise OSError("power lost")
+    monkeypatch.setattr(u.publisher, "_store_removal", power_loss)
+    with pytest.raises(OSError):
+        u.publish_artifact(v3)
+    assert art_topics(paho, v3) == []                                     # nothing was sent …
+    after = SqlPublisher(p.node.db, p.policy, clock=lambda: p.t)          # … and a restart sees the state before
+    assert after.live[("smart_meter", FIRMWARE)].artifact.manifest.version == 2 and after.removals == []

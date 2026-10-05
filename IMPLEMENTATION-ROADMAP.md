@@ -1726,3 +1726,23 @@ same "every message acknowledged" test). Validation (§16.6) covers §16.5, §16
 the final read-only review found nothing further beyond the `flush()` race fixed here. Still open, by decision or by
 nature: zone keys rotate only through the whole re-provisioning operation (§16.7, finding 2); the P0-1 storage choice
 and the new limits (§16.5, §16.7, §16.8) await the team's confirmation; nothing here is [HW] (§15.12).
+
+### 16.10 Third Codex review of `61633fe` (2026-10-05): fixes written, not yet run
+
+All seven findings were checked on `main` before any change: 1–6 reproduced (scratch script), 7 partly: its
+premise that paho 2.1.0 lets the queue bound change on a live connection is wrong (it raises RuntimeError: the 12
+broker failures of §16.9), but the gap it names is real.
+
+| # | Finding (review's severity → ours) | Fix | Regression tests (written) |
+|---|---|---|---|
+| 1 | An "idempotent" `Registry.add` after a re-provisioning stored the caller's `provisioned_at` (0): the old key's device resumed with its old ticket (P1 → P1) | `add` keeps a registered device's `provisioned_at` (a new device starts at 0); the generation only ever grows: `max(now, previous + 1)` | `…adding_a_registered_device_again_never_resets_its_provisioning`, `…generation_only_ever_grows` |
+| 2 | Command tracking (capped at 1,024, oldest dropped) and refused mids (capped at 1,024) lost refusals under load: refused commands stayed "sent" (P1 → P2) | Each tracked publish is a `_Delivery` registered by mid; its PUBACK outcome is written onto it (a PUBACK before the registration is held and picked up); command tracking is never evicted: unresolved entries are bounded by paho's queue bound (§16.7) | `…no_refused_command_is_forgotten_however_many_are_outstanding` (1,050), `…refusal_that_arrives_before_its_publish_is_registered…` |
+| 3 | A power loss after the last chunk's bit was saved left a complete download never staged; redelivered chunks were duplicates (P1 → P2) | `_finish_download` (hash, then staged, the staged record written BEFORE the download record goes) is also run at boot for a complete download | `…power_loss_after_the_last_chunk_is_finished_at_the_next_boot`, `…complete_download_whose_payload_changed_is_dropped…` |
+| 4 | Publication, cancellation of a same-version deletion and the replaced version's deletion were separate writes (P2 → P2) | `Publisher._atomic()` (SqlPublisher: one transaction) around all durable changes of `publish()` and of `cleanup()`, before anything is sent | `…republish_and_the_end_of_its_pending_deletion_are_one_transition`, `…replacing_a_version_and_recording_the_old_ones_deletion…` |
+| 5 | Recovery checked the signature but not the admission rules (slot, packet size, chunks, version) (P2 → P2) | `_admit()`, shared by fresh and recovered manifests | `…recovered_artifact_must_pass_the_checks_a_fresh_one_does` |
+| 6 | `UtilityNode.reprovision` rotated zone keys before validating; a class the policy lacks was stored (P2 → P2) | `_check_reprovision`: registered, well-formed, class in the policy in force, reported max_packet not below the class's (Master §25 L22); before any side effect | `…invalid_reprovisioning_changes_nothing` (4 cases) |
+| 7 | A policy that only grows the outbox left paho's queue bound too small until some reconnect (P2 → P3) | `stale_connect_properties()` is also true when the bound must GROW: one planned reconnect (H-2), in which `connect()` sets it; a smaller bound still waits (the no-reconnect test is unchanged) | `…grown_outbox_makes_the_connection_stale_a_smaller_one_does_not`, broker: `…policy_that_grows_the_outbox_reconnects_once…` |
+
+Mutants 223–231 cover these checks; seven older mutants were re-pointed at the rewritten lines (same check
+disabled). Not mutated: the atomic block of `cleanup()` (no crash test inside it yet). Nothing here is claimed fixed
+until it has run (as §16.9 did for §16.5–§16.8).

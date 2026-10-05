@@ -200,3 +200,17 @@ def test_a_retained_artifact_dropped_under_the_old_limit_arrives_after_the_recon
     with loops(plant, c):                                              # it activates v2, reconnects once, and
         assert wait_for(lambda: FIRMWARE in c.mq.fota_staged, 30), c.mq.errors   # the retained firmware arrives
         assert c.mq.policy_reconnects == 1 and connects(plant, C2)[-1] == c.d.profile.keepalive_s
+
+
+def test_a_policy_that_grows_the_outbox_reconnects_once_for_the_queue_bound(plant):
+    """Third Codex review, finding 7, over the broker: the outbox grows (CONNECT unchanged), so paho's queue bound must
+    grow too, which paho allows only between connections: exactly one planned reconnect."""
+    m = plant.add(M1, "smart_meter")
+    v2 = with_class(plant, 2, "smart_meter", outbox_cap=4608)
+    start(plant)
+    with loops(plant, m):
+        assert wait_for(lambda: m.d.confirmed, 15), m.mq.errors
+        roll_out(plant, m, v2, fleet_artifact(plant, v2, "smart_meter", 65536, 16384))
+        assert wait_for(lambda: m.mq.policy_reconnects == 1 and m.d.confirmed and m.d.policy.version == 2, 30), \
+            m.mq.errors
+        assert not m.mq.stale_connect_properties()

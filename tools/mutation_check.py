@@ -8,10 +8,10 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
 147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2,
-183-200 its other fixes, 201-215 the fixes of the second Codex review, 216-222 the follow-up (§16). A mutant may
-name broker tests (5th element) for a check only a real broker exercises; they run in addition to the in-process
-suite (the test image has Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15
-(§16 from 173 on).
+183-200 its other fixes, 201-215 the fixes of the second Codex review, 216-222 the follow-up, 223-231 the third
+review (§16). A mutant may name broker tests (5th element) for a check only a real broker exercises; they run in
+addition to the in-process suite (the test image has Mosquitto). Results and the classification of every survivor:
+IMPLEMENTATION-ROADMAP §15 (§16 from 173 on).
 """
 import os
 import shutil
@@ -222,11 +222,11 @@ M = [
      "        pass   # survives", "C1-12 scheduled policy persisted"),
     ("pqgrid/persistence/utility_db.py", "        if active.version > policy.version:\n            policy = active",
      "        if False:\n            policy = active", "C1-12 active policy resumed"),
-    ("pqgrid/fota/publisher.py", "        self._store(key, art, pub)                                 # the rollout state first",
-     "        pass                                 # the rollout state first", "C1-13 publish persisted"),
+    ("pqgrid/fota/publisher.py", "            self._store(key, art, pub)                             # told",
+     "            pass                             # told", "C1-13 publish persisted"),
     ("pqgrid/fota/publisher.py", "            self._store_revoked(rid)", "            pass", "C1-13 revocation persisted"),
-    ("pqgrid/fota/publisher.py", "                self._store(key, pub.artifact, None)               # still the newest",
-     "                pass               # still the newest", "C1-13 cleanup persisted"),
+    ("pqgrid/fota/publisher.py", "                    self._store(key, pub.artifact, None)           # still the newest",
+     "                    pass           # still the newest", "C1-13 cleanup persisted"),
     ("pqgrid/persistence/flash.py", "                    end = (i + 1, 0)                           # after its type byte",
      "                    pass                           # after its type byte", "C1-1 torn header"),
     ("pqgrid/registry.py", "    return bool(_DEVICE_ID.fullmatch(device_id))", "    return bool(_DEVICE_ID.match(device_id))",
@@ -275,8 +275,10 @@ M = [
     ("pqgrid/e2e/handshake.py", "            if not ct_eq(pinfo, self.policy.info()):\n                raise PolicyMismatchError(\"POLICY_INFO mismatch: the client",
      "            if False:\n                raise PolicyMismatchError(\"POLICY_INFO mismatch: the client",
      "R H-1 old-policy hello under a retired key recognised"),
-    ("pqgrid/mqtt/device_node.py", "        return self._declared is not None and self._declared != self._connect_props(self.d.profile)",
-     "        return False", "R H-2 reconnect when CONNECT properties change",
+    ("pqgrid/mqtt/device_node.py",
+     "        return self._declared is not None and (self._declared != self._connect_props(self.d.profile)",
+     "        return False and (self._declared != self._connect_props(self.d.profile)",
+     "R H-2 reconnect when CONNECT properties change",
      ("tests/integration/test_connect_properties.py",)),
     ("pqgrid/mqtt/device_node.py", "            self._fota_subscribed = False                     # retained artifacts dropped",
      "            pass                     # retained artifacts dropped", "R H-2 re-subscribe after a raised limit",
@@ -329,8 +331,8 @@ M = [
      "P1-2 confirmed only when every message was acknowledged"),
     ("pqgrid/fota/publisher.py", "            if False in answers:\n                pub.tokens = None",
      "            if False:\n                pub.tokens = None", "P1-2 a refused message un-does the publication"),
-    ("pqgrid/mqtt/utility_node.py", "        if not reason_code.is_failure:\n            return",
-     "        if True:\n            return", "P1-2 a refusing PUBACK is recorded"),
+    ("pqgrid/mqtt/utility_node.py", "        refused = reason_code.is_failure", "        refused = False",
+     "P1-2 a refusing PUBACK is recorded"),
     ("pqgrid/mqtt/utility_node.py", "                self.publisher.retry(self._fota_out)",
      "                pass", "P1-2 an unconfirmed artifact is published again"),
     ("pqgrid/persistence/utility_db.py", "                         int(retained is not None and retained.confirmed)))",
@@ -423,20 +425,42 @@ M = [
      "        self.events: list[tuple[str, bytes]] = []", "R2-6 the device's event list is bounded"),
     # ---------------------------------------------------------------- follow-up items 1 and 2 (§16.8)
     ("pqgrid/mqtt/device_node.py",
-     "        self.c.max_queued_messages_set(self._queue_cap())   # §16.8: bounded while the broker is down\n", "",
+     "        self.c.max_queued_messages_set(self._queue_bound)     # §16.8: bounded while the broker is down\n", "",
      "F-1 the device's paho queue is bounded"),
     ("pqgrid/mqtt/device_node.py",
      "            self.c.max_queued_messages_set(self._queue_cap())  # §16.8: the installed class's outbox.",
      "            pass  # §16.8: the installed class's outbox.", "F-1 the bound follows the class's outbox"),
     ("pqgrid/fota/publisher.py", "            self._send_removal(client, r)\n        return n",
      "            pass\n        return n", "F-2 an unacknowledged removal is sent again"),
-    ("pqgrid/fota/publisher.py", "        self._store_removal(r)\n", "", "F-2 a removal is durable before it is sent"),
+    ("pqgrid/fota/publisher.py", "                    self._store_removal(r)                         # together",
+     "                    pass                         # together", "F-2 a removal is durable before it is sent"),
     ("pqgrid/fota/publisher.py", "            if False in answers:\n                r.tokens = None",
      "            if False:\n                r.tokens = None", "F-2 a refused removal is sent again"),
-    ("pqgrid/fota/publisher.py", "            self._drop_removal(r)                                  # published again",
-     "            pass                                  # published again", "F-2 a republish cancels its pending removal"),
+    ("pqgrid/fota/publisher.py",
+     "        cancelled = [r for r in self.removals if (r.key, r.version) == (key, art.manifest.version)]",
+     "        cancelled = []", "F-2 a republish cancels its pending removal"),
     ("pqgrid/mqtt/utility_node.py", "        return all(i.is_published() for i in pending)",
      "        return all(i.is_published() for i in self._unacked)", "F-3 flush() checks a copy, not the live deque"),
+    # ---------------------------------------------------------- third Codex review (IMPLEMENTATION-ROADMAP §16.10)
+    ("pqgrid/registry.py", "        rec = replace(rec, provisioned_at=0 if old is None else old.provisioned_at)\n", "",
+     "R3-1 add() keeps the provisioning generation"),
+    ("pqgrid/registry.py", "max(int(now), old.provisioned_at + 1)", "int(now)", "R3-1 the generation only ever grows"),
+    ("pqgrid/mqtt/utility_node.py", "        self._cmd_pubs: list = []", "        self._cmd_pubs: list = BoundedLog(2)",
+     "R3-2 command tracking is never evicted"),
+    ("pqgrid/mqtt/utility_node.py", "            else:\n                d.refused = early", "            else:\n                pass",
+     "R3-2 a PUBACK before the registration is kept"),
+    ("pqgrid/fota/installer.py", "            if dl.complete():                                          # chunk's bit",
+     "            if False:                                          # chunk's bit",
+     "R3-3 a complete download is finished at boot"),
+    ("pqgrid/fota/publisher.py", "        with self._atomic():                                       # ONE durable",
+     "        if True:                                       # ONE durable",
+     "R3-4 publication and removals in one transaction"),
+    ("pqgrid/fota/installer.py", "            if admit:\n                self._admit(kept, n)",
+     "            if False:\n                pass", "R3-5 recovered artifacts pass the admission checks"),
+    ("pqgrid/persistence/utility_db.py", "        self._check_reprovision(rec)                       # third review",
+     "        pass                       # third review", "R3-6 re-provisioning is checked before any side effect"),
+    ("pqgrid/mqtt/device_node.py", "\n                                               or self._queue_bound < self._queue_cap())",
+     ")", "R3-7 a grown queue bound makes the connection stale"),
 ]
 
 
