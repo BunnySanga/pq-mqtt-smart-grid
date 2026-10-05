@@ -1694,3 +1694,35 @@ Validation (§16.6) now covers these as well; nothing here is claimed fixed unti
 
 Mutants 216–221 cover these checks (mutant 176's pattern now names the line after it: the removal loop reuses the
 same "every message acknowledged" test). Validation (§16.6) covers §16.5, §16.7 and §16.8.
+
+### 16.9 Validation of §16.5, §16.7 and §16.8 (2026-10-05)
+
+**Before the fixes** (today's tests against the old `pqgrid`, exported with `git archive`; in-process):
+
+| Baseline | Tests | Result |
+|---|---|---|
+| `6a9ba83` (P1-2 only) | §16.5 regression tests: re-provisioning, permissions, anchors, inboxes, the interrupted-commit assertion | 25 FAILED, `test_fota_recovery.py` not even importable (no `SIGNED_RESERVE`); 1 passed: the positive anchor test (two valid anchors accepted), as intended. The P0-1 attack itself was reproduced on `65f0f80` during triage (§16.1) |
+| `1b774c6` (the second review's base) | §16.7 and §16.8 regression tests | 14 FAILED, `test_device_queue.py` not importable; 2 passed: the "key of another type" recovery case (P0-1's signature re-check already drops it: why the type check has no mutant) and the drain race test (it lost entries in 2 of 5 runs on the old code: the race is real, the test proves the fix) |
+
+**Two defects found by this first run, fixed** (`61633fe`):
+
+| Defect | Found by | Fix |
+|---|---|---|
+| §16.8 F-1 set paho's queue bound in `_install_policy`, on a live connection, where paho raises RuntimeError: every policy activation in the device loop failed | 12 broker tests, all three runs (the in-process suite skips them) | the bound is set in `connect()`, on the closed connection; a new outbox size applies from the next connection (no new reconnect: `test_a_policy_that_changes_no_connect_property_causes_no_reconnect` stays as it is) |
+| §16.7 finding 6 made `_unacked` a deque; `flush()` checked the LIVE deque while paho's thread may append: "deque mutated during iteration" | the final read-only review | `flush()` copies it under the lock; a deterministic test fails on the previous code; mutant 222 |
+
+**After the fixes**, canonical image (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, paho-mqtt 2.1.0):
+
+| Check | Result |
+|---|---|
+| Full suite | **689 passed** [DOCKER] |
+| Broker tests | **56 / 56** in three runs (one inside the full suite) [DOCKER] |
+| In-process suite on macOS (`.venv`) | green before the two fixes (632 passed, 56 skipped); the two fixes' own tests pass |
+| v2.1 `validate.py` | 80/80 as expected |
+| pyflakes 4.0.2 (throwaway container) | `pqgrid`, `tools`: clean |
+| Mutation (all 223 mutants, canonical image) | **220 KILLED, 3 SURVIVED (40, 110, 112: the survivors classified in §15.9), 0 ERROR**; every one of the 50 new mutants (173–222) KILLED [DOCKER] |
+
+**Status after §16.9:** every finding of both Codex reviews and of the follow-up is fixed and validated as above, and
+the final read-only review found nothing further beyond the `flush()` race fixed here. Still open, by decision or by
+nature: zone keys rotate only through the whole re-provisioning operation (§16.7, finding 2); the P0-1 storage choice
+and the new limits (§16.5, §16.7, §16.8) await the team's confirmation; nothing here is [HW] (§15.12).
