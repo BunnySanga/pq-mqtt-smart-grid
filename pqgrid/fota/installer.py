@@ -135,18 +135,39 @@ class Installer:
         self.recovery_refused: list[str] = []                          # recovered artifacts not believed (P0-1)
         for key, (_, raw) in store.items(T_DOWNLOAD).items():          # resume after a reboot (E-F1)
             try:
+                t = self._record_type(key)
                 mraw, have = dec(raw, 2)
-                self.downloads[key[0]] = Download(decode_manifest(mraw), mraw, bytearray(have))
-            except (WireError, FotaError):
+                m = decode_manifest(mraw)
+                if m.type != t:
+                    raise FotaError("the record's key and its manifest name different artifact types")
+                if len(have) != (m.chunk_count + 7) // 8:
+                    raise FotaError("download bitmap of the wrong length")    # would fail every later chunk
+                self.downloads[t] = Download(m, mraw, bytearray(have))
+            except (ValueError, IndexError) as e:                     # WireError and FotaError are ValueErrors
                 store.delete(T_DOWNLOAD, key)
+                self.recovery_refused.append(f"download record {bytes(key).hex()}: {e}")
         for key, (_, raw) in store.items(T_STAGED).items():
             try:
-                self.staged[key[0]] = decode_manifest(raw)
-            except (WireError, FotaError):
+                t = self._record_type(key)
+                m = decode_manifest(raw)
+                if m.type != t:
+                    raise FotaError("the record's key and its manifest name different artifact types")
+                self.staged[t] = m
+            except (ValueError, IndexError) as e:
                 store.delete(T_STAGED, key)
+                self.recovery_refused.append(f"staged record {bytes(key).hex()}: {e}")
         self._finish_interrupted_commits()                             # by the committed versions (trusted)
         self._reverify_recovered()
         self._finish_interrupted_keyrevoke()
+
+    @staticmethod
+    def _record_type(key: bytes) -> int:
+        """Second Codex review, finding 3: a recovered record's key must be exactly one known artifact type. A record
+        under any other key (empty, longer, an unknown type) is refused and deleted at boot, instead of an IndexError or
+        KeyError aborting the boot or wedging every later update."""
+        if len(key) != 1 or key[0] not in (FIRMWARE, POLICY, KEYREVOKE):
+            raise FotaError("a recovered record under an unknown key")
+        return key[0]
 
     def _reverify_recovered(self) -> None:
         """Codex audit P0-1: an artifact recovered from flash (downloading or staged) is believed only if the signed

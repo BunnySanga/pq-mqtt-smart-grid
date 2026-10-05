@@ -1664,3 +1664,24 @@ Mutants 183–200 cover these checks; mutants 9, 124 and 133 were re-pointed at 
 Before the fix (`65f0f80` code, new tests) and after it, on the canonical image: the new tests; the full suite; the
 broker tests repeatedly; mutants 183–200 and a full mutation run; v2.1 `validate.py`; pyflakes; then a final
 read-only security review of the branch. Nothing in §16.5 is claimed fixed until those runs pass.
+
+### 16.7 Second Codex review of `main` at `1b774c6` (2026-10-05): fixes written, not yet run
+
+The review reported 4 P1 and 3 P2 findings. All seven were confirmed on `1b774c6` before any change: findings 1, 2,
+3, 4 and 5 reproduced (finding 4 exactly: 604 passed, 3 failed, 7 errors, because §16.5 was pushed unrun), 6 and 7
+by inspection.
+
+| # | Finding | Fix | Regression tests (written) |
+|---|---|---|---|
+| 1 | A command the broker refused (PUBACK with a failure code) stayed recorded as sent in that session: never sent again in it | Command publishes are followed to their PUBACK (`_cmd_pubs`); `tick()` settles them: a refused one is un-marked (`CommandService.unsend`, only if still open and recorded for that session) and the device's commands go again after `retry_every_s` (60 s), never hammering a broker that keeps refusing. `outgoing(send=…)` passes `(envelope, cmd_seq)` | `test_a_command_the_broker_refused_is_sent_again_in_the_same_session` |
+| 2 | The lower-level re-provisioning steps were public: calling one directly delivered an old command to the new identity and left the old key's session current | `Registry._reprovision` and `UtilityEndpoint._reprovision_device` are internal; sessions and queued commands carry the record's `provisioned_at` (commands: durable column, migrated) and are refused where they are used once it changed: `current_session`, DF (a handshake across a record change), alerts (resync hint), status ACKs, `outgoing` (closed UNKNOWN/CANCELLED). Only the whole operation rotates zone keys | `…even_the_record_step_alone_lets_no_old_session_or_command_through`, `…handshake_begun_before_a_record_change_is_refused_at_df` |
+| 3 | A damaged recovered FOTA record aborted the boot (empty key: IndexError; unknown type: KeyError) or wedged the update (short bitmap: IndexError on every chunk) | A record's key must be exactly one known type and match its manifest's type, and a download bitmap must have exactly ⌈chunks/8⌉ bytes; anything else is refused, deleted and logged (`recovery_refused`); the boot continues | `…record_under_a_wrong_key_is_dropped_and_the_boot_survives` (4 cases), `…truncated_download_bitmap_is_dropped…` |
+| 4 | The suite was red: 7 P0 tests never ran (the `dev` fixture was not imported) and 3 older tests changed devices through `registry.add` | Fixture imported. `test_reclassified_device_must_do_a_full_handshake` uses the record step (it tests ticket check 4, E22); the two zone-sync tests no longer re-register D2 (setup had registered it; the second call silently replaced its key and nothing depended on that). No assertion was weakened | the suite itself |
+| 5 | A failed re-provisioning rotated zone keys and then skipped sending them | `UtilityNode.reprovision(rec, rotated=…)` calls `rotated(zones)` in a `finally`, so `UtilityMqtt.reprovision_device` sends the keys in force even when the record change fails (then raises, ACL untouched). After a crash every session is gone and members get the current keys at their next establishment | `test_the_new_zone_keys_go_out_even_if_the_record_change_fails` |
+| 6 | Unbounded growth: paho's queue and the utility's tracking during an outage (tracking rebuilt on every publish), no per-device command quota, the device's event list | paho holds at most `CLIENT_QUEUE_MAX` = 4,096 messages (beyond: not queued, handled by P1-2); tracking is a deque pruned from the oldest end, at most `UNACKED_TRACKED` = 1,024; at most `MAX_QUEUED_COMMANDS` = 256 open commands per device (above the device's MAX_INTENTS = 32, so its REJECTED path stays); `DeviceMqtt.events` is a `BoundedLog(1000)` | `…client_queue_and_the_tracking_are_bounded…`, `test_open_commands_per_device_are_capped`, `test_the_device_keeps_a_bounded_list_of_accepted_events` |
+| 7 | `BoundedLog.drain()` copied then cleared without a lock: an entry appended in between was lost | `BoundedLog` takes an internal lock in `append`, `extend` and `drain` (never held while calling anything else) | `test_draining_while_another_thread_appends_loses_nothing` (a race test: it proves the fix, not the bug) |
+
+Mutants 201–215 cover the new checks (and 191, 198 and the P1-1 session/transaction mutants were re-pointed at the
+rewritten lines). Not mutated, by construction: the record-type match in recovery (the signature re-check drops such
+a record anyway) and the lock in `drain()` (only a race can show it).
+Validation (§16.6) now covers these as well; nothing here is claimed fixed until it has run.

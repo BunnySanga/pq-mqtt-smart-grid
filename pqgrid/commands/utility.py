@@ -27,6 +27,11 @@ COUNTER_MAX = (1 << 32) - 1
 GRANT_CLOCK_SLACK_S = 60          # E56: the device's clock lags by up to one message transit (+ <1 s rounding)
 
 
+MAX_QUEUED_COMMANDS = 256     # open commands per device at the utility (second Codex review, finding 6): above the
+#                               device's own MAX_INTENTS (32, H2), so the device's REJECTED path stays reachable;
+#                               each is at most MAX_COMMAND + a 3,309-B σ: ~1 MB per device [ANALYTICAL]
+
+
 @dataclass
 class QueuedCommand:
     device_id: bytes
@@ -35,6 +40,8 @@ class QueuedCommand:
     sends: int = 0                                     # number of sessions it was sent in
     last_sid: bytes = b""                              # the session it was last sent in
     status: Optional[bytes] = None                     # None while open
+    provisioned_at: int = 0                            # the device record's provisioned_at when it was issued: a
+    #                                                    re-provisioning closes it (second Codex review, finding 2)
 
 
 class UtilityCommandStore:
@@ -143,27 +150,36 @@ class CommandService:
         topic = self._topic(device_id, CmdType.CMD)
         if len(command) > MAX_COMMAND:
             raise CommandError(f"command body larger than {MAX_COMMAND} bytes (E44)")
+        if len(self.store.open_commands(device_id)) >= MAX_QUEUED_COMMANDS:         # finding 6: backpressure
+            raise CommandError(f"{MAX_QUEUED_COMMANDS} commands already open for this device")
         exp = self.now() + ttl_s
+
+        prov = self.u.registry.get(device_id).provisioned_at
 
         def build(cmd_seq: int) -> QueuedCommand:
             sig = mldsa_sign(self.cmd_key, cmd_signed_input(device_id, topic, cmd_seq, exp, idempotent, command))
-            return QueuedCommand(device_id, topic, Command(cmd_seq, command, exp, idempotent, sig))
+            return QueuedCommand(device_id, topic, Command(cmd_seq, command, exp, idempotent, sig),
+                                 provisioned_at=prov)
         return self.store.allocate_and_enqueue(device_id, self.epoch, build).cmd.cmd_seq
 
-    def outgoing(self, device_id: bytes, send: Optional[Callable[[bytes], None]] = None) -> list[bytes]:
+    def outgoing(self, device_id: bytes, send: Optional[Callable[[bytes, int], None]] = None) -> list[bytes]:
         """Envelopes to publish for the device's live session: each open, unexpired command once per session,
         in cmd_seq order (same cmd_seq and σ on redelivery, new keys). Expired ones are closed (E38). A command
         queued before a command-key rotation is re-signed under the key the active policy names, with the same
         cmd_seq, before it is sent (DR-051): the device verifies with that key, and classifies by cmd_seq.
         A command is recorded as sent in this session BEFORE its envelope leaves, so a crash can only make the outcome
-        UNKNOWN, never a false EXPIRED. With `send`, each envelope is handed over right after its record; `send` raises
-        only if the envelope was NOT handed to the transport, and then the record is undone and the error re-raised:
-        the next flush of the session sends it (Codex audit P1-2), and if it expires first it is EXPIRED."""
+        UNKNOWN, never a false EXPIRED. With `send(envelope, cmd_seq)`, each envelope is handed over right after its
+        record; `send` raises only if the envelope was NOT handed to the transport, and then the record is undone and
+        the error re-raised: the next flush of the session sends it (Codex audit P1-2), and if it expires first it is
+        EXPIRED. A broker that refuses it later (a failing PUBACK) is handled by unsend()."""
         s = self.u.current_session(device_id)                      # M1: never under an old-policy session
         if s is None:
             return []
-        now, out = self.now(), []
+        now, out, prov = self.now(), [], self.u.registry.get(device_id).provisioned_at
         for q in self.store.open_commands(device_id):
+            if q.provisioned_at != prov:                            # issued under an earlier record (finding 2)
+                self.store.close(q, b"UNKNOWN" if q.sends else b"CANCELLED")
+                continue
             if now >= q.cmd.expires_at:
                 self.store.close(q, b"UNKNOWN" if q.sends else b"EXPIRED")
                 continue
@@ -177,12 +193,23 @@ class CommandService:
             self.store.mark_sent(q, s.sid)                          # recorded before the envelope leaves
             if send is not None:
                 try:
-                    send(env)
+                    send(env, c.cmd_seq)
                 except Exception:
                     self.store.unmark_sent(q, prev)                 # it never left (P1-2)
                     raise
             out.append(env)
         return out
+
+    def unsend(self, device_id: bytes, cmd_seq: int, sid: bytes) -> bool:
+        """Second Codex review, finding 1: the broker refused the PUBLISH of this command (a PUBACK with a failure
+        reason code), so it never reached the device in session `sid`. If it is still open and recorded as sent in
+        that session, the record is undone (the next flush of the session sends it again; if it expires first it is
+        EXPIRED). Returns whether anything was undone."""
+        q = self.store.get(device_id, cmd_seq)
+        if q is None or q.status is not None or q.last_sid != sid:
+            return False
+        self.store.unmark_sent(q, b"")
+        return True
 
     def cancel_device(self, device_id: bytes) -> int:
         """Codex audit P1-1: the device was re-provisioned, so what was authorised under its old record ends. Each
@@ -254,6 +281,8 @@ class CommandService:
             raise EnvelopeError("status on a session of an old policy")
         if self.u.end_expired_chain(s):                                  # M2: the session ended with its chain
             raise EnvelopeError("status on a session whose chain expired")
+        if s.provisioned_at != self.u.registry.get(s.device_id).provisioned_at:   # finding 2
+            raise EnvelopeError("status on a session of an earlier provisioning")
         msg_seq, cmd_seq, status = verify_status_ack(s, ack)
         q = self.store.get(s.device_id, cmd_seq)
         if q is not None and q.status is None:                     # GRANT/SETPOINT/ZONEKEY have no queue entry

@@ -29,3 +29,37 @@ def test_a_bounded_log_stays_bounded_when_extended():
     assert log == list(range(15, 25)) and log.dropped == 15               # before the fix: all 25 kept
     log.extend(range(25, 30))
     assert log == list(range(20, 30)) and log.dropped == 20
+
+
+def test_draining_while_another_thread_appends_loses_nothing():
+    """Second Codex review, finding 7: drain() copied, then cleared, without a lock, so an entry appended in between
+    (paho's thread, while the application drains) was lost without a trace. Every entry is now either drained or
+    still in the log. (A race test: before the fix it CAN lose entries; whether a given run does is not
+    deterministic, so it proves the fix, not the bug.)"""
+    import threading
+    log, taken, n = BoundedLog(cap=10 ** 9), [], 200_000
+
+    def producer():
+        for i in range(n):
+            log.append(i)
+    t = threading.Thread(target=producer)
+    t.start()
+    while t.is_alive():
+        taken += log.drain()
+    t.join()
+    taken += log.drain()
+    assert sorted(taken) == list(range(n)) and log.dropped == 0
+
+
+def test_the_device_keeps_a_bounded_list_of_accepted_events():
+    """Second Codex review, finding 6: the device's accepted DR events grew without bound."""
+    import ssl
+    import conftest
+    from pqgrid.commands import CommandProcessor
+    from pqgrid.mqtt.device_node import DeviceMqtt
+    w = conftest.World()
+    d = w.device(b"der-0001", "der_ctrl")
+    mq = DeviceMqtt(d, CommandProcessor(d, lambda c: None), None, ssl.create_default_context(), "localhost", 1)
+    assert isinstance(mq.events, BoundedLog)
+    mq.events += [("f7", b"E%d" % i) for i in range(mq.events.cap + 5)]
+    assert len(mq.events) == mq.events.cap and mq.events.dropped == 5

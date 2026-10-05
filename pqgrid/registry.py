@@ -1,8 +1,11 @@
 """Utility-side device registry (Master §4.4): device ID → class, E2E public key, active flag, packet limit.
 
 A record is added once. Changing a device's class or E2E key, or its revocation, is never a silent overwrite (Codex
-audit P1-1, IMPLEMENTATION-ROADMAP §16): revoke() and reprovision() are the only ways, and the utility invalidates
-what the old record authorised (persistence.utility_db.UtilityNode.reprovision).
+audit P1-1, IMPLEMENTATION-ROADMAP §16): revoke() and UtilityNode.reprovision (persistence.utility_db, or
+UtilityMqtt.reprovision_device) are the only ways. _reprovision() here is only the record step of the latter; sessions
+and queued commands carry the record's provisioned_at and are refused wherever they are used once it changed
+(second Codex review, finding 2), so even the record step alone lets nothing of the old record through except the
+zone keys it held, which only the whole operation rotates.
 
 Device IDs become MQTT topic levels and ACL user names, so they are restricted to
 ^[a-z0-9][a-z0-9-]{0,31}$ (Master §10.1, I-21): '+', '#', '/' could otherwise inject rules.
@@ -46,15 +49,15 @@ class Registry:
         old = self._d.get(rec.device_id)
         if old is not None and (old.dclass, old.e2e_pk, old.active) != (rec.dclass, rec.e2e_pk, rec.active):
             raise PolicyError("device already registered: a class, key or revocation change goes through "
-                              "reprovision() or revoke(), never an overwrite (P1-1)")
+                              "UtilityNode.reprovision or revoke(), never an overwrite (P1-1)")
         self._store(rec)
         self._d[rec.device_id] = rec
 
-    def reprovision(self, rec: DeviceRecord, now: int) -> DeviceRecord:
-        """A registered device gets a new class and/or E2E key (or the same ones again, e.g. after a clone: "revoke and
-        re-provision", Master §23.11). The record is active again and stamped with `now`, so no resumption ticket
-        issued under the old record is accepted. Durable before it takes effect; returns the stored record. The
-        sessions, commands, GRANTs and zone keys of the old record are the caller's (UtilityNode.reprovision)."""
+    def _reprovision(self, rec: DeviceRecord, now: int) -> DeviceRecord:
+        """The record step of UtilityNode.reprovision (internal: call that, or UtilityMqtt.reprovision_device). A
+        registered device gets a new class and/or E2E key (or the same ones again, e.g. after a clone: "revoke and
+        re-provision", Master §23.11). The record is active again and stamped with `now`: no resumption ticket, session
+        or queued command of the old record is accepted from then on. Durable before it takes effect."""
         self._check(rec)
         if rec.device_id not in self._d:
             raise PolicyError("device not registered: use add()")

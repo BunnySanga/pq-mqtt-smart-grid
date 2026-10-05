@@ -48,8 +48,7 @@ def test_zone_sync_request_is_authenticated_and_replay_protected(world: World):
 def test_the_answer_is_the_current_key_then_the_still_valid_events_under_it(world: World):
     d1, zm, p1 = setup(world)
     old = zm.publish(Z, b"E1", 600)[ZT]
-    world.device(D2, "der_ctrl")
-    zm.add_member(Z, D2)                                                    # rotation: d1 misses the new key
+    zm.add_member(Z, D2)                                  # D2 (registered by setup) joins: d1 misses the new key
     new = zm.publish(Z, b"E2", 600)[ZT]
     with pytest.raises(ZoneKeyMissing) as missing:
         p1.zones.open(ZT, new)
@@ -65,8 +64,7 @@ def test_the_answer_is_the_current_key_then_the_still_valid_events_under_it(worl
 
 
 def test_sync_is_refused_for_non_members_and_rate_limited(world: World):
-    d1, zm, p1 = setup(world)
-    world.device(D2, "der_ctrl")
+    d1, zm, p1 = setup(world)                                               # D2: registered, not a member
     with pytest.raises(CommandError, match="not a member"):
         zm.sync_for(D2, Z)
     zm.sync_for(D1, Z)

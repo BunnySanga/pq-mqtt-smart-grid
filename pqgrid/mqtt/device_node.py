@@ -121,7 +121,8 @@ class DeviceMqtt:
         self.dr_duplicates = 0                                # re-sent events already accepted (M4): not errors
         self._sync_pending: dict[str, tuple[float, int]] = {} # zone → (retry deadline, ZONEKEYs seen then)
         self.zone_sync_requests = 0
-        self.events: list[tuple[str, bytes]] = []
+        self.events: list[tuple[str, bytes]] = BoundedLog(1000)   # accepted DR events for the application, which
+        #                                                            drains them (second Codex review, finding 6)
         self.fota = fota                                      # a fota.installer.Installer, or None
         self.self_test = self_test                            # trial-boot check of a staged image (§15.12)
         self.fw_results: list[str] = []                       # outcome of each staged-firmware boot

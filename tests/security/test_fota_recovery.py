@@ -12,7 +12,7 @@ from dataclasses import replace
 import pytest
 
 from conftest import World
-from test_fota import CHUNK, MP, C2, T0, Dev, _policy_art, build, firmware, station  # noqa: F401  (fixture)
+from test_fota import CHUNK, MP, C2, T0, Dev, _policy_art, build, dev, firmware, station  # noqa: F401  (fixtures)
 from pqgrid.fota.artifact import ANCHOR_A, FIRMWARE, KEYREVOKE, POLICY, FotaError, decode_manifest
 from pqgrid.fota.installer import SIGNED_RESERVE, T_DOWNLOAD, T_STAGED
 from pqgrid.fota.publisher import part_payload_budget
@@ -134,4 +134,35 @@ def test_the_payload_capacity_leaves_room_for_the_kept_signed_manifest(station):
     with pytest.raises(FotaError, match="larger than this device's slot"):
         dev.feed(build(station, FIRMWARE, 2, firmware(32 * 1024 - SIGNED_RESERVE + 1)), chunks=[])
     dev.feed(build(station, FIRMWARE, 2, firmware(32 * 1024 - SIGNED_RESERVE)))
+    assert dev.inst.boot_staged_firmware(lambda img: True) == "committed"
+
+
+# ======================================================================= second Codex review, finding 3
+@pytest.mark.parametrize("key", [b"", bytes([9]), bytes([FIRMWARE, 0]), bytes([POLICY])],
+                         ids=["empty key", "unknown type", "two-byte key", "key of another type"])
+def test_a_record_under_a_wrong_key_is_dropped_and_the_boot_survives(dev, station, key):
+    """Recovery read key[0] and trusted the type before validating: an empty key aborted the boot (IndexError), an
+    unknown type aborted it later (KeyError). Each such record is now refused and deleted, and updates still work."""
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art, chunks=art.chunks[:1])
+    raw = dev.inst.store.get(T_DOWNLOAD, bytes([FIRMWARE]))
+    dev.inst.store.delete(T_DOWNLOAD, bytes([FIRMWARE]))
+    dev.inst.store.put(T_DOWNLOAD, key, raw)                              # a record recovery never wrote
+    dev.boot()                                                            # before the fix: IndexError / KeyError
+    assert dev.inst.downloads == {} and dev.inst.recovery_refused
+    assert dev.inst.store.get(T_DOWNLOAD, key) is None                    # deleted, not met again at every boot
+    dev.feed(art)
+    assert dev.inst.boot_staged_firmware(lambda img: True) == "committed"
+
+
+def test_a_truncated_download_bitmap_is_dropped_instead_of_wedging_the_update(dev, station):
+    """A genuine manifest with a bitmap shorter than its chunk count passed recovery, then every chunk raised
+    IndexError, so the download could never finish. The record is now refused at boot and the download starts over."""
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art, chunks=art.chunks[:1])
+    raw, _ = dec(dev.inst.store.get(T_DOWNLOAD, bytes([FIRMWARE])), 2)
+    dev.inst.store.put(T_DOWNLOAD, bytes([FIRMWARE]), enc([raw, b""]))   # the genuine manifest, an empty bitmap
+    dev.boot()
+    assert FIRMWARE not in dev.inst.downloads and dev.inst.recovery_refused
+    dev.feed(art)                                                         # before the fix: IndexError per chunk
     assert dev.inst.boot_staged_firmware(lambda img: True) == "committed"

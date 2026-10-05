@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS device_seq(device_id BLOB PRIMARY KEY, counter INTEGE
 CREATE TABLE IF NOT EXISTS commands(
     device_id BLOB NOT NULL, cmd_seq BLOB NOT NULL, topic TEXT NOT NULL, body BLOB NOT NULL, sig BLOB NOT NULL,
     expires_at INTEGER NOT NULL, idempotent INTEGER NOT NULL, status BLOB,
-    sends INTEGER NOT NULL DEFAULT 0, last_sid BLOB NOT NULL DEFAULT x'',
+    sends INTEGER NOT NULL DEFAULT 0, last_sid BLOB NOT NULL DEFAULT x'', provisioned_at INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (device_id, cmd_seq));
 CREATE INDEX IF NOT EXISTS commands_open ON commands(device_id, cmd_seq) WHERE status IS NULL;
 CREATE TABLE IF NOT EXISTS used_tickets(ticket_id BLOB PRIMARY KEY, expires_at INTEGER NOT NULL);
@@ -114,6 +114,10 @@ class UtilityDB:
         if self.c.execute("PRAGMA synchronous").fetchone()[0] != 2:
             raise RuntimeError("SQLite synchronous=FULL was not applied")
         self.c.executescript(SCHEMA)
+        if "provisioned_at" not in {r[1] for r in self.c.execute("PRAGMA table_info(commands)")}:
+            # Before the second Codex review (finding 2): commands issued under the record as it is now (0, never
+            # re-provisioned) or before a re-provisioning that UtilityNode.reprovision already closed them for.
+            self.c.execute("ALTER TABLE commands ADD COLUMN provisioned_at INTEGER NOT NULL DEFAULT 0")
         if "provisioned_at" not in {r[1] for r in self.c.execute("PRAGMA table_info(registry)")}:
             # A database from before §16 (P1-1): no device was re-provisioned under the floor yet.
             self.c.execute("ALTER TABLE registry ADD COLUMN provisioned_at INTEGER NOT NULL DEFAULT 0")
@@ -234,11 +238,11 @@ class SqlUsedTickets(UsedTickets):
 
 # ================================================================================================= commands
 def _row_to_queued(row) -> QueuedCommand:
-    did, seq, topic, body, sig, exp, idem, status, sends, last_sid = row
-    return QueuedCommand(did, topic, Command(r64(seq), body, exp, bool(idem), sig), sends, last_sid, status)
+    did, seq, topic, body, sig, exp, idem, status, sends, last_sid, prov = row
+    return QueuedCommand(did, topic, Command(r64(seq), body, exp, bool(idem), sig), sends, last_sid, status, prov)
 
 
-_COLS = "device_id, cmd_seq, topic, body, sig, expires_at, idempotent, status, sends, last_sid"
+_COLS = "device_id, cmd_seq, topic, body, sig, expires_at, idempotent, status, sends, last_sid, provisioned_at"
 
 
 class SqlCommandStore(UtilityCommandStore):
@@ -272,9 +276,9 @@ class SqlCommandStore(UtilityCommandStore):
     def allocate_and_enqueue(self, device_id: bytes, epoch: int, build) -> QueuedCommand:
         with self.db.tx() as c:                            # sequence + queued command: one transaction (§16)
             q = build(self._allocate(c, device_id, epoch))
-            c.execute(f"INSERT INTO commands ({_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, x'')",
+            c.execute(f"INSERT INTO commands ({_COLS}) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 0, x'', ?)",
                       (device_id, u64(q.cmd.cmd_seq), q.topic, q.cmd.command, q.cmd.sig, q.cmd.expires_at,
-                       int(q.cmd.idempotent)))
+                       int(q.cmd.idempotent), q.provisioned_at))
         return q
 
     def open_commands(self, device_id: bytes) -> list[QueuedCommand]:
@@ -442,17 +446,23 @@ class UtilityNode:
     zones: ZoneManager
     keyring: UtilityKeyring
 
-    def reprovision(self, rec: DeviceRecord) -> list[str]:
+    def reprovision(self, rec: DeviceRecord, rotated=None) -> list[str]:
         """Codex audit P1-1: a registered device's class and/or E2E key change, and nothing authorised under its old
         record survives: its sessions and half-open handshakes (RAM), its resumption tickets (refused by the record's
         provisioning time), its open commands and GRANTs, and the zone keys it could hold. Crash-coherent order: the
         zone keys are rotated first (alone, a crash leaves an extra rotation); then the record and the closing of its
         commands are ONE transaction, so a restart sees either the old record with its commands or the new record
-        without them; then the RAM state goes. Returns the zones whose live members need the new keys."""
+        without them; then the RAM state goes. Returns the zones whose live members need the new keys.
+        `rotated(zones)` is called once the keys rotated, EVEN IF the record change then fails: the members must get
+        the keys that are now in force either way (second Codex review, finding 5)."""
         zones = self.zones.rotate_device(rec.device_id)
-        with self.db.tx():
-            self.commands.cancel_device(rec.device_id)
-            self.endpoint.reprovision_device(rec)
+        try:
+            with self.db.tx():
+                self.commands.cancel_device(rec.device_id)
+                self.endpoint._reprovision_device(rec)
+        finally:
+            if rotated is not None:
+                rotated(zones)
         return zones
 
     def keys_match_policy(self) -> bool:

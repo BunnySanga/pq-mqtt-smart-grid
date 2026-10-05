@@ -8,9 +8,9 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
 147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2,
-183-200 its other fixes (§16). A mutant may name broker tests (5th element) for a check only a real broker exercises; they run in addition
-to the in-process suite (the test image has Mosquitto). Results and the classification of every survivor:
-IMPLEMENTATION-ROADMAP §15 (and §16 for 173 onwards).
+183-200 its other fixes, 201-215 the fixes of the second Codex review (§16). A mutant may name broker tests (5th
+element) for a check only a real broker exercises; they run in addition to the in-process suite (the test image has
+Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15 (§16 from 173 on).
 """
 import os
 import shutil
@@ -355,15 +355,16 @@ M = [
     ("pqgrid/pasr/tickets.py", "        if rec.provisioned_at and t.issued_at <= rec.provisioned_at:", "        if False:",
      "P1-1 tickets of the old record refused"),
     ("pqgrid/e2e/handshake.py",
-     "        self.registry.reprovision(rec, self.now())\n        return self._drop_device(rec.device_id)",
-     "        self.registry.reprovision(rec, self.now())\n        return 0", "P1-1 the old record's sessions end"),
-    ("pqgrid/commands/utility.py", "            self.store.close(q, b\"UNKNOWN\" if q.sends else b\"CANCELLED\")",
-     "            pass", "P1-1 the old record's commands close"),
+     "        self.registry._reprovision(rec, self.now())\n        return self._drop_device(rec.device_id)",
+     "        self.registry._reprovision(rec, self.now())\n        return 0", "P1-1 the old record's sessions end"),
+    ("pqgrid/commands/utility.py",
+     "            self.store.close(q, b\"UNKNOWN\" if q.sends else b\"CANCELLED\")\n            n += 1",
+     "            n += 1", "P1-1 the old record's commands close"),
     ("pqgrid/persistence/utility_db.py", "        zones = self.zones.rotate_device(rec.device_id)",
      "        zones = []", "P1-1 the old record's zone keys rotate"),
     ("pqgrid/persistence/utility_db.py",
-     "        with self.db.tx():\n            self.commands.cancel_device(rec.device_id)",
-     "        if True:\n            self.commands.cancel_device(rec.device_id)",
+     "            with self.db.tx():\n                self.commands.cancel_device(rec.device_id)",
+     "            if True:\n                self.commands.cancel_device(rec.device_id)",
      "P1-1 record and commands change in one transaction"),
     ("pqgrid/mqtt/utility_node.py",
      "        self._acl_due = True\n        self.recompile_acl()\n\n    def _send_zone_keys(self, zone: str) -> None:",
@@ -375,12 +376,48 @@ M = [
      "        pass                              # an existing file, or a restored backup",
      "P1-3 a database readable by others is refused"),
     ("pqgrid/fota/installer.py", "        check_anchors(anchors)\n", "", "B exactly the two distinct anchors"),
-    ("pqgrid/mqtt/guard.py", "        super().extend(items)\n        self._trim()", "        super().extend(items)",
+    ("pqgrid/mqtt/guard.py", "            super().extend(items)\n            self._trim()", "            super().extend(items)",
      "C a bounded log stays bounded when extended"),
     ("pqgrid/mqtt/utility_node.py", "        self.telemetry: list[tuple[bytes, bytes]] = BoundedLog(INBOX_CAP)",
      "        self.telemetry: list[tuple[bytes, bytes]] = []", "C the telemetry inbox is bounded"),
     ("pqgrid/mqtt/utility_node.py", "        self.alerts: list[tuple[bytes, bytes, bool]] = BoundedLog(INBOX_CAP)",
      "        self.alerts: list[tuple[bytes, bytes, bool]] = []", "C the alert inbox is bounded"),
+    # -------------------------------------------------------- second Codex review (IMPLEMENTATION-ROADMAP §16.7)
+    ("pqgrid/e2e/handshake.py",
+     "                or s.provisioned_at != rec.provisioned_at                              # … and its provisioning\n",
+     "", "R2-2 a session of an earlier provisioning is not current"),
+    ("pqgrid/commands/utility.py", "            if q.provisioned_at != prov:", "            if False:",
+     "R2-2 a command of an earlier provisioning is closed"),
+    ("pqgrid/e2e/handshake.py", "        if s.provisioned_at != rec.provisioned_at:                           # re-provisioned",
+     "        if False:                           # re-provisioned", "R2-2 a handshake across a record change is refused"),
+    ("pqgrid/e2e/handshake.py",
+     "        if s is not None and s.provisioned_at != self.registry.get(who.encode()).provisioned_at:",
+     "        if False:", "R2-2 an alert of an earlier provisioning gets a resync hint"),
+    ("pqgrid/commands/utility.py",
+     "        if s.provisioned_at != self.u.registry.get(s.device_id).provisioned_at:   # finding 2",
+     "        if False:   # finding 2", "R2-2 a status ACK of an earlier provisioning is refused"),
+    ("pqgrid/mqtt/utility_node.py", "            elif ok is False and self.n.commands.unsend(did, cmd_seq, sid):",
+     "            elif False:", "R2-1 a refused command is not counted as sent"),
+    ("pqgrid/mqtt/utility_node.py", "                self._send_commands(did)\n", "                pass\n",
+     "R2-1 a refused command is sent again"),
+    ("pqgrid/mqtt/utility_node.py", "            self._settle_commands()                                    # finding 1",
+     "            pass                                    # finding 1", "R2-1 tick settles command PUBACKs"),
+    ("pqgrid/fota/installer.py", "        if len(key) != 1 or key[0] not in (FIRMWARE, POLICY, KEYREVOKE):",
+     "        if False:", "R2-3 a recovered record's key is one known type"),
+    ("pqgrid/fota/installer.py", "                if len(have) != (m.chunk_count + 7) // 8:", "                if False:",
+     "R2-3 a recovered bitmap has the right length"),
+    ("pqgrid/persistence/utility_db.py", "        finally:\n            if rotated is not None:\n                rotated(zones)",
+     "        finally:\n            pass", "R2-5 the new zone keys go out even if the change fails"),
+    ("pqgrid/mqtt/utility_node.py", "        self.c.max_queued_messages_set(CLIENT_QUEUE_MAX)\n", "",
+     "R2-6 paho's queue is bounded"),
+    ("pqgrid/mqtt/utility_node.py",
+     "        if len(self._unacked) > UNACKED_TRACKED:                         # finding 6: no unbounded tracking",
+     "        if False:                         # finding 6: no unbounded tracking", "R2-6 the tracking is bounded"),
+    ("pqgrid/commands/utility.py",
+     "        if len(self.store.open_commands(device_id)) >= MAX_QUEUED_COMMANDS:         # finding 6: backpressure",
+     "        if False:         # finding 6: backpressure", "R2-6 open commands per device are capped"),
+    ("pqgrid/mqtt/device_node.py", "        self.events: list[tuple[str, bytes]] = BoundedLog(1000)",
+     "        self.events: list[tuple[str, bytes]] = []", "R2-6 the device's event list is bounded"),
 ]
 
 

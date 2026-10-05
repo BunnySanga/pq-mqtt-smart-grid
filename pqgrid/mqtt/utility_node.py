@@ -45,6 +45,11 @@ from .device_node import TransportError
 TAKEOVER_WINDOW_S, TAKEOVER_LIMIT = 600, 5
 REFUSAL_MEMORY_S, REFUSALS_KEPT = 600, 1024    # refused PUBACKs kept for matching against tracked publishes
 INBOX_CAP = 1000                               # entries per application inbox (alerts, telemetry, statuses, alarms)
+CLIENT_QUEUE_MAX = 4096        # messages paho may hold (in flight + waiting for a reconnect); beyond: not queued,
+#                                which the publishers handle (P1-2): backpressure during a broker outage (finding 6)
+UNACKED_TRACKED = 1024         # utility publishes tracked for flush() (about 20 are in flight while connected);
+#                                during an outage the oldest beyond this are no longer waited for
+COMMAND_RETRY_S = 60           # a command the broker refused is sent again after this (second Codex review, finding 1)
 FIRMWARE_T, POLICY_T = 1, 2                                         # fota.artifact types (avoids an import cycle)
 ZONE_ROTATE_EVERY_S = 7 * 86400                                     # key table §4.7: … and weekly
 
@@ -58,6 +63,7 @@ class UtilityMqtt:
         self.lock = threading.RLock()
         self.c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt.MQTTv5)
         self.c.tls_set_context(tls_ctx)
+        self.c.max_queued_messages_set(CLIENT_QUEUE_MAX)
         self.refused: list[str] = BoundedLog()                         # expected protocol refusals (G-1, local)
         self.internal_errors: list[tuple] = BoundedLog()               # unexpected: type + locations only (M8)
         self.c.suppress_exceptions = True
@@ -77,7 +83,10 @@ class UtilityMqtt:
         self._online: dict[bytes, deque] = {}
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
         self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
-        self._unacked: list = []                                       # MQTTMessageInfo not yet PUBACKed
+        self._unacked: deque = deque()                                 # MQTTMessageInfo not yet PUBACKed, oldest first
+        self._cmd_pubs: list = BoundedLog(UNACKED_TRACKED)             # (info, device, cmd_seq, sid) awaiting PUBACK
+        self._cmd_retry: dict[bytes, float] = {}                       # device → when its refused commands go again
+        self.retry_every_s = COMMAND_RETRY_S
         self._ack_lock = threading.Lock()                              # never held while calling into paho
         self._refused_mids: OrderedDict[int, float] = OrderedDict()    # mid → when its PUBACK refused it
         self.publish_refusals: list[str] = BoundedLog()                # refused PUBACKs, publishes paho did not queue
@@ -116,7 +125,7 @@ class UtilityMqtt:
         size, limit = publish_size(topic, payload), self._max_packet(device_id)
         if size > limit:                                                 # §10.2: never send what gets dropped
             raise TransportError(f"{size} B PUBLISH exceeds {device_id.decode()}'s maximum packet size {limit} B")
-        self._send(topic, payload)
+        return self._send(topic, payload)
 
     def _send(self, topic: str, payload: bytes, retain: bool = False):
         """Hand one QoS 1 message to paho and track it until the broker acknowledges it; returns its MQTTMessageInfo.
@@ -124,14 +133,18 @@ class UtilityMqtt:
         info keeps that rc and then raises whenever it is asked whether it was published, which made every later
         publish raise (P1-2). Its rc is therefore reset, so the info reports the PUBACK like any other. Any other rc
         (MQTT_ERR_QUEUE_SIZE in paho 2.1.0) means paho did not keep the message: TransportError, nothing sent.
-        Callers hold self.lock, which also guards _unacked."""
+        Callers hold self.lock, which also guards _unacked (pruned from the oldest end: amortised O(1), bounded)."""
         info = self.c.publish(topic, payload, qos=1, retain=retain)
         if info.rc == mqtt.MQTT_ERR_NO_CONN:
             info.rc = mqtt.MQTT_ERR_SUCCESS                              # queued by paho for the reconnect
         elif info.rc != mqtt.MQTT_ERR_SUCCESS:
             self.publish_refusals.append(f"{topic}: not queued by the client: {mqtt.error_string(info.rc)}")
             raise TransportError(f"{topic}: not queued by the client ({mqtt.error_string(info.rc)})")
-        self._unacked = [i for i in self._unacked if not i.is_published()] + [info]
+        while self._unacked and self._unacked[0].is_published():
+            self._unacked.popleft()
+        self._unacked.append(info)
+        if len(self._unacked) > UNACKED_TRACKED:                         # finding 6: no unbounded tracking
+            self._unacked.popleft()
         return info
 
     def _on_publish(self, client, userdata, mid, reason_code, properties) -> None:
@@ -270,11 +283,46 @@ class UtilityMqtt:
     def _flush(self, did: bytes) -> None:
         """Commands first, each handed over right after it is recorded as sent (a publish that is not queued undoes
         its record and stops the flush: P1-2), then zone keys and DR re-sends (nothing records those as sent)."""
-        rec, z = self.n.endpoint.registry.get(did), self.n.zones
-        topic = topics.control(rec.dclass, did)
-        self.n.commands.outgoing(did, send=lambda env: self._publish(did, topic, env))
+        z = self.n.zones
+        topic = self._send_commands(did)
         for env in z.zonekeys_for(did) + z.resend_for(did):
             self._publish(did, topic, env)                               # one topic: keys before events
+
+    def _send_commands(self, did: bytes) -> str:
+        """The device's open commands for its live session, each followed to its PUBACK (finding 1: a refusing PUBACK
+        undoes the command's sent record and the device's commands go again after retry_every_s)."""
+        rec, s = self.n.endpoint.registry.get(did), self.n.endpoint.current_session(did)
+        topic = topics.control(rec.dclass, did)
+
+        def send(env: bytes, cmd_seq: int) -> None:
+            self._cmd_pubs.append((self._publish(did, topic, env), did, cmd_seq, s.sid))
+        self.n.commands.outgoing(did, send=send)
+        return topic
+
+    def _settle_commands(self) -> None:
+        """Second Codex review, finding 1 (tick): a command whose PUBLISH the broker refused never reached the device,
+        so its record of being sent in that session is undone and the device's commands go again, at most once per
+        retry_every_s (a broker that keeps refusing is not hammered). Accepted ones are simply forgotten."""
+        now, keep = self.clock(), []
+        for entry in list(self._cmd_pubs):
+            info, did, cmd_seq, sid = entry
+            ok = self._acked(info)
+            if ok is None:
+                keep.append(entry)
+            elif ok is False and self.n.commands.unsend(did, cmd_seq, sid):
+                self._cmd_retry.setdefault(did, now + self.retry_every_s)
+        self._cmd_pubs.drain()
+        self._cmd_pubs.extend(keep)
+        for did, at in list(self._cmd_retry.items()):
+            if now < at:
+                continue
+            del self._cmd_retry[did]
+            if self.n.endpoint.current_session(did) is None:
+                continue                                                 # its next establishment sends them
+            try:
+                self._send_commands(did)
+            except PqgridError as e:
+                self.refused.append(f"command retry for {did.decode()}: {e}")
 
     def command(self, did: bytes, command: bytes, ttl_s: int, idempotent: bool = False) -> int:
         with self.lock:
@@ -320,10 +368,16 @@ class UtilityMqtt:
         """Codex audit P1-1: the device's class and/or E2E key change (UtilityNode.reprovision: its sessions, tickets,
         open commands, GRANTs and zone keys end), the remaining members of its zones get the new keys, and the broker
         ACL is recompiled for the new record (its class decides its topics). The device establishes again under its
-        new identity; a failed ACL hook is retried by tick() (L-1)."""
+        new identity; a failed ACL hook is retried by tick() (L-1). The new zone keys go out even if the record change
+        fails after the rotation (second Codex review, finding 5); the error is then raised and the ACL is untouched."""
+        def send_keys(zones: list[str]) -> None:
+            for zone in zones:
+                try:
+                    self._send_zone_keys(zone)
+                except PqgridError as e:
+                    self.refused.append(f"zone keys for {zone} after a re-provisioning: {e}")
         with self.lock:
-            for zone in self.n.reprovision(rec):
-                self._send_zone_keys(zone)
+            self.n.reprovision(rec, rotated=send_keys)
         self._acl_due = True
         self.recompile_acl()
 
@@ -441,6 +495,7 @@ class UtilityMqtt:
                 self.publisher.cleanup(self._fota_out)
                 self.publisher.settle(self._acked)                     # P1-2: confirmed only on the broker's PUBACKs
                 self.publisher.retry(self._fota_out)                   # … and published again while it is not
+            self._settle_commands()                                    # finding 1: refused commands go again
             self.n.endpoint.sweep()
         self.ticks += 1
 

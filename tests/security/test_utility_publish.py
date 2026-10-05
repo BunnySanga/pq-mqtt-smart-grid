@@ -36,7 +36,7 @@ class Paho:
     puback() does what paho does when the broker acknowledges (the on_publish callback, then the info is marked)."""
 
     def __init__(self):
-        self.rc, self.mid, self.queued = mqtt.MQTT_ERR_SUCCESS, 0, []
+        self.rc, self.mid, self.queued, self.refused = mqtt.MQTT_ERR_SUCCESS, 0, [], set()
 
     def publish(self, topic, payload, qos=1, retain=False):
         self.mid += 1
@@ -52,6 +52,8 @@ class Paho:
                 u._on_publish(self, None, info.mid, ReasonCode(PacketTypes.PUBACK, "Success" if ok else
                                                                "Not authorized"), None)
                 info._set_as_published()
+                if not ok:
+                    self.refused.add(info.mid)                        # the broker did not take it
 
     def topics(self) -> list[str]:
         return [t for t, _, _, _ in self.queued]
@@ -66,8 +68,8 @@ def utility(p: Plant, publisher=None) -> tuple[UtilityMqtt, Paho]:
 def applied_on_device(dev, paho: Paho) -> list[bytes]:
     """The broker delivers what paho queued since the last call (each envelope once: the device refuses a replay)."""
     topic, start = control_topic(dev.dclass, dev.did), getattr(paho, "delivered", 0)
-    for t, env, _, _ in paho.queued[start:]:
-        if t == topic:
+    for t, env, _, info in paho.queued[start:]:
+        if t == topic and info.mid not in paho.refused:
             dev.proc.on_control(topic, env)
     paho.delivered = len(paho.queued)
     return dev.applied
@@ -116,6 +118,64 @@ def test_a_command_the_client_did_not_queue_is_not_counted_as_sent(tmp_path):
     u.command(D1, b"CMD-4", 600)
     assert p.node.commands.outcome(D1, late) == b"EXPIRED"                # never sent: not UNKNOWN
     assert applied_on_device(d, paho) == [b"CMD-1", b"CMD-2", b"CMD-4"]
+
+
+def test_a_command_the_broker_refused_is_sent_again_in_the_same_session(tmp_path):
+    """Second Codex review, finding 1: a PUBACK with a failure reason code (e.g. a stale ACL) means the command never
+    reached the device. Before the fix it stayed recorded as sent in that session, so no later flush of the session
+    sent it again. Now its record is undone and the device's commands go again after retry_every_s."""
+    p = Plant(tmp_path)
+    d = p.device(D1, "der_ctrl")
+    p.full(d)
+    u, paho = utility(p)
+    seq = u.command(D1, b"CMD-A", 600)
+    paho.puback(u, ok=False)                                              # the broker refused it
+    u.tick()
+    [q] = p.node.commands.store.open_commands(D1)
+    assert (q.cmd.cmd_seq, q.sends, q.last_sid) == (seq, 0, b"")          # not counted as sent any more
+    n = len(paho.queued)
+    p.t += u.retry_every_s - 1
+    u.tick()
+    assert len(paho.queued) == n                                          # not before retry_every_s
+    p.t += 1
+    u.tick()
+    assert len(paho.queued) == n + 1                                      # CMD-A again, in the same session
+    paho.puback(u)
+    u.tick()
+    assert applied_on_device(d, paho) == [b"CMD-A"]                       # it reached the device once
+    p.t += u.retry_every_s
+    u.tick()
+    assert len(paho.queued) == n + 1                                      # accepted: never sent again
+
+
+def test_the_client_queue_and_the_tracking_are_bounded_while_the_broker_is_down(tmp_path):
+    """Second Codex review, finding 6: during a broker outage paho kept every publish in memory and the utility's
+    tracking grew with it (and was rebuilt in full on every publish). paho now holds at most CLIENT_QUEUE_MAX; the
+    next publish is not queued (TransportError, which the command and artifact paths handle: P1-2)."""
+    from pqgrid.mqtt.utility_node import CLIENT_QUEUE_MAX, UNACKED_TRACKED
+    p = Plant(tmp_path)
+    u = UtilityMqtt(p.node, ssl.create_default_context(), "localhost", 1, clock=lambda: p.t)   # real paho, offline
+    for i in range(CLIENT_QUEUE_MAX):
+        u._send("pqgrid/test", b"%d" % i)                                 # rc 4: kept for the reconnect
+    with pytest.raises(TransportError, match="not queued"):
+        u._send("pqgrid/test", b"one too many")
+    assert len(u._unacked) <= UNACKED_TRACKED                             # (private: the tracking's size)
+
+
+def test_open_commands_per_device_are_capped(tmp_path):
+    """Second Codex review, finding 6: commands had no per-device quota. The cap is above the device's own
+    MAX_INTENTS, so the device's REJECTED path is unchanged."""
+    from pqgrid.commands.device import MAX_INTENTS
+    from pqgrid.commands.utility import MAX_QUEUED_COMMANDS
+    from pqgrid.errors import CommandError
+    assert MAX_QUEUED_COMMANDS > MAX_INTENTS
+    p = Plant(tmp_path)
+    p.device(D1, "der_ctrl")
+    svc = p.node.commands
+    for i in range(MAX_QUEUED_COMMANDS):
+        svc.issue(D1, b"C%d" % i, 600)
+    with pytest.raises(CommandError, match="already open"):
+        svc.issue(D1, b"one too many", 600)
 
 
 def test_a_status_ack_reply_and_a_dr_event_are_tracked_like_any_other_publish(tmp_path):

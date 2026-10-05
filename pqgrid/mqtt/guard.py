@@ -12,6 +12,7 @@ Neither kind escapes to paho. As a second line, paho's own suppress_exceptions i
 from __future__ import annotations
 
 import os
+import threading
 import traceback
 
 from ..errors import PqgridError
@@ -46,14 +47,18 @@ class BoundedLog(list):
     def __init__(self, cap: int = 1000):
         super().__init__()
         self.cap, self.dropped = cap, 0
+        self._lock = threading.Lock()        # paho's thread appends while the application drains (finding 7)
 
     def append(self, item) -> None:
-        super().append(item)
-        self._trim()
+        with self._lock:
+            super().append(item)
+            self._trim()
 
     def extend(self, items) -> None:
-        super().extend(items)
-        self._trim()
+        items = list(items)
+        with self._lock:
+            super().extend(items)
+            self._trim()
 
     def __iadd__(self, items):
         self.extend(items)
@@ -66,7 +71,9 @@ class BoundedLog(list):
             self.dropped += over
 
     def drain(self) -> list:
-        """Every entry, oldest first, removed from the log: the consumer's API."""
-        out = list(self)
-        self.clear()
+        """Every entry, oldest first, removed from the log in one step: the consumer's API. An entry appended
+        concurrently is either in the result or still in the log, never lost (second Codex review, finding 7)."""
+        with self._lock:
+            out = list(self)
+            self.clear()
         return out

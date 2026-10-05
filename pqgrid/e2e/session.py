@@ -25,6 +25,8 @@ class Session:
     sid: bytes
     resume_mode: ResumeMode
     chain_expires: int
+    provisioned_at: int = 0          # utility side: the device record's provisioned_at when it was established; a
+    #                                  re-provisioning ends it wherever it is used (second Codex review, finding 2)
     _keys: dict = field(default_factory=dict, repr=False)
     _send: dict = field(default_factory=dict, repr=False)
     _guards: dict = field(default_factory=dict, repr=False)

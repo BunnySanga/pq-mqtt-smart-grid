@@ -142,7 +142,7 @@ def test_the_registry_never_changes_a_device_by_overwriting_it(tmp_path):
     with pytest.raises(PolicyError, match="reprovision"):
         p.u.registry.add(rec)                                              # re-activation is a re-provisioning
     with pytest.raises(PolicyError, match="not registered"):
-        p.u.registry.reprovision(replace(rec, device_id=D2), p.t)
+        p.node.reprovision(replace(rec, device_id=D2))
 
 
 def test_the_utility_sends_the_remaining_members_new_keys_and_recompiles_the_acl(tmp_path):
@@ -161,3 +161,68 @@ def test_the_utility_sends_the_remaining_members_new_keys_and_recompiles_the_acl
     assert paho.topics() == [control_topic("der_ctrl", D2)]               # the remaining member's new key only
     assert dec(d2.proc.on_control(control_topic("der_ctrl", D2), paho.queued[0][1]), 6)[4] == b"OK"
     assert seen == ["c2_meter"] and not u.acl_failures
+
+
+# ================================================================== second Codex review, findings 2 and 5
+def test_even_the_record_step_alone_lets_no_old_session_or_command_through(tmp_path):
+    """Finding 2: the lower-level steps were public, and calling one directly skipped the rest of the operation: an old
+    queued command reached the new identity and the old key's session stayed current. The steps are internal now, and
+    sessions and commands carry the record's provisioned_at, refused wherever they are used once it changed. Here the
+    record step alone stands for any path that changes the record."""
+    from pqgrid.e2e.envelopes import alert_topic
+    from pqgrid.e2e.handshake import UnknownSessionError
+    from pqgrid.errors import EnvelopeError
+    p, old, sent, unsent, gid = before_the_change(tmp_path)
+    svc = p.node.commands
+    late = svc.issue(D1, b"STATUS ME", 600)
+    envs = svc.outgoing(D1)                                               # `unsent` and `late`, both sent now
+    assert len(envs) == 2
+    ack = old.proc.on_control(control_topic("der_ctrl", D1), envs[-1])   # the old device's status ACK, not yet in
+    never = svc.issue(D1, b"NEVER SENT", 600)
+    kp = HybridKeyPair.generate()
+    p.u.registry._reprovision(replace(p.u.registry.get(D1), e2e_pk=kp.pk), p.u.now())   # the record step alone
+    assert p.u.current_session(D1) is None                                # the old key's session: not current
+    with pytest.raises(EnvelopeError, match="earlier provisioning"):
+        svc.on_status(ack)                                                # its status ACK: refused
+    with pytest.raises(UnknownSessionError, match="earlier provisioning"):
+        p.u.open_alert(alert_topic("der_ctrl", D1), old.d.seal_alert(alert_topic("der_ctrl", D1), b"a" * 16, b"x"))
+    new = Identity(p, D1, "der_ctrl", kp)
+    p.t += 1
+    p.full(new)
+    assert svc.outgoing(D1) == []                                         # no command of the old record goes out
+    assert [svc.outcome(D1, c) for c in (sent, unsent, late, never)] == [b"UNKNOWN"] * 3 + [b"CANCELLED"]
+
+
+def test_a_handshake_begun_before_a_record_change_is_refused_at_df(tmp_path):
+    """Finding 2: a half-open handshake of the old record cannot complete after the record changed."""
+    p = Plant(tmp_path)
+    old = p.device(D1, "der_ctrl")
+    old.d.on_server_hello(p.u.on_client_hello(D1, old.d.client_hello()))
+    p.u.registry._reprovision(replace(p.u.registry.get(D1), e2e_pk=HybridKeyPair.generate().pk), p.u.now())
+    with pytest.raises(HandshakeError, match="re-provisioned during the handshake"):
+        p.u.on_finished(D1, old.d.finished())
+    assert p.u.session_for(D1) is None
+
+
+def test_the_new_zone_keys_go_out_even_if_the_record_change_fails(tmp_path, monkeypatch):
+    """Finding 5: the zone keys rotate first. Before the fix a failing record change then skipped their distribution,
+    so the live members kept keys no longer in force and could not read new events until a zone sync."""
+    from test_utility_publish import utility
+    p = Plant(tmp_path)
+    d1, d2 = p.device(D1, "der_ctrl"), p.device(D2, "der_ctrl")
+    p.full(d1)
+    p.full(d2)
+    p.node.zones.create("f7")
+    p.node.zones.add_member("f7", D1)
+    p.node.zones.add_member("f7", D2)
+    u, paho = utility(p)
+
+    def disk_full(rec):
+        raise OSError("disk full")
+    monkeypatch.setattr(p.u.registry, "_store", disk_full)
+    with pytest.raises(OSError):
+        u.reprovision_device(replace(p.u.registry.get(D1), dclass="c2_meter"))
+    assert p.u.registry.get(D1).dclass == "der_ctrl"                      # nothing changed …
+    sent = {t: env for t, env, _, _ in paho.queued}
+    assert dec(d2.proc.on_control(control_topic("der_ctrl", D2), sent[control_topic("der_ctrl", D2)]), 6)[4] == b"OK"
+    assert control_topic("der_ctrl", D1) in sent                          # … and every live member has the new key

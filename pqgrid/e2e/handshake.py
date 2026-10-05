@@ -465,11 +465,11 @@ class UtilityEndpoint:
         self.registry.revoke(device_id)
         return self._drop_device(device_id)
 
-    def reprovision_device(self, rec) -> int:
-        """Codex audit P1-1: the device's class and/or E2E key change (registry.reprovision: durable, and it refuses
-        every ticket issued until now). Then every live session and half-open handshake of the old record is
-        invalidated, as at revocation: what it authorised must not outlive it. Returns the sessions closed."""
-        self.registry.reprovision(rec, self.now())
+    def _reprovision_device(self, rec) -> int:
+        """A step of UtilityNode.reprovision (internal; Codex audit P1-1): the device's class and/or E2E key change
+        (registry._reprovision: durable, and every ticket issued until now is refused). Then every live session and
+        half-open handshake of the old record is dropped, as at revocation. Returns the sessions closed."""
+        self.registry._reprovision(rec, self.now())
         return self._drop_device(rec.device_id)
 
     def _drop_device(self, device_id: bytes) -> int:
@@ -510,6 +510,7 @@ class UtilityEndpoint:
         from."""
         s, rec = self.session_for(device_id), self.registry.get(device_id)
         if (s is None or rec is None or not rec.active or s.dclass != rec.dclass       # P1-1: the record's class
+                or s.provisioned_at != rec.provisioned_at                              # … and its provisioning
                 or not ct_eq(s.policy_info, self.policy.info()) or self.end_expired_chain(s)):
             return None
         return s
@@ -592,7 +593,8 @@ class UtilityEndpoint:
         mk = keys.derive_master(th2, ss_e + ss_u + ss_d)
         mu = keys.mac_u(mk.kc_u, th2)
         self._expire_pending(now)
-        session = Session(did, rec.dclass, pinfo, fw, prof.aead, mk.k_master, mk.sid, prof.resume, chain)
+        session = Session(did, rec.dclass, pinfo, fw, prof.aead, mk.k_master, mk.sid, prof.resume, chain,
+                          provisioned_at=rec.provisioned_at)
         self._pending.pop(did, None)                                         # one half-open per device
         self._pending[did] = _Pending(session, mk.kc_d, th2, mu, now + prof.pending_ttl_s)
         sh = enc([b"SH", ct_e, n_u, nonce2, ct_inner, mu])
@@ -650,7 +652,8 @@ class UtilityEndpoint:
         mk = keys.derive_master(th, t.psk + ss_e)
         mu = keys.mac_u(mk.kc_u, th)
         session = Session(t.device_id, t.dclass, t.policy_info, t.fw_version, prof.aead, mk.k_master, mk.sid,
-                          t.resume_mode, t.chain_expires_at)
+                          t.resume_mode, t.chain_expires_at,
+                          provisioned_at=self.registry.get(t.device_id).provisioned_at)
         self._expire_pending(now)
         self._pending.pop(t.device_id, None)                                 # one half-open per device (CH or RH)
         self._pending[t.device_id] = _Pending(session, mk.kc_d, th, mu, now + prof.pending_ttl_s)
@@ -686,6 +689,9 @@ class UtilityEndpoint:
         if now >= s.chain_expires:                                            # M2: the chain ended after RS
             s.close()
             raise HandshakeError("session chain expired: a full handshake is required")
+        if s.provisioned_at != rec.provisioned_at:                           # re-provisioned since CH/RH
+            s.close()
+            raise HandshakeError("the device was re-provisioned during the handshake")
         old = self._by_device.get(s.device_id)
         if old is not None:                                                  # one live session per device
             prev = self.sessions.pop(old, None)
@@ -735,6 +741,8 @@ class UtilityEndpoint:
         s, reason = self.sessions.get(sid), "unknown session"
         if s is not None and self.end_expired_chain(s):                     # M2: gone, as after a restart
             s, reason = None, "session chain expired: a full handshake is required"
+        if s is not None and s.provisioned_at != self.registry.get(who.encode()).provisioned_at:
+            s, reason = None, "session of an earlier provisioning: a full handshake is required"
         if s is None:                                                        # DR-041: hint, at most every 30 s
             now = self.now()
             if now - self._last_hint.get(who, -DeviceEndpoint.RESYNC_INTERVAL_S) < DeviceEndpoint.RESYNC_INTERVAL_S:

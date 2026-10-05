@@ -209,7 +209,8 @@ def test_P9_revoked_device(world: World):
 
 def test_reclassified_device_must_do_a_full_handshake(world: World):
     d = ready(world)
-    world.registry.add(DeviceRecord(M1, "c2_meter", d.static.pk))   # moved to another class (E22)
+    world.registry._reprovision(DeviceRecord(M1, "c2_meter", d.static.pk), world.utility.now())   # moved to
+    #                                                another class (E22): the registry step alone is what this needs
     with pytest.raises(TicketError, match="class does not match the registry"):
         world.utility.on_resume_hello(M1, d.resume_hello())
 
