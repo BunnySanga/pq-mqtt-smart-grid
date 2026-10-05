@@ -376,3 +376,24 @@ def test_publishing_the_same_version_again_cancels_its_pending_removal(tmp_path,
     p.t += u.publisher.retry_every_s
     u.tick()
     assert len(empties(paho, art)) == n                                   # no deletion after the new copy
+
+
+def test_flush_is_not_broken_by_a_publish_that_lands_while_it_checks(tmp_path):
+    """Final review of §16.7: _unacked became a deque, and flush() then checked every entry of the LIVE deque while
+    paho's thread (handshake replies) may append to it between two checks: "RuntimeError: deque mutated during
+    iteration". flush() now works on a copy taken under the lock. The concurrent publish is made deterministic here."""
+    p = Plant(tmp_path)
+    u, _ = utility(p)
+
+    class Racing:                                                         # a tracked publish, acknowledged …
+        mid = 0
+
+        def wait_for_publish(self, timeout=None):
+            pass
+
+        def is_published(self):
+            u._unacked.append(mqtt.MQTTMessageInfo(99))                   # … while another publish lands
+            return True
+    u._unacked.append(Racing())
+    u._unacked.append(Racing())
+    assert u.flush(0) is True                                             # before the fix: RuntimeError

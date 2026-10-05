@@ -171,12 +171,14 @@ class UtilityMqtt:
         """True once the broker has acknowledged (stored) every QoS 1 message this node published so far, e.g.
         before a graceful shutdown."""
         end = time.monotonic() + timeout
-        for info in list(self._unacked):
+        with self.lock:                                   # _unacked is a deque that paho's thread appends to: copying
+            pending = list(self._unacked)                 # it unlocked can raise "deque mutated during iteration"
+        for info in pending:                              # (final review of §16.7, finding 6's change)
             try:
                 info.wait_for_publish(max(0.0, end - time.monotonic()))
             except (RuntimeError, ValueError):
                 return False
-        return all(i.is_published() for i in self._unacked)
+        return all(i.is_published() for i in pending)
 
     # ------------------------------------------------------------------------------------------- inbound
     def _on_message(self, client, userdata, m):

@@ -8,7 +8,7 @@ Run inside the test image (tools/ is copied to /app/tools; no host mounts), 4 sl
 A mutant counts as KILLED only when a test FAILED (pytest exit code 1); a crash or collection error is ERROR.
 Mutants 117-139 disable the checks added by cycle 1 (C2-2), 140-143 cycle 2's (C2-8), 144-146 cycle 3's (C3-4),
 147-172 the remediation after the independent release audit (R-x), 173-182 the fix of the Codex audit's P1-2,
-183-200 its other fixes, 201-215 the fixes of the second Codex review, 216-221 the follow-up (§16). A mutant may
+183-200 its other fixes, 201-215 the fixes of the second Codex review, 216-222 the follow-up (§16). A mutant may
 name broker tests (5th element) for a check only a real broker exercises; they run in addition to the in-process
 suite (the test image has Mosquitto). Results and the classification of every survivor: IMPLEMENTATION-ROADMAP §15
 (§16 from 173 on).
@@ -426,8 +426,8 @@ M = [
      "        self.c.max_queued_messages_set(self._queue_cap())   # §16.8: bounded while the broker is down\n", "",
      "F-1 the device's paho queue is bounded"),
     ("pqgrid/mqtt/device_node.py",
-     "        self.c.max_queued_messages_set(self._queue_cap())     # §16.8: follows the class's outbox size\n", "",
-     "F-1 the bound follows the class's outbox"),
+     "            self.c.max_queued_messages_set(self._queue_cap())  # §16.8: the installed class's outbox.",
+     "            pass  # §16.8: the installed class's outbox.", "F-1 the bound follows the class's outbox"),
     ("pqgrid/fota/publisher.py", "            self._send_removal(client, r)\n        return n",
      "            pass\n        return n", "F-2 an unacknowledged removal is sent again"),
     ("pqgrid/fota/publisher.py", "        self._store_removal(r)\n", "", "F-2 a removal is durable before it is sent"),
@@ -435,6 +435,8 @@ M = [
      "            if False:\n                r.tokens = None", "F-2 a refused removal is sent again"),
     ("pqgrid/fota/publisher.py", "            self._drop_removal(r)                                  # published again",
      "            pass                                  # published again", "F-2 a republish cancels its pending removal"),
+    ("pqgrid/mqtt/utility_node.py", "        return all(i.is_published() for i in pending)",
+     "        return all(i.is_published() for i in self._unacked)", "F-3 flush() checks a copy, not the live deque"),
 ]
 
 

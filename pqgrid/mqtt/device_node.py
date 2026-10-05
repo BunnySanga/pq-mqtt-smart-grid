@@ -162,6 +162,10 @@ class DeviceMqtt:
         if self._declared is not None and want[0] > self._declared[0]:
             self._fota_subscribed = False                     # retained artifacts dropped under the smaller limit
         self._props.MaximumPacketSize, self._props.SessionExpiryInterval = prof.max_packet, prof.session_expiry_s
+        try:
+            self.c.max_queued_messages_set(self._queue_cap())  # §16.8: the installed class's outbox. paho changes it
+        except RuntimeError:                                    # only on a closed connection (it raises otherwise),
+            pass                                                # so a new policy's bound applies from here
         self.connected.clear()
         self.c.connect(self.host, self.port, keepalive=prof.keepalive_s, clean_start=False, properties=self._props)
         self.c.loop_start()
@@ -413,7 +417,7 @@ class DeviceMqtt:
         prof = self.d.profile
         if self.outbox is not None:
             self.outbox.cap = prof.outbox_cap                 # the budget require_capacity() just checked
-        self.c.max_queued_messages_set(self._queue_cap())     # §16.8: follows the class's outbox size
+        #                                                       paho's queue bound follows at the next connect()
         self._rehandshake_at = time.monotonic() + self._spread()   # CONNECT values: at the planned reconnect
 
     def _queue_cap(self) -> int:
@@ -421,7 +425,10 @@ class DeviceMqtt:
         it for the reconnect, so without a bound every attempt during a long broker outage grew the device's memory.
         The bound must still take the burst after an establishment (every outbox entry that did not fit in DF goes
         live at once), and the outbox never holds more than outbox_cap // Outbox.OVERHEAD entries. Beyond the bound
-        paho keeps nothing (MQTT_ERR_QUEUE_SIZE): alerts stay in the outbox, handshakes are retried."""
+        paho keeps nothing (MQTT_ERR_QUEUE_SIZE): alerts stay in the outbox, handshakes are retried.
+        paho refuses to change the bound on an established connection, so a policy that changes the outbox size takes
+        effect at the next connect() (a class change outside CONNECT causes no reconnect, H-2). Until then a GROWN
+        outbox may not fit the burst: what does not go live stays in the outbox and goes in the next DF."""
         from ..persistence.device import Outbox
         return self.d.profile.outbox_cap // Outbox.OVERHEAD + QUEUE_HEADROOM
 

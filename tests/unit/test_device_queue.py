@@ -35,11 +35,16 @@ def test_the_device_client_queue_is_bounded_while_the_broker_is_down(world):
         mq._publish(TOPIC, b"one too many")                               # before the fix: kept like the rest
 
 
-def test_the_bound_follows_a_policy_that_changes_the_outbox_size(world):
+def test_the_bound_follows_a_policy_that_changes_the_outbox_size_from_the_next_connect(world):
+    """paho refuses to change the bound on an established connection (RuntimeError: found by the broker tests, where
+    every policy activation failed in the device loop), so the new bound applies at the next connect()."""
     d, mq = device(world)
     bigger = conftest.replace_class(world.policy, "smart_meter", outbox_cap=2 * d.profile.outbox_cap)
     v2 = conftest.make_policy(world.u_static.pk, mldsa_public_bytes(world.cmd_sk), version=2, classes=bigger)
     mq._install_policy(v2)                                                # what the device loop does at activate_at
+    with pytest.raises(OSError):
+        mq.connect(timeout=0.1)                                           # nothing listens on port 1: the bound
+    #                                                                       is set before the attempt all the same
     fill(mq, v2.profile("smart_meter").outbox_cap // Outbox.OVERHEAD + QUEUE_HEADROOM)
     with pytest.raises(TransportError, match="queue full"):
         mq._publish(TOPIC, b"one too many")
