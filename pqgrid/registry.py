@@ -45,11 +45,16 @@ class Registry:
         self._d: dict[bytes, DeviceRecord] = {}
 
     def add(self, rec: DeviceRecord) -> None:
+        """Register a device. A new record starts at provisioned_at 0 (never re-provisioned), whatever the caller
+        passes. Adding a registered device again with the same class, key and state may only update its reported
+        max_packet: its provisioned_at is KEPT (third Codex review, finding 1: an "idempotent" add stored the caller's
+        default 0, and the old key's tickets were accepted again)."""
         self._check(rec)
         old = self._d.get(rec.device_id)
         if old is not None and (old.dclass, old.e2e_pk, old.active) != (rec.dclass, rec.e2e_pk, rec.active):
             raise PolicyError("device already registered: a class, key or revocation change goes through "
                               "UtilityNode.reprovision or revoke(), never an overwrite (P1-1)")
+        rec = replace(rec, provisioned_at=0 if old is None else old.provisioned_at)
         self._store(rec)
         self._d[rec.device_id] = rec
 
@@ -59,9 +64,12 @@ class Registry:
         re-provision", Master §23.11). The record is active again and stamped with `now`: no resumption ticket, session
         or queued command of the old record is accepted from then on. Durable before it takes effect."""
         self._check(rec)
-        if rec.device_id not in self._d:
+        old = self._d.get(rec.device_id)
+        if old is None:
             raise PolicyError("device not registered: use add()")
-        rec = replace(rec, active=True, provisioned_at=now)
+        # A generation that only ever grows (third review, finding 1): the utility's clock, but never at or below the
+        # previous value, so a clock set back or two re-provisionings in one second cannot reuse a generation.
+        rec = replace(rec, active=True, provisioned_at=max(int(now), old.provisioned_at + 1))
         self._store(rec)
         self._d[rec.device_id] = rec
         return rec

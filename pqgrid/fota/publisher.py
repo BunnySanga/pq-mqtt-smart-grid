@@ -21,6 +21,7 @@ retained for good while the utility believed it gone.
 """
 from __future__ import annotations
 
+import contextlib
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -118,17 +119,27 @@ class Publisher:
         key = (art.manifest.device_class, art.manifest.type)
         old, pub = self.live.get(key), Published(art, [t for t, _ in msgs], self.clock())
         rid = r8(dec(art.payload, 1)[0]) if art.manifest.type == KEYREVOKE else None
-        self._store(key, art, pub)                                 # the rollout state first (U-4), so a restart
-        if rid is not None:                                        # never forgets what it retained or revoked;
-            self._store_revoked(rid)                               # unconfirmed until the broker has it all (P1-2)
+        cancelled = [r for r in self.removals if (r.key, r.version) == (key, art.manifest.version)]
+        replaced = (self._removal_of(old) if old and old.artifact.manifest.version != art.manifest.version
+                    else None)                                     # only the newest needs to stay retained
+        with self._atomic():                                       # ONE durable transition, before the broker is
+            self._store(key, art, pub)                             # told (third Codex review, finding 4): the new
+            if rid is not None:                                    # publication (unconfirmed until the broker has
+                self._store_revoked(rid)                           # it all, P1-2), its revocation, the end of a
+            for r in cancelled:                                    # pending deletion of the same version (it would
+                self._forget_removal(r)                            # delete the new copy, §16.8) and the deletion
+            if replaced is not None:                               # of the version it replaces
+                self._store_removal(replaced)
+        for r in cancelled:
+            self.removals.remove(r)
+        if replaced is not None:
+            self.removals.append(replaced)
         self.live[key], self.newest[key] = pub, art
         if rid is not None:
             self.revoked.add(rid)
-        for r in [r for r in self.removals if (r.key, r.version) == (key, art.manifest.version)]:
-            self._drop_removal(r)                                  # published again: its pending deletion would
-        self._send(client, pub)                                    # delete the new copy (§16.8)
-        if old and old.artifact.manifest.version != art.manifest.version:
-            self._remove(client, old)                              # only the newest needs to stay retained
+        self._send(client, pub)
+        if replaced is not None:
+            self._send_removal(client, replaced)
 
     def _send(self, client, pub: Published) -> None:
         """Hand every message of the publication to the client, retained. If the client raises part-way, nothing is
@@ -184,9 +195,13 @@ class Publisher:
         now, removed = self.clock(), 0
         for key, pub in list(self.live.items()):
             if now - pub.at >= RETENTION_S:
-                self._remove(client, pub)
+                r = self._removal_of(pub)
+                with self._atomic():                               # finding 4: the deletion and "not retained"
+                    self._store_removal(r)                         # together
+                    self._store(key, pub.artifact, None)           # still the newest; no longer retained
+                self.removals.append(r)
                 del self.live[key]
-                self._store(key, pub.artifact, None)               # still the newest; no longer retained
+                self._send_removal(client, r)
                 removed += 1
         return removed
 
@@ -202,6 +217,10 @@ class Publisher:
 
     def _load_removals(self) -> list:
         return []
+
+    def _atomic(self):
+        """One durable transition for several state changes (SqlPublisher: one database transaction)."""
+        return contextlib.nullcontext()
 
     def _store_removal(self, r: Removal) -> None:
         pass
@@ -248,13 +267,11 @@ class Publisher:
             self.publish(client, art)
         return [a.manifest.type for a in arts]
 
-    def _remove(self, client, pub: Published) -> None:
-        """Delete a publication from the broker: durably recorded first (§16.8), then the empty retained messages."""
+    @staticmethod
+    def _removal_of(pub: Published) -> Removal:
+        """The deletion of a publication from the broker (§16.8): recorded durably by the caller, then sent."""
         m = pub.artifact.manifest
-        r = Removal((m.device_class, m.type), m.version, list(pub.topics))
-        self._store_removal(r)
-        self.removals.append(r)
-        self._send_removal(client, r)
+        return Removal((m.device_class, m.type), m.version, list(pub.topics))
 
     def _send_removal(self, client, r: Removal) -> None:
         r.tokens, r.tried_at = None, self.clock()

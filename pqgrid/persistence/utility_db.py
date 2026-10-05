@@ -30,6 +30,7 @@ from ..commands.codec import Command
 from ..commands.utility import CommandService, QueuedCommand, UtilityCommandStore
 from ..commands.zones import GroupKey, LogicalEvent, Zone, ZoneManager
 from ..e2e.handshake import UtilityEndpoint
+from ..errors import PolicyError
 from ..fota.artifact import MAX_CHUNKS, MAX_PARTS, decode_manifest, split_signed
 from ..fota.publisher import Published, Publisher, Removal
 from ..fota.station import Artifact
@@ -413,6 +414,9 @@ class SqlPublisher(Publisher):
                 for dclass, t, v, topics in self.db.execute(
                     "SELECT dclass, type, version, topics FROM artifact_removals ORDER BY dclass, type, version")]
 
+    def _atomic(self):
+        return self.db.tx()
+
     def _store_removal(self, r: Removal) -> None:
         self.db.execute("INSERT OR REPLACE INTO artifact_removals VALUES (?, ?, ?, ?)",
                         (r.key[0], r.key[1], r.version, enc_list([t.encode() for t in r.topics], MAX_TOPICS)))
@@ -470,6 +474,7 @@ class UtilityNode:
         without them; then the RAM state goes. Returns the zones whose live members need the new keys.
         `rotated(zones)` is called once the keys rotated, EVEN IF the record change then fails: the members must get
         the keys that are now in force either way (second Codex review, finding 5)."""
+        self._check_reprovision(rec)                       # third review, finding 6: before ANY side effect
         zones = self.zones.rotate_device(rec.device_id)
         try:
             with self.db.tx():
@@ -479,6 +484,20 @@ class UtilityNode:
             if rotated is not None:
                 rotated(zones)
         return zones
+
+    def _check_reprovision(self, rec: DeviceRecord) -> None:
+        """Third Codex review, finding 6: everything that can refuse a re-provisioning is checked before the zone keys
+        rotate or anything is written. The device must be registered, its new identity well formed (Registry._check),
+        its class one the policy in force defines (otherwise it could never establish again), and a reported
+        max_packet must not be below the class's: the utility sends at most min(both), so a smaller one could make
+        the NT/FIN unpublishable (Master §25 L22)."""
+        Registry._check(rec)
+        if self.endpoint.registry.get(rec.device_id) is None:
+            raise PolicyError("device not registered: use add()")
+        prof = self.endpoint.policy.profile(rec.dclass)             # PolicyError: a class the policy does not have
+        if rec.max_packet is not None and rec.max_packet < prof.max_packet:
+            raise PolicyError(f"reported max_packet {rec.max_packet} B is below the class's {prof.max_packet} B: the "
+                              f"NT/FIN could not be published (Master §25 L22)")
 
     def keys_match_policy(self) -> bool:
         """DR-051 invariant: the keys in use are exactly those the active policy names."""

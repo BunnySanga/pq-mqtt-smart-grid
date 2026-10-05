@@ -43,7 +43,7 @@ from .topics import publish_size
 from .device_node import TransportError
 
 TAKEOVER_WINDOW_S, TAKEOVER_LIMIT = 600, 5
-REFUSAL_MEMORY_S, REFUSALS_KEPT = 600, 1024    # refused PUBACKs kept for matching against tracked publishes
+EARLY_ACKS_KEPT = 4096         # PUBACKs that arrived before their publish was registered (or of untracked publishes)
 INBOX_CAP = 1000                               # entries per application inbox (alerts, telemetry, statuses, alarms)
 CLIENT_QUEUE_MAX = 4096        # messages paho may hold (in flight + waiting for a reconnect); beyond: not queued,
 #                                which the publishers handle (P1-2): backpressure during a broker outage (finding 6)
@@ -84,11 +84,14 @@ class UtilityMqtt:
         self._scheduled = node.db.load_policy("scheduled")             # a verified policy awaiting activate_at
         self._recheck_scheduled()                                      # M-1: revocations since it was scheduled
         self._unacked: deque = deque()                                 # MQTTMessageInfo not yet PUBACKed, oldest first
-        self._cmd_pubs: list = BoundedLog(UNACKED_TRACKED)             # (info, device, cmd_seq, sid) awaiting PUBACK
+        self._cmd_pubs: list = []                                      # (delivery, device, cmd_seq, sid): every one is
+        #                                                                kept until its PUBACK settles it (third review,
+        #                                                                finding 2); paho's queue bound bounds them
         self._cmd_retry: dict[bytes, float] = {}                       # device → when its refused commands go again
         self.retry_every_s = COMMAND_RETRY_S
         self._ack_lock = threading.Lock()                              # never held while calling into paho
-        self._refused_mids: OrderedDict[int, float] = OrderedDict()    # mid → when its PUBACK refused it
+        self._by_mid: dict[int, _Delivery] = {}                        # tracked publishes awaiting their PUBACK
+        self._early: OrderedDict[int, bool] = OrderedDict()            # mid → refused, PUBACK before registration
         self.publish_refusals: list[str] = BoundedLog()                # refused PUBACKs, publishes paho did not queue
         self._fota_out = _FotaClient(self)                             # what the publisher publishes through
         self.ticks = 0                                                 # completed main-loop steps
@@ -127,8 +130,8 @@ class UtilityMqtt:
             raise TransportError(f"{size} B PUBLISH exceeds {device_id.decode()}'s maximum packet size {limit} B")
         return self._send(topic, payload)
 
-    def _send(self, topic: str, payload: bytes, retain: bool = False):
-        """Hand one QoS 1 message to paho and track it until the broker acknowledges it; returns its MQTTMessageInfo.
+    def _send(self, topic: str, payload: bytes, retain: bool = False) -> "_Delivery":
+        """Hand one QoS 1 message to paho and track it until the broker acknowledges it; returns its _Delivery.
         MQTT_ERR_NO_CONN is NOT a failure: paho keeps the message and sends it after reconnecting [DOCKER], but the
         info keeps that rc and then raises whenever it is asked whether it was published, which made every later
         publish raise (P1-2). Its rc is therefore reset, so the info reports the PUBACK like any other. Any other rc
@@ -140,32 +143,43 @@ class UtilityMqtt:
         elif info.rc != mqtt.MQTT_ERR_SUCCESS:
             self.publish_refusals.append(f"{topic}: not queued by the client: {mqtt.error_string(info.rc)}")
             raise TransportError(f"{topic}: not queued by the client ({mqtt.error_string(info.rc)})")
+        d = _Delivery(info)
+        with self._ack_lock:                                             # its PUBACK may already have arrived
+            early = self._early.pop(info.mid, None)
+            if early is None:
+                self._by_mid[info.mid] = d
+            else:
+                d.refused = early
         while self._unacked and self._unacked[0].is_published():
             self._unacked.popleft()
         self._unacked.append(info)
         if len(self._unacked) > UNACKED_TRACKED:                         # finding 6: no unbounded tracking
-            self._unacked.popleft()
-        return info
+            self._unacked.popleft()                                      # (flush()'s list only, best effort)
+        return d
 
     def _on_publish(self, client, userdata, mid, reason_code, properties) -> None:
-        """paho's PUBACK callback (on its own thread, holding its own lock: only in-memory bookkeeping here). paho
-        marks the message published after this returns, whatever the reason code, so a refusal is recorded first."""
-        if not reason_code.is_failure:
-            return
-        now = time.monotonic()
+        """paho's PUBACK callback (on its own thread, holding its own lock: only in-memory bookkeeping here). The
+        outcome goes onto the publish's own _Delivery, so no refusal can be forgotten however many arrive (third
+        Codex review, finding 2: a capped list of refused mids evicted the oldest). paho marks the message published
+        after this returns, so the outcome is recorded first."""
+        refused = reason_code.is_failure
         with self._ack_lock:
-            self._refused_mids[mid] = now
-            while self._refused_mids and (len(self._refused_mids) > REFUSALS_KEPT or
-                                          next(iter(self._refused_mids.values())) < now - REFUSAL_MEMORY_S):
-                self._refused_mids.popitem(last=False)
-        self.publish_refusals.append(f"mid {mid}: {reason_code}")
+            d = self._by_mid.pop(mid, None)
+            if d is not None:
+                d.refused = refused
+            else:                                                        # before its registration (or untracked)
+                self._early[mid] = refused
+                while len(self._early) > EARLY_ACKS_KEPT:
+                    self._early.popitem(last=False)
+        if refused:
+            self.publish_refusals.append(f"mid {mid}: {reason_code}")
 
-    def _acked(self, info) -> Optional[bool]:
+    @staticmethod
+    def _acked(d) -> Optional[bool]:
         """True: the broker accepted the message; False: its PUBACK refused it; None: no answer yet."""
-        if info is None or not info.is_published():
+        if d is None or not d.info.is_published():
             return None
-        with self._ack_lock:
-            return self._refused_mids.pop(info.mid, None) is None
+        return not d.refused
 
     def flush(self, timeout: float = 10.0) -> bool:
         """True once the broker has acknowledged (stored) every QoS 1 message this node published so far, e.g.
@@ -313,8 +327,7 @@ class UtilityMqtt:
                 keep.append(entry)
             elif ok is False and self.n.commands.unsend(did, cmd_seq, sid):
                 self._cmd_retry.setdefault(did, now + self.retry_every_s)
-        self._cmd_pubs.drain()
-        self._cmd_pubs.extend(keep)
+        self._cmd_pubs[:] = keep
         for did, at in list(self._cmd_retry.items()):
             if now < at:
                 continue
@@ -546,9 +559,17 @@ class UtilityMqtt:
             return len(pubs)
 
 
+class _Delivery:
+    """One tracked QoS 1 publish: paho's MQTTMessageInfo and whether the broker's PUBACK refused it."""
+    __slots__ = ("info", "refused")
+
+    def __init__(self, info):
+        self.info, self.refused = info, False
+
+
 class _FotaClient:
     """What the artifact publisher publishes through: the utility's tracked publish, so every artifact message is
-    followed to its PUBACK (P1-2). publish() returns the MQTTMessageInfo the publisher keeps as its token."""
+    followed to its PUBACK (P1-2). publish() returns the _Delivery the publisher keeps as its token."""
 
     def __init__(self, utility: UtilityMqtt):
         self.u = utility

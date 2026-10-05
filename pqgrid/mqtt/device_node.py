@@ -99,7 +99,8 @@ class DeviceMqtt:
         self.c = _Client(mqtt.CallbackAPIVersion.VERSION2, client_id=did.decode(), protocol=mqtt.MQTTv5,
                          reconnect_on_failure=False)
         self.c.tls_set_context(tls_ctx)
-        self.c.max_queued_messages_set(self._queue_cap())   # §16.8: bounded while the broker is down
+        self._queue_bound = self._queue_cap()                 # the bound paho holds now
+        self.c.max_queued_messages_set(self._queue_bound)     # §16.8: bounded while the broker is down
         self.c.will_set(topics.status(self.cls, did), b"offline", qos=1)
         self.errors: list[str] = BoundedLog()                 # expected protocol refusals (local log only)
         self.internal_errors: list[tuple] = BoundedLog()      # unexpected: type + code locations only (H3)
@@ -164,8 +165,9 @@ class DeviceMqtt:
         self._props.MaximumPacketSize, self._props.SessionExpiryInterval = prof.max_packet, prof.session_expiry_s
         try:
             self.c.max_queued_messages_set(self._queue_cap())  # §16.8: the installed class's outbox. paho changes it
-        except RuntimeError:                                    # only on a closed connection (it raises otherwise),
-            pass                                                # so a new policy's bound applies from here
+            self._queue_bound = self._queue_cap()               # only on a closed connection (it raises otherwise),
+        except RuntimeError:                                    # so a new policy's bound applies from here
+            pass
         self.connected.clear()
         self.c.connect(self.host, self.port, keepalive=prof.keepalive_s, clean_start=False, properties=self._props)
         self.c.loop_start()
@@ -176,8 +178,12 @@ class DeviceMqtt:
         self.c.tls_session = getattr(sock, "session", None)  # T2: resume the TLS hop next time (RAM only)
 
     def stale_connect_properties(self) -> bool:
-        """The live connection declared other CONNECT properties than the installed policy's class values."""
-        return self._declared is not None and self._declared != self._connect_props(self.d.profile)
+        """The live connection declared other CONNECT properties than the installed policy's class values, or paho's
+        queue bound is below what the installed class's outbox needs (third Codex review, finding 7: paho changes
+        it only between connections, and a policy that only grows the outbox caused no reconnect, so the old bound
+        could stay for good). A SMALLER bound waits for the next connection: no reconnect for that (H-2)."""
+        return self._declared is not None and (self._declared != self._connect_props(self.d.profile)
+                                               or self._queue_bound < self._queue_cap())
 
     def _planned_reconnect(self) -> None:
         """H-2: a newly installed policy changed CONNECT properties. The broker enforces what the live connection

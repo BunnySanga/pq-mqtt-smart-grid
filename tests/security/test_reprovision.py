@@ -226,3 +226,59 @@ def test_the_new_zone_keys_go_out_even_if_the_record_change_fails(tmp_path, monk
     sent = {t: env for t, env, _, _ in paho.queued}
     assert dec(d2.proc.on_control(control_topic("der_ctrl", D2), sent[control_topic("der_ctrl", D2)]), 6)[4] == b"OK"
     assert control_topic("der_ctrl", D1) in sent                          # … and every live member has the new key
+
+
+# ======================================================================= third Codex review, findings 1 and 6
+def test_adding_a_registered_device_again_never_resets_its_provisioning(tmp_path):
+    """Finding 1: after a re-provisioning, an "idempotent" add of the current record stored the caller's default
+    provisioned_at (0), and the OLD key's device resumed with its old ticket. The generation is now kept."""
+    from pqgrid.registry import DeviceRecord
+    p, old, sent, unsent, gid = before_the_change(tmp_path)
+    kp = HybridKeyPair.generate()
+    p.node.reprovision(replace(p.u.registry.get(D1), e2e_pk=kp.pk))
+    gen = p.u.registry.get(D1).provisioned_at
+    p.t += 5
+    p.u.registry.add(DeviceRecord(D1, "der_ctrl", kp.pk))                 # the same record, default generation 0
+    p.u.registry.add(replace(p.u.registry.get(D1), max_packet=65536, provisioned_at=0))   # a max_packet update
+    rec = p.u.registry.get(D1)
+    assert (rec.provisioned_at, rec.max_packet) == (gen, 65536)
+    with pytest.raises(TicketError, match="re-provisioned"):
+        p.resume(old)                                                      # before the fix: it resumed
+    p.restart()
+    assert p.u.registry.get(D1).provisioned_at == gen                     # durable
+    p.u.registry.add(DeviceRecord(D2, "der_ctrl", kp.pk, provisioned_at=12345))
+    assert p.u.registry.get(D2).provisioned_at == 0                        # a new device starts at 0
+
+
+def test_the_provisioning_generation_only_ever_grows(tmp_path):
+    """Finding 1: the generation was the utility's clock as it was: two re-provisionings in one second, or a clock
+    set back, reused a generation, and an earlier session or command would pass as the current one."""
+    p = Plant(tmp_path)
+    p.device(D1, "der_ctrl")
+    gens = []
+    for t in (p.t, p.t, p.t - 100):                                       # the same second twice, then back in time
+        p.t = t
+        p.node.reprovision(replace(p.u.registry.get(D1), e2e_pk=HybridKeyPair.generate().pk))
+        gens.append(p.u.registry.get(D1).provisioned_at)
+    assert gens[0] < gens[1] < gens[2]
+
+
+def test_an_invalid_reprovisioning_changes_nothing(tmp_path):
+    """Finding 6: the zone keys rotated before anything was checked, and a class the policy does not define was
+    accepted and stored, so the device could never establish again. Everything is checked first now."""
+    p = Plant(tmp_path)
+    d1, d2 = p.device(D1, "der_ctrl"), p.device(D2, "der_ctrl")
+    p.full(d1)
+    p.full(d2)
+    p.node.zones.create("f7")
+    p.node.zones.add_member("f7", D1)
+    p.node.zones.add_member("f7", D2)
+    rec, before = p.u.registry.get(D1), epochs(p)
+    for bad, why in [(replace(rec, dclass="no_such_class"), "not defined by policy"),
+                     (replace(rec, max_packet=1024), "below the class"),
+                     (replace(rec, e2e_pk=b"short"), "1,216 bytes"),
+                     (replace(rec, device_id=b"der-0009"), "not registered")]:
+        with pytest.raises(PolicyError, match=why):
+            p.node.reprovision(bad)
+    assert epochs(p) == before                                             # before the fix: rotated
+    assert p.u.registry.get(D1) == rec and p.u.current_session(D1) is not None   # nothing else either

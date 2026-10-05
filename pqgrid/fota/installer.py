@@ -176,7 +176,7 @@ class Installer:
         recovered = [(t, d.manifest) for t, d in self.downloads.items()] + list(self.staged.items())
         for t, m in recovered:
             try:
-                kept = self._reverify(t, m)
+                kept = self._reverify(t, m, admit=True)
             except FotaError as e:
                 self.recovery_refused.append(f"type {t}: {e}")
                 continue
@@ -184,6 +184,12 @@ class Installer:
                 self.downloads[t].manifest = kept
             else:
                 self.staged[t] = kept
+        for t, dl in list(self.downloads.items()):                     # finding 3: power lost after the last
+            if dl.complete():                                          # chunk's bit was saved, before staging:
+                try:                                                   # finish it now (redelivered chunks are
+                    self._finish_download(t)                           # duplicates and never would)
+                except FotaError as e:
+                    self.recovery_refused.append(f"type {t}: {e}")
 
     def _finish_interrupted_commits(self) -> None:
         """A commit is one protected record; the staging record is dropped after it. If power failed in between, the
@@ -253,20 +259,7 @@ class Installer:
         if label is not None and label != (m.type, m.version):
             raise FotaError("manifest parts labelled with another type or version")
         # ------------------------------------------------------------------- trusted from here on
-        if m.device_class != self.cls:
-            raise FotaError("manifest targets another device class")      # F7
-        cap = (self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size) - SIGNED_RESERVE
-        if m.payload_length > cap:
-            raise FotaError("payload larger than this device's slot")        # V-F5, before any download (the slot
-        if 4 + len(signed) > SIGNED_RESERVE:                               # minus the kept signed manifest)
-            raise FotaError("signed manifest larger than the copy the device keeps of it")
-        if m.chunk_count > MAX_CHUNKS:
-            raise FotaError(f"more than {MAX_CHUNKS} chunks: the download record would not fit its budget")
-        if m.chunk_size + merkle.HASH_LEN * merkle.max_path_len(m.chunk_count) + CHUNK_RECORD + MQTT_RESERVE \
-                > self.max_packet:
-            raise FotaError("chunks would exceed this device's packet limit")  # E61
-        if m.version <= self.prot.committed[m.type]:
-            raise FotaError("rollback: version not newer than installed")  # F4, F5, F6
+        self._admit(m, len(signed))
         cur = self.downloads.get(m.type) or (Download(self.staged[m.type], b"", bytearray())
                                             if m.type in self.staged else None)
         if cur is not None:
@@ -282,12 +275,31 @@ class Installer:
         self._save_download(m.type)
         return m
 
+    def _admit(self, m: Manifest, signed_len: int) -> None:
+        """What this device accepts at all, checked for a fresh manifest AND for one recovered from flash (third Codex
+        review, finding 5: recovery checked only the signature, so a genuine artifact too large for this slot could
+        be planted and resumed). FotaError otherwise."""
+        if m.device_class != self.cls:
+            raise FotaError("manifest targets another device class")      # F7
+        cap = (self.flash.slot_size if m.type == FIRMWARE else self.flash.area_size) - SIGNED_RESERVE
+        if m.payload_length > cap:
+            raise FotaError("payload larger than this device's slot")        # V-F5, before any download (the slot
+        if 4 + signed_len > SIGNED_RESERVE:                                # minus the kept signed manifest)
+            raise FotaError("signed manifest larger than the copy the device keeps of it")
+        if m.chunk_count > MAX_CHUNKS:
+            raise FotaError(f"more than {MAX_CHUNKS} chunks: the download record would not fit its budget")
+        if m.chunk_size + merkle.HASH_LEN * merkle.max_path_len(m.chunk_count) + CHUNK_RECORD + MQTT_RESERVE \
+                > self.max_packet:
+            raise FotaError("chunks would exceed this device's packet limit")  # E61
+        if m.version <= self.prot.committed[m.type]:
+            raise FotaError("rollback: version not newer than installed")  # F4, F5, F6
+
     # ------------------------------------------------------------------------- the kept signed manifest (P0-1)
     def _keep_signed(self, t: int, signed: bytes) -> None:
         area = self._area(t)
         area[len(area) - SIGNED_RESERVE:] = (u32(len(signed)) + signed).ljust(SIGNED_RESERVE, b"\0")
 
-    def _verified_copy(self, t: int) -> Manifest:
+    def _verified_copy(self, t: int) -> tuple[Manifest, int]:
         """Codex audit P0-1: the signed manifest kept in the tail of type t's area, verified NOW (anchor, signature,
         DR-050 role with the revocations of now) and checked to be for this type and class. The record store, the
         slot and the copy can all be rewritten by someone with access to flash; only a valid signature is believed.
@@ -303,15 +315,17 @@ class Installer:
             raise FotaError("the kept signed manifest is malformed") from e
         if m.type != t or m.device_class != self.cls:
             raise FotaError("the kept signed manifest is for another artifact type or class")
-        return m
+        return m, n
 
-    def _reverify(self, t: int, m: Manifest) -> Manifest:
+    def _reverify(self, t: int, m: Manifest, admit: bool = False) -> Manifest:
         """The kept copy verifies and is the very manifest the record (or RAM) names; otherwise the artifact is dropped
         and FotaError raised."""
         try:
-            kept = self._verified_copy(t)
+            kept, n = self._verified_copy(t)
             if kept != m:
                 raise FotaError("the recorded manifest is not the signed one kept beside the artifact")
+            if admit:
+                self._admit(kept, n)                                       # finding 5: as for a fresh manifest
         except FotaError:
             self._drop(t)
             raise
@@ -348,14 +362,23 @@ class Installer:
         self._save_download(t)                                             # … then its bit is made durable
         if not dl.complete():
             return None
-        payload = bytes(area[:m.payload_length])
+        return self._finish_download(t)
+
+    def _finish_download(self, t: int) -> int:
+        """A complete download: the whole payload against its signed SHA-256, then "staged" (and a KEYREVOKE applied).
+        Also run at boot for a download whose last bit was saved before the power went (third Codex review, finding
+        3). The staged record is written BEFORE the download record goes, so a power loss in between leaves both (the
+        next boot finishes again), never neither."""
+        dl = self.downloads[t]
+        m = dl.manifest
+        payload = bytes(self._area(t)[:m.payload_length])
         if hashlib.sha256(payload).digest() != m.payload_sha256:
             self._drop(t)
             raise FotaError("image hash mismatch")
-        del self.downloads[t]
-        self.store.delete(T_DOWNLOAD, bytes([t]))
         self.staged[t] = m
         self.store.put(T_STAGED, bytes([t]), dl.raw)
+        del self.downloads[t]
+        self.store.delete(T_DOWNLOAD, bytes([t]))
         if t == KEYREVOKE:
             self._apply_keyrevoke(m, payload)
         return t

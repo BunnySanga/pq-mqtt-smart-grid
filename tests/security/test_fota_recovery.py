@@ -16,6 +16,7 @@ from test_fota import CHUNK, MP, C2, T0, Dev, _policy_art, build, dev, firmware,
 from pqgrid.fota.artifact import ANCHOR_A, FIRMWARE, KEYREVOKE, POLICY, FotaError, decode_manifest
 from pqgrid.fota.installer import SIGNED_RESERVE, T_DOWNLOAD, T_STAGED
 from pqgrid.fota.publisher import part_payload_budget
+from pqgrid.persistence.flash import PowerLoss
 from pqgrid.wire import dec, enc, r32, u32
 
 EVIL = b"EVIL FIRMWARE " * 1000
@@ -166,3 +167,55 @@ def test_a_truncated_download_bitmap_is_dropped_instead_of_wedging_the_update(de
     assert FIRMWARE not in dev.inst.downloads and dev.inst.recovery_refused
     dev.feed(art)                                                         # before the fix: IndexError per chunk
     assert dev.inst.boot_staged_firmware(lambda img: True) == "committed"
+
+
+# =================================================================== third Codex review, findings 3 and 5
+def power_off_after_the_last_bitmap_write(dev):
+    real = dev.inst._save_download
+
+    def save_then_power_off(t):
+        real(t)
+        if dev.inst.downloads[t].complete():
+            raise PowerLoss()                                             # the last chunk's bit is durable; nothing else
+    dev.inst._save_download = save_then_power_off
+
+
+def test_a_power_loss_after_the_last_chunk_is_finished_at_the_next_boot(dev, station):
+    """Finding 3: the last chunk's bit was saved, then the power went before staging. The boot restored a complete
+    download and never finished it, and every redelivered chunk was a duplicate: wedged for good."""
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art, chunks=art.chunks[:-1], shuffle=False)
+    power_off_after_the_last_bitmap_write(dev)
+    with pytest.raises(PowerLoss):
+        dev.feed(art, parts=[], chunks=art.chunks[-1:], shuffle=False)
+    dev.boot()
+    assert FIRMWARE in dev.inst.staged and FIRMWARE not in dev.inst.downloads   # before the fix: neither
+    assert dev.inst.boot_staged_firmware(lambda img: img == art.payload) == "committed"
+
+
+def test_a_complete_download_whose_payload_changed_is_dropped_at_the_boot(dev, station):
+    art = build(station, FIRMWARE, 2, firmware())
+    dev.feed(art, chunks=art.chunks[:-1], shuffle=False)
+    power_off_after_the_last_bitmap_write(dev)
+    with pytest.raises(PowerLoss):
+        dev.feed(art, parts=[], chunks=art.chunks[-1:], shuffle=False)
+    dev.ff.slots[1 - dev.inst.prot.active][10] ^= 1
+    dev.boot()
+    assert dev.inst.staged == {} and dev.inst.downloads == {} and any("hash" in r for r in dev.inst.recovery_refused)
+
+
+def test_a_recovered_artifact_must_pass_the_checks_a_fresh_one_does(station):
+    """Finding 5: recovery checked the signature only. A genuine artifact of this class, too large for THIS device's
+    slot (another device of the class accepted it), planted with its record and kept copy, was resumed."""
+    big = Dev(station, slot=128 * 1024)
+    art = build(station, FIRMWARE, 2, firmware(60_000))
+    big.feed(art, chunks=art.chunks[:1])
+    record = big.inst.store.get(T_DOWNLOAD, bytes([FIRMWARE]))
+    small = Dev(station, slot=32 * 1024)
+    with pytest.raises(FotaError, match="larger than this device's slot"):
+        small.feed(art, chunks=[])                                        # what a fresh delivery gets
+    keep(small.ff.slots[1 - small.inst.prot.active], art.signed)
+    small.inst.store.put(T_DOWNLOAD, bytes([FIRMWARE]), record)
+    small.boot()
+    assert FIRMWARE not in small.inst.downloads                           # before the fix: resumed
+    assert any("larger than this device's slot" in r for r in small.inst.recovery_refused)
