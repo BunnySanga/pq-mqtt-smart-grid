@@ -1805,3 +1805,9 @@ CONTROL), and every attempt refused with its reason: A1, A2, A2b (tampered hands
 (no plaintext in an ALERT), A6 (tier-stripped plaintext), A7 (ALERT on a TELEMETRY topic), A8, A9 (replays), A10
 (a forged command: REJECTED:signature, not applied), and N3 over the real broker (X25519MLKEM768 negotiated; a
 classical-only client and a TLS 1.2 client refused). The sizes agree with the v2.1 reference and with §9.4/§13.1.
+
+**Live scenarios and the results report (2026-10-06).** `tools/demo_objective1.py` runs every Objective 1 scenario
+over the real broker with the production main loops (S1 connect + handshake, S2 TELEMETRY, S3 ALERT, S4 command,
+S5 GRANT + SETPOINT, S6 broadcast event, S7 four attacks, S8 policy change): **11 of 11 checks passed**
+(`results/objective1-scenarios.md`); `--forever` keeps the system running (a reading every 5 s) until Ctrl+C. The
+report for the final evaluation, `results/OBJECTIVE1-REPORT.md`, collects §16.12 and these scenarios.
