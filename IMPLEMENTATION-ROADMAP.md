@@ -1746,3 +1746,40 @@ broker failures of §16.9), but the gap it names is real.
 Mutants 223–231 cover these checks; seven older mutants were re-pointed at the rewritten lines (same check
 disabled). Not mutated: the atomic block of `cleanup()` (no crash test inside it yet). Nothing here is claimed fixed
 until it has run (as §16.9 did for §16.5–§16.8).
+
+### 16.11 Validation of §16.10 (2026-10-06)
+
+**Before the fixes** (today's tests against `pqgrid` at `89dad90`, exported with `git archive`; in-process): 10 of the
+11 new regression tests FAIL, each on the defect it targets (the provisioning generation reset to 0 and not growing;
+an invalid re-provisioning accepted; refused commands still recorded as sent; a republish deleted after the restart;
+a replacing version sent although its predecessor's deletion was not recorded; a complete download never staged;
+a changed complete download not dropped; an oversized artifact resumed; no reconnect for a grown queue bound). The
+one that passes, `…refusal_that_arrives_before_its_publish_is_registered…`, guards a case the old mid-keyed refusal
+list also handled: it pins that the new per-delivery tracking keeps it.
+
+**An intermittent test found by this run, fixed (test only).** In the mutation run mutant 40 (a known equivalent
+survivor) showed as KILLED: the failing test was `test_corrupted_fota_messages_are_refused_cleanly[part]`, unrelated to
+the mutant. Reproduced in Docker in 1 of 80 runs (random corruptions): a corrupted copy of part 0 relabelled as part 2
+stayed in the assembly area, the genuine parts were assembled with it, and the result did not even parse ("malformed
+signed manifest") instead of failing its signature; the next delivery assembled and committed the genuine artifact. The
+behaviour is the intended one (nothing accepted, the poisoned assembly refused, the genuine artifact installed on the
+next delivery); the assertion only named the signature failure. It now accepts any verification failure of the
+assembly, still at most one, still followed by the commit: 240 runs in Docker, 0 failures. Mutant 40 was re-run.
+
+**Results**, canonical image (Debian trixie, OpenSSL 3.5.7, Mosquitto 2.0.21, paho-mqtt 2.1.0), `cdbb790` plus the test
+fix above:
+
+| Check | Result |
+|---|---|
+| In-process suite on macOS (`.venv`) | 644 passed, 57 skipped (the broker tests) [SIM] |
+| Full suite | **701 passed** [DOCKER] |
+| Broker tests | **57 / 57** in three runs (one inside the full suite), including the new reconnect test [DOCKER] |
+| v2.1 `validate.py` | 80/80 as expected |
+| pyflakes | `pqgrid`, `tools`: clean |
+| Mutation (all 232 mutants, 2 containers) | **229 KILLED, 3 SURVIVED (40, 110, 112: the survivors classified in §15.9), 0 ERROR**; all 9 new mutants (223–231) KILLED; mutant 40 re-run after the test fix above and correctly SURVIVED [DOCKER] |
+
+**Status after §16.11:** every finding of the three Codex reviews and of the follow-up is fixed and validated. Still
+open, by decision or by nature: zone keys rotate only through the whole re-provisioning operation; the atomic block
+of `cleanup()` has no crash test yet; the P0-1 storage choice and the new limits await the team's confirmation; the
+per-tier figures of §11 come from the v2.1 reference (a benchmark of `pqgrid` itself is still to be written); nothing
+here is [HW] (§15.12).

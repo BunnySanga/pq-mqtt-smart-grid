@@ -521,7 +521,10 @@ def test_corrupted_fota_messages_are_refused_cleanly(station, target):
     """300 random mutations into each FOTA parser: every one is refused (FotaError, or held and never accepted),
     nothing is installed, the staging area stays bounded, and the staging is NOT cleared by the test: poisoned
     staging must be detected by the installer (a failed verification) and the genuine artifact must still
-    install, at the latest on its next retained re-delivery."""
+    install, at the latest on its next retained re-delivery. A poisoned assembly (genuine parts joined with a
+    corrupted one left in staging) fails verification either at its signature or one step earlier, when the
+    assembled bytes do not even parse as a signed manifest: about 1 run in 80 with "[part]" (found by the
+    2026-10-06 mutation run, IMPLEMENTATION-ROADMAP §16.11); before, only the signature failure was expected."""
     from test_fuzz import mutations
     from pqgrid.fota.installer import MAX_ASSEMBLIES
     rng = random.Random(hash(target) & 0xFFFF)
@@ -551,7 +554,9 @@ def test_corrupted_fota_messages_are_refused_cleanly(station, target):
             break
         except FotaError as e:
             detected.append(str(e))
-    assert all("signature invalid" in e for e in detected) and len(detected) <= 1
+    poisoned = ("manifest signature invalid", "malformed signed manifest", "malformed manifest",
+                "bad manifest magic", "chunk_count does not match")         # a failed verification of the assembly
+    assert len(detected) <= 1 and all(any(p in e for p in poisoned) for e in detected), detected
     assert d.inst.boot_staged_firmware(lambda img: img == art.payload) == "committed"
 
 
