@@ -1781,5 +1781,27 @@ fix above:
 **Status after §16.11:** every finding of the three Codex reviews and of the follow-up is fixed and validated. Still
 open, by decision or by nature: zone keys rotate only through the whole re-provisioning operation; the atomic block
 of `cleanup()` has no crash test yet; the P0-1 storage choice and the new limits await the team's confirmation; the
-per-tier figures of §11 come from the v2.1 reference (a benchmark of `pqgrid` itself is still to be written); nothing
+per-tier figures of §11 are now measured on `pqgrid` itself (§16.12); nothing
 here is [HW] (§15.12).
+
+### 16.12 Objective 1 measured on the final code (2026-10-06)
+
+`tools/bench_objective1.py` runs in the test image (`docker run --rm pqgrid-tests python tools/bench_objective1.py`)
+and writes the Objective 1 evidence in one report, `results/objective1.md` [DOCKER, Debian trixie, OpenSSL 3.5.7,
+Python 3.13.5, median of 180 runs after 20 warm-up; a laptop, not a device]:
+
+| Measured on `pqgrid` (64-byte payload) | Envelope | MQTT PUBLISH | Device (ms) | Utility (ms) |
+|---|---|---|---|---|
+| TELEMETRY (TLS only) | none | 108 B | — | — |
+| ALERT | 137 B (+73) | 178 B | seal 0.0056 | open 0.0100 |
+| CONTROL command (ML-DSA-65) | 3,466 B (+3,402) | 3,504 B | open + verify + apply 0.1125 | sign + seal 0.5572 |
+| CONTROL GRANT | 3,477 B | 3,515 B | open + verify 0.1126 | sign + seal 0.4399 |
+| CONTROL SETPOINT | 97 B | 135 B | 0.0077 | 0.0071 |
+| CONTROL broadcast event | 3,484 B | 3,525 B | — | — |
+| Full E2E handshake (smart_meter) | 2,493 + 2,411 + 46 + 271 = 5,221 B | — | 0.299 | 0.229 |
+
+The same report gives the tier of each example topic (strongest rule wins; no rule, or an invalid topic, gives
+CONTROL), and every attempt refused with its reason: A1, A2, A2b (tampered handshake), A4 (older policy), A5
+(no plaintext in an ALERT), A6 (tier-stripped plaintext), A7 (ALERT on a TELEMETRY topic), A8, A9 (replays), A10
+(a forged command: REJECTED:signature, not applied), and N3 over the real broker (X25519MLKEM768 negotiated; a
+classical-only client and a TLS 1.2 client refused). The sizes agree with the v2.1 reference and with §9.4/§13.1.

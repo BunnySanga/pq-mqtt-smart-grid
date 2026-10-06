@@ -960,11 +960,12 @@ depend slightly on the lengths of the device ID and class name). The v2.1 bench 
 The differences come from v2.2 fields: the 16-bit ticket key id, the DF bundle field, the ACK field in NT and a flat
 RS layout (IMPLEMENTATION-ROADMAP §8.6).
 
-**Laptop compute** [DOCKER, v2.1 bench; not re-measured on the v2.2 code]:
+**Laptop compute** [DOCKER]: the full handshake re-measured on the v2.2 code (`results/objective1.md`, from
+`tools/bench_objective1.py`, median of 180 after 20 warm-up); the resume rows are still the v2.1 bench:
 
 | Exchange | Device | Utility |
 |---|---|---|
-| Full handshake | 0.278 ms | 0.229 ms |
+| Full handshake | 0.299 ms (v2.1: 0.278 ms) | 0.229 ms (v2.1: 0.229 ms) |
 | PSK resume | 0.021 ms | 0.030 ms |
 | PSK+KEM resume | 0.144 ms | 0.103 ms |
 
@@ -3862,6 +3863,7 @@ idea carries forward (§9.6).
 | DOCKER-NET | `design-validation/results/network.txt` | N1–N7 through an interception proxy |
 | DOCKER-BRK | `design-validation/results/broker.txt` | Default group negotiation; ACL at delivery; MQTT 5 properties; retained 16 KB/256 KB; TLS resumption; Nagle; certificate-type handshake bytes |
 | DOCKER-BENCH | `design-validation/results/bench.txt` | E2E handshake/resume compute and bytes; per-tier message sizes; FOTA costs |
+| DOCKER-OBJ1 | `results/objective1.md` (from `tools/bench_objective1.py`) | Objective 1 on the final `pqgrid` code: tier per topic; per-tier sizes and compute (ALERT 137 B, command 3,466 B, GRANT 3,477 B, SETPOINT 97 B, broadcast 3,484 B); the full handshake (5,221 B); attacks A1–A10 and N3, every one refused |
 | DOCKER-SIG | `design-validation/results/signature_speed.txt` | ML-DSA-65, SLH-DSA-192s, SLH-DSA-128s (openssl speed) |
 | DOCKER-HYB | `design-validation/results/hybrid_cost.txt` | X25519 vs ML-KEM-768 compute (+122%) |
 | DOCKER-S | `design-validation/constrained-audit/results/state.txt` | S1–S5 |
